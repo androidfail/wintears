@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Cross-build from Linux with MinGW-w64 and run the tests under Wine (the same setup as the dev sandbox).
+  linux-cross:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install MinGW-w64, Wine and Boost headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64 wine64 libboost-dev ninja-build llvm
+          mkdir -p "$RUNNER_TEMP/boostinc" && ln -s /usr/include/boost "$RUNNER_TEMP/boostinc/boost"
+      - name: Check the generated guest test programs are up to date
+        run: |
+          python3 tools/embed_guest.py tests/guest/programs.S "$RUNNER_TEMP/programs.h"
+          diff -u tests/guest/programs.h "$RUNNER_TEMP/programs.h"
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-x64.cmake -DBoost_INCLUDE_DIR="$RUNNER_TEMP/boostinc"
+      - name: Build
+        run: cmake --build build
+      - name: Test under Wine
+        env:
+          WINEDEBUG: -all
+          LANG: C.UTF-8
+          LC_ALL: C.UTF-8
+        run: |
+          wineboot -i >/dev/null 2>&1 || true
+          ctest --test-dir build --output-on-failure
+
+  # Native Windows build and tests: the real placeholder, section and fault behaviour (Wine differs in places).
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-boost
+      - name: Configure
+        run: cmake -S . -B build -G Ninja
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # Game-free Python tests of the upstream build tools (containers, updates, shader list) on Windows paths.
+  python-tools:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install build-tool dependencies
+        run: python -m pip install -r upstream/games/totk/requirements.txt
+      - name: Run the Windows build-tool tests
+        run: python -m unittest discover -s tools/tests -v
+      - name: Run the portable upstream container and data tests
+        working-directory: upstream/tests
+        run: python -m unittest -v test_game_containers test_relr test_mod_manifest test_romfs_paths test_shader_list

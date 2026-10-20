@@ -4,7 +4,27 @@ Goal: play your own copy of *The Legend of Zelda: Tears of the Kingdom* on Windo
 [MacNativeGames](https://github.com/ly05010419/macnativegames) (MNG): no full Switch emulation, the Switch system
 services answered by a small host, and the game's NVN graphics calls answered by a native graphics API.
 
-Status: planning. Upstream reference: MNG at commit `4fdda41562a1c783fb1aacd18891ad4f48b8c360` (2026-10-21).
+Upstream reference: MNG at commit `4fdda41562a1c783fb1aacd18891ad4f48b8c360` (2026-10-21).
+
+## Status
+
+| Phase | State |
+|---|---|
+| 0. Repository and CI | done: submodules, CMake cross-build, CI (Linux + Wine, native Windows, Python tools) |
+| 1. Build pipeline | in progress: `tools/build_win.py` extracts and verifies 1.0.0 code and data; waiting for the first run on real files |
+| 2. Platform layer | done for bring-up: `src/pal`, 56 checks |
+| 3A. CPU (JIT) | started: dynarmic builds for Windows, `src/cpu/jit` runs ARM64 code, 39 checks; loader and bridge next |
+| 4–9 | not started |
+
+## Decisions
+
+- **CPU track: A (x86-64, dynarmic JIT).** The test PCs are Intel/AMD.
+- **Test GPUs: NVIDIA RTX 4070 and RTX 3080.** Driver-specific fixes are checked on NVIDIA first.
+- **Low-end target for later: a laptop with integrated AMD Radeon graphics.** Not a bring-up target, but the design
+  keeps it reachable (see "Low-end budget" below).
+- **Bring-up version: 1.0.0** (base game only, no update merge).
+- **Upstream as git submodules** (MNG and dynarmic, pinned), not a subtree: lighter, and upstream stays untouched.
+  Files we must change are reimplemented under `src/` or patched at build time.
 
 ---
 
@@ -81,8 +101,8 @@ for hot functions that profiling shows are the bottleneck.
 
 ```
 wintears/
-  upstream/            MNG, pinned as a git subtree (read-only except via patches/)
-  patches/             numbered patches applied to upstream files we must change
+  upstream/            MNG, pinned git submodule (never edited)
+  externals/dynarmic   ARM64-to-x86 JIT, pinned git submodule
   src/
     pal/               platform layer (Windows; a POSIX shim for tests)
     cpu/               cpu_jit/ (Track A, dynarmic) and cpu_native/ (Track B)
@@ -281,10 +301,23 @@ Testing once a day is assumed. Testing a few times a week stretches this by abou
 | Upstream MNG moves fast | merge pain | thin platform interface, numbered patches, regular syncs |
 | Bugs only reproducible with game data | slow fixes | detailed logs, frame captures (RenderDoc), replayable input |
 
-## 10. Open decisions
+## 10. Low-end budget (integrated AMD Radeon, later)
 
-1. **Your PC:** Intel/AMD or Snapdragon, and which GPU? This sets which track comes first and which driver gets
-   tested first.
-2. **Bring-up version:** 1.0.0 (simplest inputs) or straight to 1.4.3.
-3. **Upstream:** subtree with patches (planned) vs. a hard fork.
-4. **License for new code:** MIT, matching upstream (planned).
+Decisions made now so the integrated-GPU laptop stays reachable without a rewrite:
+
+- **Memory is shared with the CPU.** Keep GPU copies of guest memory pools small: upload only dirty ranges, no
+  second full copy of each pool. Prefer `VK_EXT_external_memory_host` (import guest pages directly) where the driver
+  offers it, as AMD's does.
+- **ASTC costs bandwidth and memory.** Decoding to RGBA8 is 4–16× larger than ASTC. The texture path keeps a
+  "transcode to BC7/BC3" option behind the same interface, for when VRAM or bandwidth is the limit.
+- **Resolution first.** Render at 720p–900p internally with FSR 1 (cheap, no motion vectors) on the iGPU; FSR 2/3
+  only on the discrete GPUs.
+- **Shader stutter hurts more on a slower CPU.** Pre-warming at build time and `VK_EXT_graphics_pipeline_library`
+  matter more here; the pipeline cache is keyed per GPU and driver.
+- **CPU time.** The laptop's CPU is the likely bottleneck for the JIT: keep dynarmic's code cache warm, avoid
+  per-frame `VirtualProtect` storms (batch dirty tracking), and keep the host-call bridge thunks tight.
+- A `--profile low` switch will bundle these settings once phase 7 exists.
+
+## 11. Open decisions
+
+1. **License for new code:** MIT, matching upstream (planned).
