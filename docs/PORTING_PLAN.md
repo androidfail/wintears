@@ -13,7 +13,7 @@ Upstream reference: MNG at commit `4fdda41562a1c783fb1aacd18891ad4f48b8c360` (20
 | 0. Repository and CI | done: submodules, CMake cross-build, CI (Linux + Wine, native Windows, Python tools) |
 | 1. Build pipeline | in progress: `tools/build_win.py` extracts and verifies 1.0.0 code and data; waiting for the first run on real files |
 | 2. Platform layer | done for bring-up: `src/pal`, 56 checks |
-| 3A. CPU (JIT) | started: dynarmic builds for Windows, `src/cpu/jit` runs ARM64 code, 39 checks; loader and bridge next |
+| 3A. CPU (JIT) | started: dynarmic builds for Windows, `src/cpu/jit` runs ARM64 code (39 checks); `src/bridge` calls host functions from guest code through generated thunks, 422 NVN thunks (17 checks); loader next |
 | 4–9 | not started |
 
 ## Decisions

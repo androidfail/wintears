@@ -27,6 +27,13 @@ jobs:
         run: |
           python3 tools/embed_guest.py tests/guest/programs.S "$RUNNER_TEMP/programs.h"
           diff -u tests/guest/programs.h "$RUNNER_TEMP/programs.h"
+      - name: Check the generated bridge thunks are up to date
+        run: |
+          N=upstream/games/totk/third_party/d2r_gfx/gfx/nvn
+          python3 tools/gen_bridge.py "$RUNNER_TEMP/nvn.c" $N/hle_nvn.c $N/totk_nvn_ext.c $N/nvn_tex.c $N/nvn_mtl.m
+          diff -u src/bridge/nvn_bridge_gen.c "$RUNNER_TEMP/nvn.c"
+          python3 tools/gen_bridge.py "$RUNNER_TEMP/fx.c" tests/bridge_fixture.c --include bridge_fixture.h --table bridge_fixture_table
+          diff -u tests/bridge_fixture_gen.c "$RUNNER_TEMP/fx.c"
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-x64.cmake -DBoost_INCLUDE_DIR="$RUNNER_TEMP/boostinc"
       - name: Build

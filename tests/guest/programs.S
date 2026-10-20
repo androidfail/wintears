@@ -98,5 +98,10 @@ p_udf:
     udf #0
     svc #0xff
 
+    .globl p_call               // call the function at x9 with the registers as set, then stop
+p_call:
+    blr x9
+    svc #0xff
+
     .globl p_end
 p_end:
