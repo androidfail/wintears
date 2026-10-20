@@ -1,0 +1,15 @@
+/build*/
+/out/
+*.exe
+*.obj
+*.o
+__pycache__/
+# Game files, keys and generated game data never go in the repository.
+*.xci
+*.nsp
+*.nsz
+*.xcz
+prod.keys
+title.keys
+TOTK_build/
+TOTK_win/

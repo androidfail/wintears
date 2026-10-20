@@ -1,0 +1,6 @@
+[submodule "upstream"]
+	path = upstream
+	url = https://github.com/ly05010419/macnativegames
+[submodule "externals/dynarmic"]
+	path = externals/dynarmic
+	url = https://github.com/azahar-emu/dynarmic
