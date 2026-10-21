@@ -62,6 +62,25 @@ static void test_reserve_and_alias(void) {
     CHECK(pal_unreserve(BASE, RESERVE) == 0);
 }
 
+/* A dynamic region (Horizon heap / alias): page ranges committed and given back in any order. */
+static void test_dynamic(void) {
+    uintptr_t d = BASE + 16 * GiB;
+    CHECK(pal_reserve_dynamic(d, 4 * GiB) == 0);
+    uint32_t v = 0;
+    CHECK(pal_guarded_copy(&v, (void *)(d + 8192), sizeof v) == 1);
+    CHECK(pal_commit(d, 64 * 1024, PAL_PROT_READ | PAL_PROT_WRITE) == 0);
+    ((volatile uint32_t *)d)[2048] = 7;                          /* +8 KiB */
+    CHECK(pal_commit(d + 32 * 1024, 64 * 1024, PAL_PROT_READ | PAL_PROT_WRITE) == 0);   /* overlaps: contents kept */
+    CHECK(((volatile uint32_t *)d)[2048] == 7);
+    CHECK(pal_decommit(d + 4096, 8192) == 0);                   /* a hole in the middle */
+    CHECK(pal_guarded_copy(&v, (void *)(d + 8192), sizeof v) == 1);
+    CHECK(pal_guarded_copy(&v, (void *)(d + 64 * 1024), sizeof v) == 0);
+    CHECK(pal_commit(d, 96 * 1024, PAL_PROT_READ | PAL_PROT_WRITE) == 0);
+    CHECK(((volatile uint32_t *)d)[2048] == 0);                  /* recommitted: zero */
+    CHECK(pal_decommit(d, 4 * GiB) == 0);                        /* also over pages never committed */
+    CHECK(pal_unreserve(d, 4 * GiB) == 0);
+}
+
 /* Dirty-page tracking in miniature: write-protect, catch the write, record it, unprotect, retry. */
 static uintptr_t watch_lo, watch_hi;
 static atomic_int write_faults;
@@ -177,6 +196,7 @@ static void test_files(void) {
 
 int main(void) {
     test_reserve_and_alias();
+    test_dynamic();
     test_write_tracking();
     test_threads();
     test_time();

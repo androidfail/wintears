@@ -68,6 +68,8 @@ uint64_t ldr_symbol(const ldr_set *s, const char *name);
 uint64_t ldr_module_symbol(const ldr_module *m, const char *name);
 /* "main+0x1234" or "0x..." */
 void ldr_describe(const ldr_set *s, uint64_t addr, char *out, size_t cap);
+/* The defined function symbol at or before addr in its module (exported names only), or NULL; *off = addr - symbol. */
+const char *ldr_nearest_symbol(const ldr_set *s, uint64_t addr, uint64_t *off);
 const ldr_module *ldr_module_of(const ldr_set *s, uint64_t addr);
 
 /* LZ4 block decompression (exposed for tests). Returns the number of bytes written, or -1 if the block is invalid

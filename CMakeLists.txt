@@ -59,8 +59,17 @@ target_link_libraries(loader PUBLIC pal)
 
 # ---- the runtime (phase 3A: boot probe) ----
 if(WINTEARS_JIT)
+  # Horizon host: kernel svcs and system services (ported from upstream games/totk/runtime)
+  set(MNG_RUNTIME upstream/games/totk/runtime)
+  set(MNG_HOST_SOURCES ${MNG_RUNTIME}/ipc.c)   # compiled unchanged
+  add_library(host STATIC src/host/svc.c src/host/memory.c src/host/threads.c src/host/overrides.c
+              src/host/services.c ${MNG_HOST_SOURCES})
+  set_source_files_properties(${MNG_HOST_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/src/host/upstream_compat.h;-Wno-unused-parameter")
+  target_include_directories(host PUBLIC src)
+  target_link_libraries(host PUBLIC loader bridge cpu_jit pal pthread)
   add_executable(wintears src/app/main.c)
-  target_link_libraries(wintears PRIVATE loader bridge cpu_jit pal)
+  target_link_libraries(wintears PRIVATE host)
   if(CMAKE_CROSSCOMPILING)
     target_link_options(wintears PRIVATE -static)
   endif()

@@ -93,6 +93,12 @@ int pal_unreserve(uintptr_t addr, size_t size) {
     return 0;
 }
 
+int pal_reserve_dynamic(uintptr_t addr, size_t size) {
+    void *p = VirtualAlloc((void *)addr, size, MEM_RESERVE, PAGE_NOACCESS);
+    if ((uintptr_t)p != addr) { if (p) VirtualFree(p, 0, MEM_RELEASE); return -1; }
+    return 0;
+}
+
 /* Make [addr, addr + size) a placeholder of its own. Splitting fails when it already is exactly one: check that. */
 static int carve(uintptr_t addr, size_t size) {
     if (VirtualFree((void *)addr, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return 0;
@@ -169,6 +175,10 @@ int pal_protect(uintptr_t addr, size_t size, unsigned prot) {
 
 int pal_discard(uintptr_t addr, size_t size) {
     return VirtualAlloc((void *)addr, size, MEM_RESET, PAGE_NOACCESS) ? 0 : -1;
+}
+
+int pal_decommit(uintptr_t addr, size_t size) {
+    return VirtualFree((void *)addr, size, MEM_DECOMMIT) ? 0 : -1;
 }
 
 void *pal_alloc(size_t size, unsigned prot) { return VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, win_prot(prot)); }

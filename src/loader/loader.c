@@ -161,6 +161,22 @@ void ldr_describe(const ldr_set *s, uint64_t a, char *out, size_t cap) {
     else snprintf(out, cap, "0x%llx", (unsigned long long)a);
 }
 
+const char *ldr_nearest_symbol(const ldr_set *s, uint64_t a, uint64_t *off) {
+    const ldr_module *m = ldr_module_of(s, a);
+    if (!m) return NULL;
+    uint64_t rel = a - m->base, best = 0;
+    const char *name = NULL;
+    for (unsigned i = 1; i < m->nsym; i++) {
+        const ldr_sym *y = &m->symbols[i];
+        if (!y->defined || y->type != 2 || y->value > rel || y->value < best || y->value >= m->ro_off) continue;
+        if (y->size && rel >= y->value + y->size) continue;   /* past the end of a sized function */
+        best = y->value;
+        name = y->name;
+    }
+    if (name && off) *off = rel - best;
+    return name;
+}
+
 /* ---- mapping ----------------------------------------------------------------------------------------------------- */
 
 #define DT_NULL 0

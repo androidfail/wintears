@@ -22,6 +22,11 @@ int pal_reserve_fixed(uintptr_t addr, size_t size);
 /* Release a whole reservation made with pal_reserve_fixed. Every view and private piece in it must be unmapped or
    released first. */
 int pal_unreserve(uintptr_t addr, size_t size);
+/* Reserve [addr, addr + size) for memory that grows and shrinks page by page (Horizon's heap, alias and stack
+   regions): any page range in it can be committed with pal_commit and given back with pal_decommit, but it cannot
+   hold section views. Committing pages that are already committed keeps their contents; recommitted pages read as
+   zero. Released with pal_unreserve. Returns 0 on success. */
+int pal_reserve_dynamic(uintptr_t addr, size_t size);
 
 /* Anonymous memory backed by the page file that can be mapped at several addresses (Horizon's physical memory and
    its aliases). Pages are committed on first pal_commit of any view. */
@@ -42,6 +47,8 @@ int pal_commit(uintptr_t addr, size_t size, unsigned prot);
 int pal_protect(uintptr_t addr, size_t size, unsigned prot);
 /* Tell the OS the contents are no longer needed (they may read back as anything, usually zero). */
 int pal_discard(uintptr_t addr, size_t size);
+/* Give committed pages back (they stay reserved; committing them again gives zero-filled pages). */
+int pal_decommit(uintptr_t addr, size_t size);
 
 /* Plain allocations for host use. */
 void *pal_alloc(size_t size, unsigned prot);
