@@ -88,7 +88,8 @@ void runtime_account_uid(uint64_t out[2]);
 const host_fn *host_fs_override(const char *name);        /* romfs.c + fs_host.c */
 const host_fn *host_fs_host_override(const char *name);   /* fs_host.c */
 const host_fn *host_account_override(const char *name);   /* account.c */
-const host_fn *host_gfx_override(const char *name);       /* gfx_stub.c */
+const host_fn *host_gfx_override(const char *name);       /* gfx_bridge.c */
+uint64_t nvn_stub(const char *name);                       /* src/gfx/nvn.c: guest address for an NVN name, 0 if unknown */
 const host_fn *host_vi_override(const char *name);        /* vi_stub.c */
 
 /* overrides.c / services.c: host functions that replace SDK functions */

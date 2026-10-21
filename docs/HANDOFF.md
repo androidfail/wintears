@@ -24,8 +24,9 @@ of natively; everything else follows MNG's design, with graphics on Vulkan.
 | `tools/upstream_patches.py` | exact text patches applied to the work copy of upstream's scripts (never to `upstream/`); now: NSPs with unencrypted sections (type 1) | `tools/tests/test_upstream_patches.py`, 6 tests |
 | `src/loader` | maps the **original** NSO modules (LZ4) into guest memory, RELR/RELA/JMPREL relocations, cross-module linking with a resolver hook for host overrides, segment protections, address-to-module lookup; all parsed at run time, no generated tables | `tests/loader_test.c`, 43 checks (two synthetic NSOs, a JIT call through a resolved PLT slot) |
 | `wintears.exe boot <TOTK_win>` | loads main/subsdk0/sdk at upstream's guest layout, runs the SDK's `nn::init::Start` in the JIT, logs svcs (`--trace`), stops at the first unimplemented one with registers and the guest call chain | run by hand on the real game |
-| `src/host` (Horizon host) | ported from upstream `runtime/`: memory regions and svcs (`memory.c`), threads and sync on virtual cores with one `jit_core` each (`threads.c`), upstream `ipc.c` compiled unchanged, SDK overrides through bridge stubs (`overrides.c`; oe/aoc/diag/err/pctl and observers in `services.c`), RomFS backend and fs host (`romfs.c`, `fs_host.c`), local account (`account.c`); windowless `vi` with a 60 Hz vsync and graphics stand-ins (`vi_stub.c`, `gfx_stub.c`) | through the boot probe on the real game; no unit tests yet |
-| Frontend, NVN layer / Vulkan | not started (task list below) | |
+| `src/host` (Horizon host) | ported from upstream `runtime/`: memory regions and svcs (`memory.c`), threads and sync on virtual cores with one `jit_core` each (`threads.c`), upstream `ipc.c` compiled unchanged, SDK overrides through bridge stubs (`overrides.c`; oe/aoc/diag/err/pctl and observers in `services.c`), RomFS backend and fs host (`romfs.c`, `fs_host.c`), local account (`account.c`); windowless `vi` with a 60 Hz vsync (`vi_stub.c`), the SDK's graphics entry points (`gfx_bridge.c`) | through the boot probe on the real game; no unit tests yet |
+| `src/gfx` (NVN layer) | port of upstream `hle_nvn.c` + `totk_nvn_ext.c` (421 of upstream's 422 NVN functions, same signatures and object layouts; `nvn_obj.h`, `nvn_tex.c` used unchanged), each reached through its generated bridge thunk; the GPU backend interface (`nvn_backend.h`) with the **null backend** (`nvn_null.c`: event values, counter reports, buffer copies and uniform updates at submit, nothing drawn) | `tests/nvn_test.c`, 37 checks (recording lifetimes, memory accounting, deferred binds, submit effects, texture layout); the game's graphics start-up on the real game |
+| Frontend, Vulkan backend | not started (task list below) | |
 
 ## The user's NSP: unencrypted sections and a re-packed RomFS (solved)
 
@@ -81,9 +82,10 @@ Not an option: getting game files from anywhere but the user's own dump.
 2. **Horizon host**: started (2026-10-20). The boot probe on the user's files now runs `nn::init::Start`,
    `nnosInitialize`, `nninitInitializeSdkModule` (with upstream's overrides), `nninitStartup`, all three DT_INIT
    constructors and the game's `nnMain` up to graphics start-up: `nv::InitializeGraphics`, `nn::vi` (display, layer,
-   vsync event), `nvnBootstrapLoader(nvnDeviceInitialize / nvnDeviceGetProcAddress)` and stops at **the first NVN
-   call, `nvnDeviceGetProcAddress` from `main+0xe9d57c`**. No guest thread has been created and no RomFS file read
-   yet: the game sets graphics up first. How it is built:
+   vsync event), `nvnBootstrapLoader`, then (2026-10-21, NVN layer with the null backend) the whole graphics start-up:
+   NVN device, queue, a 2-image 1920x1080 RGBA8 swapchain (`nvnWindowInitialize`); it creates its first two
+   threads and stops at **`sm` service "hid"** (`nn::hid::InitializeNpad`, from `main+0x110fd20`): input is the
+   next stop. How it is built:
    - Each guest thread is a pthread (winpthreads) running its registers on the `jit_core` of the virtual core it
      holds (3 cores, upstream's scheduler). A better thread waiting for a core calls `jit_halt` on the owner, which
      gives the core up at the halt (`runtime_core_checkpoint`). Host-to-guest calls (`host_guest_call`) run nested on
@@ -97,13 +99,15 @@ Not an option: getting game files from anywhere but the user's own dump.
      output folder). The image is hashed once; `.romfs-verified-v1` next to it keeps the proof.
    - Saves and the account id live in `%LOCALAPPDATA%\WinTears\totk` (or `TOTK_PROFILE_DIR`).
 3. **Next, in order:**
-   - **NVN layer** (phase 5, the next stop): port `third_party/d2r_gfx/gfx/nvn/hle_nvn.c` (2.9k lines) with a null
-     backend first (objects and memory pools tracked, nothing drawn), so the game runs on into its threads and RomFS
-     reads; then Vulkan in place of `nvn_mtl.m` (14k lines). The 422 generated NVN thunks in `src/bridge` are its
-     entry points (`nvnBootstrapLoader` / `nvnDeviceGetProcAddress` return their stubs).
+   - **Overrides the probe asks for, in its order**: input (`nn::hid`, upstream `runtime/input.c`,
+     `hid_feedback.c`) is the next stop; then time, shared fonts, codecs, movie, applet, swkbd, audio renderer.
+   - **NVN layer, left out of the port so far** (`src/gfx/nvn.c` header comment): physical / virtual memory pools
+     (upstream `totk_vpool.c`, Mach VM aliasing; on Windows file mappings with placeholders: the run stops where the
+     game first makes one), the recording-copy marks in control memory (copies of control memory the game frees to
+     its heap stay until it is re-added), the translation thread, the game's frame-step patches.
+   - **Vulkan backend** in place of `nvn_mtl.m` (14k lines), behind `src/gfx/nvn_backend.h`.
    - **Host tests**: guest programs (`tests/guest`) that exercise the sync svcs (mutex hand-off, condition variable
      order, address arbiter, events, WaitSynchronization timeouts) on several threads.
-   - **More overrides** as the probe asks: time, input, shared fonts, codecs, movie, applet, swkbd, audio renderer.
    - **Frontend** (SDL3: window, input, audio) replaces `vi_stub.c`.
    - `long` is 32-bit on Windows: audit reused code (~540 plain `long`/`unsigned long` uses) as files are ported.
 

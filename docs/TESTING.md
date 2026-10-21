@@ -50,7 +50,7 @@ build/wintears.exe boot D:/Games/TOTK/TOTK_win --trace
 ```
 
 It loads the game's code, starts it in the JIT and runs it until the first thing the runtime cannot do yet
-(right now: the first graphics call), printing where. The first start reads the whole 17 GB RomFS image once to
+(right now: the input service `hid`, after graphics start-up), printing where. The first start reads the whole 17 GB RomFS image once to
 check it (a minute or two); later starts skip that while the file is unchanged. Saves go to
 `%LOCALAPPDATA%\WinTears\totk`. Send the last 40 lines: the output has addresses and register values, nothing from the game.
 
