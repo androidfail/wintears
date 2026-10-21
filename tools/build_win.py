@@ -39,6 +39,7 @@ UPSTREAM = REPO / 'upstream'
 GAME = UPSTREAM / 'games/totk'
 sys.path.insert(0, str(UPSTREAM))
 import build_app as mng   # noqa: E402  (upstream helpers: hash checks, container detection, genuine-dump checks)
+import romfs_rebuild      # noqa: E402
 import upstream_patches   # noqa: E402
 
 BuildError = mng.BuildError
@@ -128,6 +129,8 @@ def step_data(tree, py, game, keys, logs, *, firmware=None, shared_fonts=None):
         if romfs.exists():
             shutil.rmtree(romfs)
         run([py, 'scripts/extract_romfs.py', '--keys', keys], logs / 'extract_romfs.log', cwd=tree)
+        if json.loads(index.read_text())['romfs_sha256'] != EXPECTED['romfs']['sha256']:
+            canonical_romfs(romfs)
         check('RomFS', json.loads(index.read_text())['romfs_sha256'], EXPECTED['romfs']['sha256'])
     fonts = tree / 'extracted/firmware/shared-fonts'
     if not mng.fonts_valid(fonts):
@@ -159,6 +162,34 @@ def step_data(tree, py, game, keys, logs, *, firmware=None, shared_fonts=None):
         say('2/3 data: RomFS overlay for the 2560x1440 output')
         run([py, 'scripts/make_output_res_overlay.py', '2560x1440'], logs / 'output_res_overlay.log', cwd=tree)
     return romfs, fonts
+
+
+def canonical_romfs(romfs):
+    """The extracted RomFS passed all IVFC levels but is not the 1.0.0 image: some converters re-pack the RomFS
+    (same files, another order). Rebuild it in Nintendo's layout (tools/romfs_rebuild.py) and keep the result only
+    if it is byte for byte the verified image; otherwise stop as before."""
+    say('2/3 data: the RomFS image is not the 1.0.0 one although its hash levels verify (re-packed by a converter?); '
+        "rebuilding it in Nintendo's layout")
+    image, tmp, index = romfs / 'romfs.bin', romfs / 'romfs.rebuilt.bin', romfs / 'index.json'
+    if tmp.exists():
+        tmp.unlink()
+    try:
+        sha, size, files = romfs_rebuild.rebuild(image, tmp)
+    except ValueError as e:
+        tmp.unlink(missing_ok=True)
+        raise BuildError(f'RomFS: rebuilding it failed: {e}') from None
+    if sha != EXPECTED['romfs']['sha256'] or size != EXPECTED['romfs']['size']:
+        tmp.unlink()
+        raise BuildError(f'RomFS: SHA-256 {sha[:16]}... is not the expected {EXPECTED["romfs"]["sha256"][:16]}... even '
+                         f'rebuilt in the original layout: the files differ from 1.0.0 (another version, or modified)')
+    os.replace(tmp, image)
+    report = json.loads(index.read_text())
+    report['rebuilt_from'] = {'sha256': report['romfs_sha256'], 'size': report['romfs_size']}
+    report.update(romfs_sha256=sha, romfs_size=size, files=files,
+                  integrity=report['integrity'] + "; re-packed by a converter: rebuilt in Nintendo's layout, which "
+                                                  'matched the verified 1.0.0 SHA-256')
+    index.write_text(json.dumps(report, indent=2) + '\n')
+    say('2/3 data: the rebuilt RomFS is byte for byte the verified 1.0.0 image')
 
 
 def place(src, dst):

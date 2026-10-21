@@ -41,7 +41,9 @@ Most bugs can only be found with the real game, and the game files stay on your 
 
 ## If the build stops at "1/3 code"
 
-NSPs whose sections were decrypted by a conversion tool (encryption type 1) are supported. For anything else, run the
+NSPs whose sections were decrypted by a conversion tool (encryption type 1) are supported, and so is a RomFS a
+converter re-packed in another file order: the build rebuilds it in the original layout and uses it only if it is
+then byte for byte the verified 1.0.0 image (this needs about 17 GB more free space for a moment). For anything else, run the
 diagnostic and send its output (it prints no key values):
 
 ```
