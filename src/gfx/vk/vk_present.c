@@ -14,6 +14,7 @@ static VkSemaphore g_acquired[9], g_drawn[8];
 static unsigned g_next;
 static int g_stale;
 static uint64_t g_presents;
+uint64_t vk_present_count(void) { return g_presents; }
 
 static int create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
@@ -67,6 +68,17 @@ static void image_barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, Vk
     vkCmdPipelineBarrier2(c, &di);
 }
 
+typedef struct { uint8_t *px; uint32_t w, h, d; int bgra; char path[1024]; } shot_t;
+int vk_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h, size_t pitch);
+const char *vk_shot_path(uint64_t n);
+static void write_shot(void *arg) {   /* completion thread: the copy is done */
+    shot_t *s = arg;
+    if (s->bgra) for (size_t i = 0; i < (size_t)s->w * s->h; i++) { uint8_t t = s->px[4 * i]; s->px[4 * i] = s->px[4 * i + 2]; s->px[4 * i + 2] = t; }
+    for (size_t i = 0; i < (size_t)s->w * s->h; i++) s->px[4 * i + 3] = 255;
+    VLOG("screenshot %s (%ux%u): %s", s->path, s->w, s->h, vk_write_png(s->path, s->px, s->w, s->h, (size_t)s->w * 4) ? "FAILED" : "written");
+    free(s);
+}
+
 uint64_t vp_present(const tex_t *t, const int crop[4]) {
     if (g_stale || !g_sc) { vkDeviceWaitIdle(vk_dev); g_stale = 0; if (!create_swapchain()) return 0; }
     VkSemaphore acq = g_acquired[g_next++ % 9];
@@ -91,6 +103,19 @@ uint64_t vp_present(const tex_t *t, const int crop[4]) {
                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
         vk_barrier(c);
         vkCmdBlitImage(c, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, g_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    }
+    const char *shot = e ? vk_shot_path(g_presents + 1) : NULL;
+    VkFormat ef = e ? vt_vkformat(e) : VK_FORMAT_UNDEFINED;
+    if (shot && (ef == VK_FORMAT_R8G8B8A8_UNORM || ef == VK_FORMAT_R8G8B8A8_SRGB || ef == VK_FORMAT_B8G8R8A8_UNORM || ef == VK_FORMAT_B8G8R8A8_SRGB)) {
+        shot_t *sh = malloc(sizeof *sh);
+        vt_size(e, 0, &sh->w, &sh->h, &sh->d);
+        VkBuffer sb; VkDeviceSize so;
+        sh->px = vk_stage((VkDeviceSize)sh->w * sh->h * 4, 16, &sb, &so);
+        sh->bgra = ef == VK_FORMAT_B8G8R8A8_UNORM || ef == VK_FORMAT_B8G8R8A8_SRGB;
+        snprintf(sh->path, sizeof sh->path, "%s", shot);
+        VkBufferImageCopy r = {.bufferOffset = so, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {sh->w, sh->h, 1}};
+        vkCmdCopyImageToBuffer(c, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, sb, 1, &r);
+        vk_after(write_shot, sh);
     }
     image_barrier(c, g_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     VkSemaphoreSubmitInfo w = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = acq, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};

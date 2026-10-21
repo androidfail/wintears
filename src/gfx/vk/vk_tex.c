@@ -235,7 +235,9 @@ static VkComponentSwizzle sel(unsigned s, const VkComponentSwizzle fmt[4]) {
     return s == NVN_TEXTURE_SWIZZLE_ZERO ? VK_COMPONENT_SWIZZLE_ZERO : s == NVN_TEXTURE_SWIZZLE_ONE ? VK_COMPONENT_SWIZZLE_ONE : s <= 5 ? fmt[s - 2] : VK_COMPONENT_SWIZZLE_IDENTITY;
 }
 
-VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int attachment) {
+uint32_t vt_samples(const vtex *e) { return e->k.samples; }
+VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int mode, VkImageViewType want) {
+    int attachment = mode == VT_ATTACHMENT;
     view_key k; memset(&k, 0, sizeof k);
     int format = v && v->set_format ? v->format : t->d.format, target = v && v->set_target ? v->target : t->d.target;
     vk_fmt f;
@@ -245,6 +247,7 @@ VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int attachment) {
     k.levels = attachment ? 1 : v && v->set_levels && v->nlevels ? v->nlevels : e->levels - k.base_level;
     k.base_layer = v && v->set_layers ? v->min_layer : 0;
     k.layers = v && v->set_layers && v->nlayers ? v->nlayers : e->layers - k.base_layer;
+    if (mode == VT_STORAGE) k.levels = 1;
     if (k.base_level >= e->levels) k.base_level = e->levels - 1;
     if (k.base_level + k.levels > e->levels) k.levels = e->levels - k.base_level;
     if (k.base_layer >= e->layers) k.base_layer = e->layers - 1;
@@ -255,8 +258,10 @@ VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int attachment) {
         for (int i = 0; i < 4; i++) k.swz[i] = VK_COMPONENT_SWIZZLE_IDENTITY;
         k.aspect = e->aspect;
     } else {
-        k.type = view_type(target);
+        k.type = want != VT_ANY_TYPE ? want : view_type(target);
         if (e->type == VK_IMAGE_TYPE_3D) k.type = VK_IMAGE_VIEW_TYPE_3D;
+        if (e->type == VK_IMAGE_TYPE_1D) k.type = k.type == VK_IMAGE_VIEW_TYPE_1D_ARRAY || k.type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
+        else if (e->type == VK_IMAGE_TYPE_2D && (k.type == VK_IMAGE_VIEW_TYPE_1D || k.type == VK_IMAGE_VIEW_TYPE_1D_ARRAY || k.type == VK_IMAGE_VIEW_TYPE_3D)) k.type = VK_IMAGE_VIEW_TYPE_2D;
         if ((k.type == VK_IMAGE_VIEW_TYPE_CUBE || k.type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) && !(e->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)) k.type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
         if (k.type == VK_IMAGE_VIEW_TYPE_CUBE) k.layers = 6;
         if (k.type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) k.layers -= k.layers % 6;
@@ -264,7 +269,7 @@ VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int attachment) {
         if (k.type == VK_IMAGE_VIEW_TYPE_1D && k.layers > 1) k.layers = 1;
         unsigned s[4] = {t->d.swizzle_r, t->d.swizzle_g, t->d.swizzle_b, t->d.swizzle_a};
         if (v && v->set_swizzle) for (int i = 0; i < 4; i++) s[i] = v->swz[i];
-        for (int i = 0; i < 4; i++) k.swz[i] = sel(s[i], f.swz);
+        for (int i = 0; i < 4; i++) k.swz[i] = mode == VT_STORAGE ? VK_COMPONENT_SWIZZLE_IDENTITY : sel(s[i], f.swz);
         /* a depth / stencil image is sampled through one aspect: stencil when the view's format is the stencil one */
         k.aspect = e->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? (format == 0x31 ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT) : e->aspect;
     }
@@ -272,7 +277,8 @@ VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int attachment) {
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     VkFormatFeatureFlags ff = features(k.f);
     uci.usage = attachment ? (e->aspect & VK_IMAGE_ASPECT_COLOR_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
-                           : VK_IMAGE_USAGE_SAMPLED_BIT | (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT && e->k.samples == 1 ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+                           : mode == VT_STORAGE ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (mode == VT_STORAGE && !(ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) { VK_ONCE("format %d cannot be a storage image here", (int)k.f); return VK_NULL_HANDLE; }
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .pNext = &uci, .image = e->img, .viewType = k.type, .format = k.f,
         .components = {k.swz[0], k.swz[1], k.swz[2], k.swz[3]}, .subresourceRange = {k.aspect, k.base_level, k.levels, k.base_layer, k.layers}};
     VkImageView view;

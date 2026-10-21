@@ -26,7 +26,8 @@ of natively; everything else follows MNG's design, with graphics on Vulkan.
 | `wintears.exe boot <TOTK_win>` | loads main/subsdk0/sdk at upstream's guest layout, runs the SDK's `nn::init::Start` in the JIT, logs svcs (`--trace`), stops at the first unimplemented one with registers and the guest call chain | run by hand on the real game |
 | `src/host` (Horizon host) | ported from upstream `runtime/`: memory regions and svcs (`memory.c`), threads and sync on virtual cores with one `jit_core` each (`threads.c`), upstream `ipc.c` compiled unchanged, SDK overrides through bridge stubs (`overrides.c`; oe/aoc/diag/err/pctl and observers in `services.c`), RomFS backend and fs host (`romfs.c`, `fs_host.c`), local account (`account.c`); windowless `vi` with a 60 Hz vsync (`vi_stub.c`), the SDK's graphics entry points (`gfx_bridge.c`) | through the boot probe on the real game; no unit tests yet |
 | `src/gfx` (NVN layer) | port of upstream `hle_nvn.c` + `totk_nvn_ext.c` (421 of upstream's 422 NVN functions, same signatures and object layouts; `nvn_obj.h`, `nvn_tex.c` used unchanged), each reached through its generated bridge thunk; physical / virtual pools as sections and placeholder views (`nvn_vpool.c`); the GPU backend interface (`nvn_backend.h`) with the **null backend** (`nvn_null.c`: event values, counter reports, buffer copies and uniform updates at submit, nothing drawn) | `tests/nvn_test.c`, 47 checks (recording lifetimes, memory accounting, deferred binds, submit effects, texture layout, physical / virtual pool aliasing); the game's graphics start-up on the real game |
-| Frontend, Vulkan backend | not started (task list below) | |
+| `src/frontend` | SDL3 window on the main thread (the game on its own thread), keyboard and controllers to the Switch controller, F11 fullscreen | by hand |
+| `src/gfx/vk` (Vulkan backend) | device, guest pools as imported host memory (the heap as one import), NVN textures as images keyed by storage, uploads from pool memory with the ported dirty-page tracker (`src/gfx/nvn_dirty.c`), clears, copies, events / counters on a completion thread, present into the window; draws and dispatches with run-time shader translation (`tools/build_xlate.py` builds `wt_xlate.exe`: upstream's translator, `tools/wt_xlate/VkService.cs` for Vulkan output), pipelines with Vulkan 1.3 dynamic state, per-draw descriptor sets. `TOTK_SHOT=frame:path.png`, `TOTK_PASSLOG=frame` for checks | the real game: the title scene renders (2026-10-21); ASTC textures still blank |
 
 ## The user's NSP: unencrypted sections and a re-packed RomFS (solved)
 
@@ -102,23 +103,18 @@ Not an option: getting game files from anywhere but the user's own dump.
      output folder). The image is hashed once; `.romfs-verified-v1` next to it keeps the proof.
    - Saves and the account id live in `%LOCALAPPDATA%\WinTears\totk` (or `TOTK_PROFILE_DIR`).
 3. **Next, in order:**
-   - **Next: press buttons** (`TOTK_INPUT_SCRIPT`) to take the game past the title screen into the save / new game
-     path (savedata, the opening movie: upstream `movie_host.c` with libvpx, or the game's own decoder without it),
-     then the **Vulkan backend** for a picture. Ported so far: `src/host/input.c` (a controller
-     with nothing pressed until the frontend sets it; `TOTK_INPUT_SCRIPT` presses buttons; no rumble / six-axis),
-     `time.c` (Windows clock, IANA zone name through ICU), `fonts.c` (the six fonts from the build manifest, checked),
-     `applet.c`, the audio renderer (`audio_renderer.c`, `audio_mixer.c`: Windows copies of upstream's; the device
-     is WASAPI in `audio_out.c`; upstream `audio_effects.c`, `audio_reverb.c` compiled unchanged), the hardware Opus
-     decoder (upstream `opus_codec.c` unchanged, libopus 1.5.2 in `externals/opus`, result kinds in `codec.c`). Guest
-     `WFE` gives the virtual core up for a moment (`threads.c`). `tests/audio_test.c` runs upstream's audio probe
-     (46,587 sample checks).
+   - **Next (Vulkan backend, 2026-10-21):** the game draws its title scene. Not done yet: ASTC decoding on upload
+     (most of the game's textures; desktop GPUs have no ASTC), buffer textures (bound as zeros), partial-mask clears,
+     layered rendering (first layer only), 24-bit depth uploads, writing rendered textures back to pool memory
+     (InvalidateMappedRange), occlusion queries (always "visible"), the instance divisor extension, physical pools
+     the driver cannot import (one 111 MiB pool), background shader translation, performance (full barriers, GENERAL
+     layouts, a pass split at every inline uniform update).
    - **NVN layer, left out of the port so far** (`src/gfx/nvn.c` header comment): CPU-visible physical memory pools
      (`src/gfx/nvn_vpool.c`: they would alias the game's private heap memory), the recording-copy marks in control memory (copies of control memory the game frees to
      its heap stay until it is re-added), the translation thread, the game's frame-step patches.
-   - **Vulkan backend** in place of `nvn_mtl.m` (14k lines), behind `src/gfx/nvn_backend.h`.
    - **Host tests**: guest programs (`tests/guest`) that exercise the sync svcs (mutex hand-off, condition variable
      order, address arbiter, events, WaitSynchronization timeouts) on several threads.
-   - **Frontend** (SDL3: window, input, audio) replaces `vi_stub.c`.
+   - **Frontend** still to do: rumble, gyro, the software keyboard, a controller layout file.
    - `long` is 32-bit on Windows: audit reused code (~540 plain `long`/`unsigned long` uses) as files are ported.
 
 ## Building and testing

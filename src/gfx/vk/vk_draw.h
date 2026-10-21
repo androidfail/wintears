@@ -8,7 +8,7 @@ typedef struct {
     p_scissor sc; int has_sc;
     int render_disabled; int64_t copy_stride;
     struct { int ncolor; VkFormat color[8], depth, stencil; } pass_fmt;   /* formats of the open pass */
-    uint32_t pass_w, pass_h;
+    uint32_t pass_w, pass_h, pass_samples;
     /* bound program and state objects (vk_draw.c) */
     const prog_t *prog; int prog_stages;
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
@@ -31,3 +31,4 @@ void vd_state_op(uint32_t op, const void *a);
 void vd_draw(const p_draw *dw, const p_draw_idx *di);
 void vd_dispatch(const p_dispatch *d);
 void vd_pass_begun(void);                   /* dynamic state must be set again */
+void vd_init(void);

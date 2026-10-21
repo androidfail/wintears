@@ -39,20 +39,27 @@ Most bugs can only be found with the real game, and the game files stay on your 
 
    Logs contain file names, sizes and hashes, never key values or game content.
 
-## Boot probe (phase 3A)
+## Running the game
 
-After a data build, the runtime can be built and pointed at the output folder. In the MSYS2 UCRT64 shell, from the
-repository folder:
+After a data build, the runtime and the shader translator can be built and pointed at the output folder. In the MSYS2
+UCRT64 shell, from the repository folder:
 
 ```
-cmake -S . -B build -G Ninja && cmake --build build
-build/wintears.exe boot D:/Games/TOTK/TOTK_win --trace
+cmake -S . -B build -G Ninja && cmake --build build -j4
+python tools/build_xlate.py          # once, and after the translator changes: build/shader-service/wt_xlate.exe
+build/wintears.exe boot D:/Games/TOTK/TOTK_win
 ```
 
-It loads the game's code, starts it in the JIT and runs it until the first thing the runtime cannot do yet
-(right now nothing: it runs the game's main loop, with sound, until you close it; no window yet), printing where. The first start reads the whole 17 GB RomFS image once to
-check it (a minute or two); later starts skip that while the file is unchanged. Saves go to
-`%LOCALAPPDATA%\WinTears\totk`. Send the last 40 lines: the output has addresses and register values, nothing from the game.
+`build_xlate.py` needs the .NET 10 SDK and the Visual Studio C++ build tools (both are on your PC). The game opens a
+window and draws with Vulkan. Keyboard (as on the Mac version): WASD left stick, arrow keys right stick, J = A,
+K / Space = B, I = X, U = Y, Q = L, E = R, Left Alt = ZL, Left Shift = ZR, Enter = Plus, Tab / Escape = Minus,
+F G H T = d-pad; F11 = fullscreen. A controller works too (Switch layout by position: east = A, south = B).
+
+The first start reads the whole 17 GB RomFS image once to check it (a minute or two); later starts skip that while the
+file is unchanged. Shaders are translated the first time they appear (short stutters), then cached in
+`%LOCALAPPDATA%\WinTears\totk\shader-cache`. Saves go to `%LOCALAPPDATA%\WinTears\totk`. `--no-window` runs without
+a window (nothing drawn); `--trace` logs every svc. Send the last 40 lines of the output when something stops: it has
+addresses and register values, nothing from the game.
 
 ## If the build stops at "1/3 code"
 

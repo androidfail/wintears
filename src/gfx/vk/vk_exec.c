@@ -31,9 +31,22 @@ static void do_counter(void *arg) {
     free(c);
 }
 
+/* ---------- TOTK_PASSLOG=<present>: one line per pass and copy of the submissions between that present and the next */
+static int g_plog = -1; int vk_passlog_on;
+uint64_t vk_present_count(void);
+static int plog(void) {
+    if (g_plog < 0) { const char *e = pal_getenv("TOTK_PASSLOG"); g_plog = e ? atoi(e) : 0; }
+    return vk_passlog_on = g_plog && vk_present_count() == (uint64_t)g_plog;
+}
+static int g_pass_draws, g_pass_clears;
+void vx_note_draw(void) { g_pass_draws++; }
+
 /* ---------- render passes ---------- */
 void vx_end_pass(void) {
     if (!g_pass) return;
+    if (plog()) VLOG("[pass] %ux%u colors %d (%d %d) depth %d: %d draws, %d clears", S.pass_w, S.pass_h, S.pass_fmt.ncolor, (int)S.pass_fmt.color[0], (int)S.pass_fmt.color[1],
+                     (int)S.pass_fmt.depth, g_pass_draws, g_pass_clears);
+    g_pass_draws = g_pass_clears = 0;
     vkCmdEndRendering(vk_cmd());
     vk_barrier(vk_cmd());
     g_pass = 0;
@@ -47,7 +60,7 @@ static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uin
         if (i >= S.rt.n || !S.rt.color[i]) continue;
         const view_t *v = S.rt.has_cview[i] ? &S.rt.cview[i] : NULL;
         if (!(col[i] = vt_get(S.rt.color[i]))) continue;
-        if (!(cv[i] = vt_view(col[i], S.rt.color[i], v, 1))) { col[i] = NULL; continue; }
+        if (!(cv[i] = vt_view(col[i], S.rt.color[i], v, VT_ATTACHMENT, VT_ANY_TYPE))) { col[i] = NULL; continue; }
         unsigned lv = v && v->set_levels ? v->base_level : 0; uint32_t a, b, c; vt_size(col[i], lv, &a, &b, &c);
         uint32_t nl = v && v->set_layers && v->nlayers ? v->nlayers : vt_layers(col[i]);
         *w = a < *w ? a : *w; *h = b < *h ? b : *h; *layers = nl < *layers ? nl : *layers;
@@ -56,7 +69,7 @@ static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uin
     *dep = NULL; *dv = VK_NULL_HANDLE;
     if (S.rt.depth && (*dep = vt_get(S.rt.depth))) {
         const view_t *v = S.rt.has_dview ? &S.rt.dview : NULL;
-        if ((*dv = vt_view(*dep, S.rt.depth, v, 1))) {
+        if ((*dv = vt_view(*dep, S.rt.depth, v, VT_ATTACHMENT, VT_ANY_TYPE))) {
             unsigned lv = v && v->set_levels ? v->base_level : 0; uint32_t a, b, c; vt_size(*dep, lv, &a, &b, &c);
             uint32_t nl = v && v->set_layers && v->nlayers ? v->nlayers : vt_layers(*dep);
             *w = a < *w ? a : *w; *h = b < *h ? b : *h; *layers = nl < *layers ? nl : *layers;
@@ -93,7 +106,9 @@ static int begin_pass(void) {
     for (int i = 0; i < 8; i++) S.pass_fmt.color[i] = i < n && col[i] ? vt_vkformat(col[i]) : VK_FORMAT_UNDEFINED;
     S.pass_fmt.depth = has_d ? vt_vkformat(dep) : VK_FORMAT_UNDEFINED;
     S.pass_fmt.stencil = has_s ? vt_vkformat(dep) : VK_FORMAT_UNDEFINED;
-    S.pass_w = w; S.pass_h = h;
+    S.pass_w = w; S.pass_h = h; S.pass_samples = 1;
+    for (int i = 0; i < n; i++) if (col[i]) { S.pass_samples = vt_samples(col[i]); break; }
+    if (dep && S.pass_samples == 1) S.pass_samples = vt_samples(dep);
     vkCmdBeginRendering(vk_cmd(), &ri);
     g_pass = 1;
     vd_pass_begun();
@@ -120,6 +135,7 @@ static void clear_color(const p_clear_color *c) {
     if (!begin_pass()) return;
     if (S.pass_fmt.color[c->index] == VK_FORMAT_UNDEFINED) return;
     if ((c->mask & 0xf) != 0xf) { g_stat_skip[0]++; VK_ONCE("colour clear with channel mask %#x: done as a full clear for now", c->mask); }
+    g_pass_clears++;
     VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index};
     memcpy(ca.clearValue.color.float32, c->rgba, 16);   /* integer targets: NVN passes the integer bits the same way */
     VkClearRect r = {clear_rect(), 0, 1};
@@ -219,6 +235,8 @@ static void copy_t2b(const p_copy_b2t *c) {   /* the T2B record: tex is the sour
 }
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = c->src ? vt_get(c->src) : NULL, *d = c->dst ? vt_get(c->dst) : NULL;
+    if (plog()) VLOG("[pass] copy %ux%u fmt %#x -> %ux%u fmt %#x (%s %s)", c->src ? c->src->d.width : 0, c->src ? c->src->d.height : 0, c->src ? c->src->d.format : 0,
+                     c->dst ? c->dst->d.width : 0, c->dst ? c->dst->d.height : 0, c->dst ? c->dst->d.format : 0, s ? "src" : "-", d ? "dst" : "-");
     if (!s || !d) return;
     VkImageSubresourceLayers ss, ds; VkOffset3D so, dof; VkExtent3D sx, dx;
     region(s, &c->sr, view_level(&c->sv, c->has_sv), view_layer(&c->sv, c->has_sv), &ss, &so, &sx);

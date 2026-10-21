@@ -1,6 +1,8 @@
 /* Vulkan backend: device, guest memory pools, submissions and their completion, and the gpu_ops table. */
 #include "gfx/vk/vk.h"
 #include <SDL3/SDL_vulkan.h>
+#include "gfx/vk/vk_draw.h"
+#include "gfx/vk/vk_shader.h"
 #include <stdatomic.h>
 
 #include "frontend/frontend.h"
@@ -380,7 +382,7 @@ static int init(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, done_thread, NULL)) die("Vulkan: completion thread");
     pthread_detach(t);
-    vt_init();
+    vt_init(); vs_init(); vd_init();
     if (vp_init()) return -1;
     return 0;
 }
@@ -393,7 +395,7 @@ static void set_tex_pool_n(int n) { vt_set_pool_n(n); }
 static void reg_tex(int id, const tex_t *t, const view_t *v) { vt_reg_tex(id, t, v); }
 static void reg_samp(int id, const samp_par *p) { vt_reg_samp(id, p); }
 static void tex_release(tex_t *t) { if (t->serial) vt_release_serial(t->serial); }
-static void prog_release(prog_t *p) { (void)p; }
+static void prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&vk_mu); vs_prog_release(p->serial); pthread_mutex_unlock(&vk_mu); }
 static void window_tex(uint64_t serial) { (void)serial; }
 
 static uint64_t submit(const uint64_t *handles, int n) {

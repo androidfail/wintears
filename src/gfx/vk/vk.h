@@ -64,6 +64,7 @@ typedef struct { VkFormat vk; VkComponentSwizzle swz[4]; uint8_t depth, stencil,
    on upload (vk_tex.c says which). */
 int vk_fmt_of(int nvn_format, vk_fmt *out);
 int vk_fmt_block_compressed(VkFormat f);   /* BC / ETC / EAC / ASTC */
+VkFormat vk_vfmt(int nvn_format);          /* vertex attribute format, VK_FORMAT_UNDEFINED if none */
 
 /* vk_tex.c ------------------------------------------------------------------------------------------------------ */
 typedef struct vtex vtex;
@@ -78,8 +79,13 @@ VkImageAspectFlags vt_aspect(const vtex *e);
 int vt_depth(const vtex *e);
 void vt_size(const vtex *e, unsigned level, uint32_t *w, uint32_t *h, uint32_t *d);
 uint32_t vt_layers(const vtex *e);
-/* A view: the whole texture (v NULL) or an NVN view. attachment: one level, the view's layers, no swizzle. */
-VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int attachment);
+/* A view: the whole texture (v NULL) or an NVN view. mode: VT_SAMPLED (NVN swizzle, the view's levels / layers),
+   VT_ATTACHMENT (one level, no swizzle), VT_STORAGE (no swizzle). want: the view type the shader declares, or
+   VT_ANY_TYPE for the texture's own. */
+enum { VT_SAMPLED, VT_ATTACHMENT, VT_STORAGE };
+#define VT_ANY_TYPE VK_IMAGE_VIEW_TYPE_MAX_ENUM
+VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int mode, VkImageViewType want);
+uint32_t vt_samples(const vtex *e);
 void vt_release_serial(uint64_t serial);
 void vt_pool_gone(uintptr_t lo, uintptr_t hi);   /* images over a finalised pool */
 void vt_end_submission(void);                    /* idle images are released */
