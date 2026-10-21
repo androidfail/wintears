@@ -84,9 +84,11 @@ Not an option: getting game files from anywhere but the user's own dump.
    constructors and the game's `nnMain` up to graphics start-up: `nv::InitializeGraphics`, `nn::vi` (display, layer,
    vsync event), `nvnBootstrapLoader`, then (2026-10-21, NVN layer with the null backend) the whole graphics start-up:
    NVN device, queue, a 2-image 1920x1080 RGBA8 swapchain (`nvnWindowInitialize`); it creates its first two
-   threads; with input, time, shared fonts, applet overrides and NVN physical / virtual pools it goes on to 30
-   threads and stops at **`sm` service "audren:u"** (`nn::audio::GetAudioRendererWorkBufferSize`): the audio
-   renderer is the next stop. How it is built:
+   threads; with input, time, shared fonts, applet overrides, NVN physical / virtual pools, the audio renderer and
+   the Opus decoder **the game runs its main loop**: 55 threads, the startup logo finished ("game finished startup
+   logo"), then a steady 30 fps (present interval 2) on the null GPU backend for as long as it is left running, with
+   music mixed and played through WASAPI. Most likely the title screen waiting for a button (no picture yet to check).
+   How it is built:
    - Each guest thread is a pthread (winpthreads) running its registers on the `jit_core` of the virtual core it
      holds (3 cores, upstream's scheduler). A better thread waiting for a core calls `jit_halt` on the owner, which
      gives the core up at the halt (`runtime_core_checkpoint`). Host-to-guest calls (`host_guest_call`) run nested on
@@ -100,11 +102,16 @@ Not an option: getting game files from anywhere but the user's own dump.
      output folder). The image is hashed once; `.romfs-verified-v1` next to it keeps the proof.
    - Saves and the account id live in `%LOCALAPPDATA%\WinTears\totk` (or `TOTK_PROFILE_DIR`).
 3. **Next, in order:**
-   - **Overrides the probe asks for, in its order**: the audio renderer (upstream `runtime/audio_renderer.c`,
-     `audio_mixer.c`) is the next stop; then codecs, movie, swkbd. Ported so far: `src/host/input.c` (a controller
+   - **Next: press buttons** (`TOTK_INPUT_SCRIPT`) to take the game past the title screen into the save / new game
+     path (savedata, the opening movie: upstream `movie_host.c` with libvpx, or the game's own decoder without it),
+     then the **Vulkan backend** for a picture. Ported so far: `src/host/input.c` (a controller
      with nothing pressed until the frontend sets it; `TOTK_INPUT_SCRIPT` presses buttons; no rumble / six-axis),
      `time.c` (Windows clock, IANA zone name through ICU), `fonts.c` (the six fonts from the build manifest, checked),
-     `applet.c`. Guest `WFE` gives the virtual core up for a moment (`threads.c`).
+     `applet.c`, the audio renderer (`audio_renderer.c`, `audio_mixer.c`: Windows copies of upstream's; the device
+     is WASAPI in `audio_out.c`; upstream `audio_effects.c`, `audio_reverb.c` compiled unchanged), the hardware Opus
+     decoder (upstream `opus_codec.c` unchanged, libopus 1.5.2 in `externals/opus`, result kinds in `codec.c`). Guest
+     `WFE` gives the virtual core up for a moment (`threads.c`). `tests/audio_test.c` runs upstream's audio probe
+     (46,587 sample checks).
    - **NVN layer, left out of the port so far** (`src/gfx/nvn.c` header comment): CPU-visible physical memory pools
      (`src/gfx/nvn_vpool.c`: they would alias the game's private heap memory), the recording-copy marks in control memory (copies of control memory the game frees to
      its heap stay until it is re-added), the translation thread, the game's frame-step patches.

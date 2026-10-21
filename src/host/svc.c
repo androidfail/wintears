@@ -54,6 +54,10 @@ void host_init(ldr_set *mods) {
 }
 
 void host_set_trace(int svcs) { host_trace_svcs = svcs; }
+uint64_t runtime_now_ns(void) { return pal_now_ns(); }   /* upstream name (audio renderer) */
+/* Upstream's GPU dirty tracking write-protects pool pages and opens them before the host writes guest memory; the
+   null GPU backend tracks nothing. */
+void dm_guest_write_prepare(void *addr, size_t n) { (void)addr; (void)n; }
 
 static char data_dir[1024], profile_dir[1024];
 void host_set_dirs(const char *data, const char *profile) {

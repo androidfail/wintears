@@ -40,6 +40,13 @@ if(WINTEARS_JIT)
   # Older MinGW-w64 headers lack the newer CPU topology structs xbyak's cache query uses; dynarmic does not need it.
   add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:XBYAK_CPU_CACHE=0>)
   add_subdirectory(externals/dynarmic EXCLUDE_FROM_ALL)
+  # libopus (externals/opus, v1.5.2): the hardware Opus decoder upstream implements with it (game voices)
+  set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+  set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+  set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+  set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+  set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+  add_subdirectory(externals/opus EXCLUDE_FROM_ALL)
   add_library(cpu_jit STATIC src/cpu/jit/jit.cpp)
   target_include_directories(cpu_jit PUBLIC src/cpu)
   target_compile_options(cpu_jit PRIVATE -mcx16)
@@ -61,16 +68,22 @@ target_link_libraries(loader PUBLIC pal)
 if(WINTEARS_JIT)
   # Horizon host: kernel svcs and system services (ported from upstream games/totk/runtime)
   set(MNG_RUNTIME upstream/games/totk/runtime)
-  set(MNG_HOST_SOURCES ${MNG_RUNTIME}/ipc.c)   # compiled unchanged
+  set(MNG_HOST_SOURCES ${MNG_RUNTIME}/ipc.c ${MNG_RUNTIME}/audio_effects.c ${MNG_RUNTIME}/audio_reverb.c
+      ${MNG_RUNTIME}/opus_codec.c)   # compiled unchanged
+  set(MNG_HOST_COPIES src/host/audio_renderer.c src/host/audio_mixer.c)   # Windows copies, compiled the same way
   add_library(host STATIC src/host/svc.c src/host/memory.c src/host/threads.c src/host/overrides.c
               src/host/services.c src/host/sha256.c src/host/romfs.c src/host/fs_host.c src/host/account.c
               src/host/gfx_bridge.c src/host/vi_stub.c src/host/input.c src/host/time.c src/host/fonts.c
-              src/host/applet.c
-              ${MNG_HOST_SOURCES})
-  set_source_files_properties(${MNG_HOST_SOURCES} PROPERTIES
+              src/host/applet.c src/host/audio_out.c src/host/codec.c
+              ${MNG_HOST_SOURCES} ${MNG_HOST_COPIES})
+  set_source_files_properties(${MNG_HOST_SOURCES} ${MNG_HOST_COPIES} PROPERTIES
     COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/src/host/upstream_compat.h;-Wno-unused-parameter")
+  set_source_files_properties(${MNG_HOST_COPIES} PROPERTIES INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/${MNG_RUNTIME})
   target_include_directories(host PUBLIC src)
-  target_link_libraries(host PUBLIC loader bridge cpu_jit pal pthread bcrypt)
+  target_link_libraries(host PUBLIC loader bridge cpu_jit pal pthread bcrypt ole32 opus)
+  # Upstream services register themselves from constructors (audio_renderer.c: audren:u); nothing else refers to
+  # their objects, so the archive would drop them.
+  target_link_options(host INTERFACE "LINKER:-u,runtime_audio_register")
   # NVN layer (ported from upstream third_party/d2r_gfx/gfx/nvn) with the null GPU backend. An object library, linked
   # directly into each program: its functions register themselves from constructors, which an archive would drop.
   file(STRINGS ${NVN_DIR}/names.txt NVN_NAMES)
@@ -114,6 +127,9 @@ if(WINTEARS_TESTS)
     add_executable(nvn_test tests/nvn_test.c)
     target_link_libraries(nvn_test PRIVATE gfx)
     add_test(NAME nvn COMMAND nvn_test)
+    add_executable(audio_test tests/audio_test.c)
+    target_link_libraries(audio_test PRIVATE gfx)
+    add_test(NAME audio COMMAND audio_test)
   endif()
   if(CMAKE_CROSSCOMPILING)
     # MinGW runtime DLLs next to the tests so Wine (and a copied folder on Windows) finds them.
@@ -123,6 +139,7 @@ if(WINTEARS_TESTS)
       target_link_options(bridge_test PRIVATE -static)
       target_link_options(loader_test PRIVATE -static)
       target_link_options(nvn_test PRIVATE -static)
+      target_link_options(audio_test PRIVATE -static)
     endif()
   endif()
 endif()

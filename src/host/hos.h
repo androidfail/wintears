@@ -97,6 +97,7 @@ const host_fn *host_input_override(const char *name);     /* input.c */
 const host_fn *host_time_override(const char *name);      /* time.c */
 const host_fn *host_font_override(const char *name);      /* fonts.c */
 const host_fn *host_applet_override(const char *name);    /* applet.c */
+const host_fn *host_codec_override(const char *name);     /* codec.c (upstream opus_codec.c) */
 int runtime_handheld_mode(void);                           /* services.c: TOTK_OPERATION_MODE=handheld */
 void runtime_oe_push_message(uint32_t message);            /* applet.c: an oe notification message for the game */
 

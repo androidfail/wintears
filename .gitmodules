@@ -4,3 +4,6 @@
 [submodule "externals/dynarmic"]
 	path = externals/dynarmic
 	url = https://github.com/azahar-emu/dynarmic
+[submodule "externals/opus"]
+	path = externals/opus
+	url = https://github.com/xiph/opus
