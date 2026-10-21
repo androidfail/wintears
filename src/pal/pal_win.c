@@ -58,7 +58,7 @@ size_t pal_alloc_granularity(void) { SYSTEM_INFO s; GetSystemInfo(&s); return s.
 
 /* Reservations made by pal_reserve_fixed: an address inside one is a placeholder piece, so views and private pieces
    there are replaced into, and given back as, placeholders. */
-#define MAX_RESERVATIONS 32
+#define MAX_RESERVATIONS 128   /* guest regions, plus one per NVN virtual memory pool */
 static struct { uintptr_t base; size_t size; } reservations[MAX_RESERVATIONS];
 static SRWLOCK reservation_lock = SRWLOCK_INIT;
 
@@ -83,6 +83,25 @@ int pal_reserve_fixed(uintptr_t addr, size_t size) {
     ReleaseSRWLockExclusive(&reservation_lock);
     if (slot < 0) { VirtualFree(p, 0, MEM_RELEASE); return -1; }
     return 0;
+}
+
+uintptr_t pal_reserve_below(size_t size, uintptr_t limit) {
+    apis();
+    if (!p_VirtualAlloc2 || !limit) return 0;
+    MEM_ADDRESS_REQUIREMENTS req = {0};
+    req.HighestEndingAddress = (PVOID)(limit - 1);
+    MEM_EXTENDED_PARAMETER ext = {0};
+    ext.Type = MemExtendedParameterAddressRequirements;
+    ext.Pointer = &req;
+    void *p = p_VirtualAlloc2(NULL, NULL, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &ext, 1);
+    if (!p) return 0;
+    AcquireSRWLockExclusive(&reservation_lock);
+    int slot = -1;
+    for (int i = 0; i < MAX_RESERVATIONS; i++) if (!reservations[i].size) { slot = i; break; }
+    if (slot >= 0) { reservations[slot].base = (uintptr_t)p; reservations[slot].size = size; }
+    ReleaseSRWLockExclusive(&reservation_lock);
+    if (slot < 0) { VirtualFree(p, 0, MEM_RELEASE); return 0; }
+    return (uintptr_t)p;
 }
 
 int pal_unreserve(uintptr_t addr, size_t size) {

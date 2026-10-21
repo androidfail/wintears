@@ -25,7 +25,7 @@ of natively; everything else follows MNG's design, with graphics on Vulkan.
 | `src/loader` | maps the **original** NSO modules (LZ4) into guest memory, RELR/RELA/JMPREL relocations, cross-module linking with a resolver hook for host overrides, segment protections, address-to-module lookup; all parsed at run time, no generated tables | `tests/loader_test.c`, 43 checks (two synthetic NSOs, a JIT call through a resolved PLT slot) |
 | `wintears.exe boot <TOTK_win>` | loads main/subsdk0/sdk at upstream's guest layout, runs the SDK's `nn::init::Start` in the JIT, logs svcs (`--trace`), stops at the first unimplemented one with registers and the guest call chain | run by hand on the real game |
 | `src/host` (Horizon host) | ported from upstream `runtime/`: memory regions and svcs (`memory.c`), threads and sync on virtual cores with one `jit_core` each (`threads.c`), upstream `ipc.c` compiled unchanged, SDK overrides through bridge stubs (`overrides.c`; oe/aoc/diag/err/pctl and observers in `services.c`), RomFS backend and fs host (`romfs.c`, `fs_host.c`), local account (`account.c`); windowless `vi` with a 60 Hz vsync (`vi_stub.c`), the SDK's graphics entry points (`gfx_bridge.c`) | through the boot probe on the real game; no unit tests yet |
-| `src/gfx` (NVN layer) | port of upstream `hle_nvn.c` + `totk_nvn_ext.c` (421 of upstream's 422 NVN functions, same signatures and object layouts; `nvn_obj.h`, `nvn_tex.c` used unchanged), each reached through its generated bridge thunk; the GPU backend interface (`nvn_backend.h`) with the **null backend** (`nvn_null.c`: event values, counter reports, buffer copies and uniform updates at submit, nothing drawn) | `tests/nvn_test.c`, 37 checks (recording lifetimes, memory accounting, deferred binds, submit effects, texture layout); the game's graphics start-up on the real game |
+| `src/gfx` (NVN layer) | port of upstream `hle_nvn.c` + `totk_nvn_ext.c` (421 of upstream's 422 NVN functions, same signatures and object layouts; `nvn_obj.h`, `nvn_tex.c` used unchanged), each reached through its generated bridge thunk; physical / virtual pools as sections and placeholder views (`nvn_vpool.c`); the GPU backend interface (`nvn_backend.h`) with the **null backend** (`nvn_null.c`: event values, counter reports, buffer copies and uniform updates at submit, nothing drawn) | `tests/nvn_test.c`, 47 checks (recording lifetimes, memory accounting, deferred binds, submit effects, texture layout, physical / virtual pool aliasing); the game's graphics start-up on the real game |
 | Frontend, Vulkan backend | not started (task list below) | |
 
 ## The user's NSP: unencrypted sections and a re-packed RomFS (solved)
@@ -84,8 +84,9 @@ Not an option: getting game files from anywhere but the user's own dump.
    constructors and the game's `nnMain` up to graphics start-up: `nv::InitializeGraphics`, `nn::vi` (display, layer,
    vsync event), `nvnBootstrapLoader`, then (2026-10-21, NVN layer with the null backend) the whole graphics start-up:
    NVN device, queue, a 2-image 1920x1080 RGBA8 swapchain (`nvnWindowInitialize`); it creates its first two
-   threads and stops at **`sm` service "hid"** (`nn::hid::InitializeNpad`, from `main+0x110fd20`): input is the
-   next stop. How it is built:
+   threads; with input, time, shared fonts, applet overrides and NVN physical / virtual pools it goes on to 30
+   threads and stops at **`sm` service "audren:u"** (`nn::audio::GetAudioRendererWorkBufferSize`): the audio
+   renderer is the next stop. How it is built:
    - Each guest thread is a pthread (winpthreads) running its registers on the `jit_core` of the virtual core it
      holds (3 cores, upstream's scheduler). A better thread waiting for a core calls `jit_halt` on the owner, which
      gives the core up at the halt (`runtime_core_checkpoint`). Host-to-guest calls (`host_guest_call`) run nested on
@@ -99,11 +100,13 @@ Not an option: getting game files from anywhere but the user's own dump.
      output folder). The image is hashed once; `.romfs-verified-v1` next to it keeps the proof.
    - Saves and the account id live in `%LOCALAPPDATA%\WinTears\totk` (or `TOTK_PROFILE_DIR`).
 3. **Next, in order:**
-   - **Overrides the probe asks for, in its order**: input (`nn::hid`, upstream `runtime/input.c`,
-     `hid_feedback.c`) is the next stop; then time, shared fonts, codecs, movie, applet, swkbd, audio renderer.
-   - **NVN layer, left out of the port so far** (`src/gfx/nvn.c` header comment): physical / virtual memory pools
-     (upstream `totk_vpool.c`, Mach VM aliasing; on Windows file mappings with placeholders: the run stops where the
-     game first makes one), the recording-copy marks in control memory (copies of control memory the game frees to
+   - **Overrides the probe asks for, in its order**: the audio renderer (upstream `runtime/audio_renderer.c`,
+     `audio_mixer.c`) is the next stop; then codecs, movie, swkbd. Ported so far: `src/host/input.c` (a controller
+     with nothing pressed until the frontend sets it; `TOTK_INPUT_SCRIPT` presses buttons; no rumble / six-axis),
+     `time.c` (Windows clock, IANA zone name through ICU), `fonts.c` (the six fonts from the build manifest, checked),
+     `applet.c`. Guest `WFE` gives the virtual core up for a moment (`threads.c`).
+   - **NVN layer, left out of the port so far** (`src/gfx/nvn.c` header comment): CPU-visible physical memory pools
+     (`src/gfx/nvn_vpool.c`: they would alias the game's private heap memory), the recording-copy marks in control memory (copies of control memory the game frees to
      its heap stay until it is re-added), the translation thread, the game's frame-step patches.
    - **Vulkan backend** in place of `nvn_mtl.m` (14k lines), behind `src/gfx/nvn_backend.h`.
    - **Host tests**: guest programs (`tests/guest`) that exercise the sync svcs (mutex hand-off, condition variable

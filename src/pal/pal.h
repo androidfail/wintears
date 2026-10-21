@@ -19,6 +19,8 @@ size_t pal_alloc_granularity(void);   /* 64 KiB on Windows: fixed views and rese
 /* Reserve [addr, addr + size) without committing it, so nothing else in the process can take that range. The range
    can later be filled piece by piece with pal_map_view or pal_commit_private. Returns 0 on success. */
 int pal_reserve_fixed(uintptr_t addr, size_t size);
+/* The same, anywhere below limit (the system picks the address). Returns the address, 0 if there is no room. */
+uintptr_t pal_reserve_below(size_t size, uintptr_t limit);
 /* Release a whole reservation made with pal_reserve_fixed. Every view and private piece in it must be unmapped or
    released first. */
 int pal_unreserve(uintptr_t addr, size_t size);

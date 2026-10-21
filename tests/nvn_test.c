@@ -7,6 +7,7 @@
 
 #include "gfx/nvn_reg.h"
 #include "nvn_obj.h"
+#include "totk_vpool.h"
 
 static int failures, checks;
 #define CHECK(c) do { checks++; if (!(c)) { failures++; fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); } } while (0)
@@ -184,12 +185,50 @@ static void test_texture(void) {
     F(nvnTextureFinalize)(&t);
 }
 
+/* Physical / virtual pools: a virtual page is a view of a physical pool's page (writes through either are the same
+   memory), the virtual range is in the guest's address space, and remapping / unmapping works page by page. */
+static void pool_init(NVNmemoryPool *p, void *storage, size_t size, int flags) {
+    NVNmemoryPoolBuilder b; memset(&b, 0, sizeof b);
+    F(nvnMemoryPoolBuilderSetDefaults)(&b);
+    F(nvnMemoryPoolBuilderSetStorage)(&b, storage, size);
+    F(nvnMemoryPoolBuilderSetFlags)(&b, flags);
+    CHECK(F(nvnMemoryPoolInitialize)(p, &b));
+}
+static void test_vpool(void) {
+    enum { PAGE = 0x10000 };
+    static _Alignas(4096) uint8_t storage[4 * PAGE];
+    NVNmemoryPool phys, virt;
+    pool_init(&phys, storage, sizeof storage, NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS);
+    pool_init(&virt, NULL, 4 * PAGE, NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_GPU_CACHED);
+    uint8_t *pm = ((pool_t *)&phys)->mem, *vm = (uint8_t *)(uintptr_t)F(nvnMemoryPoolGetBufferAddress)(&virt);
+    CHECK(pm && pm != storage);
+    CHECK(vm && (uintptr_t)vm + 4 * PAGE <= (1ull << 39));
+    pm[2 * PAGE + 5] = 0x5a;
+    totk_mapping_request r[2]; memset(r, 0, sizeof r);   /* the runtime-verified 0x28-byte layout (totk_vpool.h) */
+    const NVNmappingRequest *rq = (const NVNmappingRequest *)(const void *)r;
+    r[0] = (totk_mapping_request){(const NVNmemoryPool *)&phys, 2 * PAGE, 1 * PAGE, 2 * PAGE, 0, 0};   /* virtual 1-2 = physical 2-3 */
+    CHECK(F(nvnMemoryPoolMapVirtual)(&virt, 1, rq));
+    CHECK(vm[PAGE + 5] == 0x5a);
+    vm[2 * PAGE + 7] = 0xa5;                       /* through the virtual view... */
+    CHECK(pm[3 * PAGE + 7] == 0xa5);               /* ...into the physical page */
+    r[0] = (totk_mapping_request){(const NVNmemoryPool *)&phys, 0, 2 * PAGE, PAGE, 0, 0};             /* remap virtual 2 = physical 0 */
+    r[1] = (totk_mapping_request){NULL, 0, 1 * PAGE, PAGE, 0, 0};                                      /* unmap virtual 1 */
+    CHECK(F(nvnMemoryPoolMapVirtual)(&virt, 2, rq));
+    vm[2 * PAGE] = 0x11;
+    CHECK(pm[0] == 0x11 && pm[3 * PAGE + 7] == 0xa5);
+    r[0] = (totk_mapping_request){(const NVNmemoryPool *)&phys, 0, 3 * PAGE, 2 * PAGE, 0, 0};         /* past the end: refused */
+    CHECK(!F(nvnMemoryPoolMapVirtual)(&virt, 1, rq));
+    F(nvnMemoryPoolFinalize)(&virt);
+    F(nvnMemoryPoolFinalize)(&phys);
+}
+
 int main(void) {
     test_commands();
     test_usage();
     test_deferred();
     test_null_backend();
     test_texture();
+    test_vpool();
     printf("nvn_test: %d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

@@ -225,6 +225,15 @@ static void run(thr_t *t, jit_context *c) {
         if (stop == JIT_STOP_EXCEPTION) {
             uint64_t pc;
             int kind = jit_exception(jc, &pc);
+            if (kind == JIT_EXC_WAIT) {
+                /* WFE / WFI (the SDK's light message queues and spin locks wait for an event with WFE): the core is
+                   given up for a moment so other guest threads run, then the guest continues after the instruction,
+                   as after a spurious wake-up (the code re-checks its condition). */
+                int away = runtime_core_away();
+                pal_yield();
+                runtime_core_back(&away);
+                continue;
+            }
             uint32_t insn = 0;
             pal_guarded_copy(&insn, (const void *)(uintptr_t)pc, 4);
             char where[96];

@@ -39,6 +39,7 @@ static int handheld_mode(void) {
     }
     return v;
 }
+int runtime_handheld_mode(void) { return handheld_mode(); }   /* input.c: the pad is the handheld controller then */
 static int operation_mode(void) { return handheld_mode() ? 0 : 1; }
 static int performance_mode(void) { return handheld_mode() ? 0 : 1; }
 static int focus_policy;
@@ -163,6 +164,10 @@ static const host_fn *find(const host_fn *t, size_t n, const char *name) {
 }
 const host_fn *host_service_override(const char *name) {
     const host_fn *f = find(overrides, sizeof overrides / sizeof *overrides, name);
+    if (!f) f = host_input_override(name);   /* upstream's order: input, fonts, codecs, movie, time, applet, swkbd, ... */
+    if (!f) f = host_font_override(name);
+    if (!f) f = host_time_override(name);
+    if (!f) f = host_applet_override(name);
     if (!f) f = host_account_override(name);
     if (!f) f = host_fs_override(name);
     if (!f) f = host_gfx_override(name);

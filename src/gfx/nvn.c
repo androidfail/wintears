@@ -18,6 +18,7 @@
 #include "gfx/nvn_backend.h"
 #include "nvn_hmap.h"
 #include "nvn_pace.h"
+#include "totk_vpool.h"
 
 #define OLOG(...) do { if (g_log) LOG("[nvn] " __VA_ARGS__); } while (0)
 static int g_log;   /* TOTK_NVN_LOG=1 logs object creation (upstream DM_NVN_LOG) */
@@ -210,11 +211,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
-    /* upstream totk_vpool.c aliases 64 KiB pages with Mach VM; the Windows version (file mappings and placeholders) is
-       not written yet, so the run stops where the game first asks for one */
-    if (o->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL))
-        die("NVN %s memory pool (size %#llx flags %#x): not ported yet (upstream totk_vpool.c)",
-            o->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL ? "virtual" : "physical", (unsigned long long)o->size, o->flags);
+    if ((o->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) && !totk_vpool_init(o)) { o->magic = 0; return 0; }   /* nvn_vpool.c */
     int gpu_visible = !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS);
     if (o->mem && gpu_visible) gpu_pool_add(o->mem, o->size);
     if (!o->mem) LOG("nvnMemoryPoolInitialize: pool without storage, flags=%#x size=%#llx", o->flags, (unsigned long long)o->size);
@@ -225,7 +222,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     pool_t *o = (pool_t *)p;
     if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) gpu_pool_del(o->mem);
-    o->magic = 0;
+    totk_vpool_fini(o); o->magic = 0;
 }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
 NVN(nvnMemoryPoolGetFlags, NVNmemoryPoolFlags, const NVNmemoryPool *p) { return (NVNmemoryPoolFlags)((const pool_t *)p)->flags; }
@@ -235,7 +232,7 @@ NVN(nvnMemoryPoolMap, void *, const NVNmemoryPool *p) {
     return (v->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ? NULL : v->mem;
 }
 NVN(nvnMemoryPoolMapVirtual, NVNboolean, NVNmemoryPool *p, int n, const NVNmappingRequest *r) {
-    (void)p; (void)n; (void)r; die("nvnMemoryPoolMapVirtual: virtual memory pools are not ported yet (upstream totk_vpool.c)");
+    return (NVNboolean)totk_vpool_map((pool_t *)p, n, (const totk_mapping_request *)(const void *)r);
 }
 NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)(uintptr_t)((const pool_t *)p)->mem; }
 

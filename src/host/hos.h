@@ -19,7 +19,8 @@ _Noreturn void runtime_fail(const char *message);   /* upstream name */
 static inline int dm_detclock_enabled(void) { return 0; }
 
 /* A host function replacing an SDK function, and how its result goes back to the guest's x0 (overrides.c). */
-enum { HOST_RET_VOID, HOST_RET_U8, HOST_RET_U32, HOST_RET_U64 };
+enum { HOST_RET_VOID, HOST_RET_U8, HOST_RET_U32, HOST_RET_U64,
+       HOST_RET_VOID_FF };   /* two float arguments (v0, v1 -> xmm0, xmm1), no result */
 typedef struct { const char *name; void *fn; int ret; } host_fn;
 
 extern ldr_set *host_mods;
@@ -42,6 +43,7 @@ void host_tls_free(uint64_t tls);
 uint64_t host_return_trap(void);                  /* svc #HOST_RETURN_SVC */
 uint64_t host_main_stack(uint64_t *size);
 uint64_t host_object_page(void);                  /* a guest page for host tokens the game only passes back (vi Display, Layer) */
+void *host_guest_alloc(size_t size);              /* zeroed guest-visible memory for host data the game reads; never freed */
 #define HOST_RETURN_SVC 0xfffeu
 
 /* threads.c */
@@ -91,6 +93,19 @@ const host_fn *host_account_override(const char *name);   /* account.c */
 const host_fn *host_gfx_override(const char *name);       /* gfx_bridge.c */
 uint64_t nvn_stub(const char *name);                       /* src/gfx/nvn.c: guest address for an NVN name, 0 if unknown */
 const host_fn *host_vi_override(const char *name);        /* vi_stub.c */
+const host_fn *host_input_override(const char *name);     /* input.c */
+const host_fn *host_time_override(const char *name);      /* time.c */
+const host_fn *host_font_override(const char *name);      /* fonts.c */
+const host_fn *host_applet_override(const char *name);    /* applet.c */
+int runtime_handheld_mode(void);                           /* services.c: TOTK_OPERATION_MODE=handheld */
+void runtime_oe_push_message(uint32_t message);            /* applet.c: an oe notification message for the game */
+
+/* input.c: the controller state the frontend sets (libnx button bits: A 1, B 2, X 4, Y 8, L stick 16, R stick 32, L 64,
+   R 128, ZL 256, ZR 512, Plus 1024, Minus 2048, Left 4096, Up 8192, Right 16384, Down 32768; sticks -32767..32767) */
+typedef struct { uint64_t buttons; int32_t lx, ly, rx, ry; } host_pad;
+void host_input_set_pad(const host_pad *p);
+void host_input_clear(void);
+void host_input_start(void);                              /* TOTK_INPUT_SCRIPT */
 
 /* overrides.c / services.c: host functions that replace SDK functions */
 const host_fn *host_service_override(const char *name);   /* upstream runtime_override */

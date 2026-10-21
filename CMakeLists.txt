@@ -64,7 +64,8 @@ if(WINTEARS_JIT)
   set(MNG_HOST_SOURCES ${MNG_RUNTIME}/ipc.c)   # compiled unchanged
   add_library(host STATIC src/host/svc.c src/host/memory.c src/host/threads.c src/host/overrides.c
               src/host/services.c src/host/sha256.c src/host/romfs.c src/host/fs_host.c src/host/account.c
-              src/host/gfx_bridge.c src/host/vi_stub.c
+              src/host/gfx_bridge.c src/host/vi_stub.c src/host/input.c src/host/time.c src/host/fonts.c
+              src/host/applet.c
               ${MNG_HOST_SOURCES})
   set_source_files_properties(${MNG_HOST_SOURCES} PROPERTIES
     COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/src/host/upstream_compat.h;-Wno-unused-parameter")
@@ -82,7 +83,7 @@ if(WINTEARS_JIT)
   endforeach()
   string(APPEND NVN_NAMES_C "};\nconst unsigned nvn_name_count = sizeof nvn_names / sizeof *nvn_names;\n")
   file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/nvn_names.c CONTENT "${NVN_NAMES_C}")
-  add_library(gfx OBJECT src/gfx/nvn.c src/gfx/nvn_ext.c src/gfx/nvn_null.c ${NVN_DIR}/nvn_tex.c ${CMAKE_BINARY_DIR}/nvn_names.c)
+  add_library(gfx OBJECT src/gfx/nvn.c src/gfx/nvn_ext.c src/gfx/nvn_vpool.c src/gfx/nvn_null.c ${NVN_DIR}/nvn_tex.c ${CMAKE_BINARY_DIR}/nvn_names.c)
   target_include_directories(gfx PUBLIC src ${NVN_DIR} ${NVN_DIR}/include)
   target_link_libraries(gfx PUBLIC host)
   add_executable(wintears src/app/main.c)

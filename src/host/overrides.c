@@ -4,8 +4,9 @@
    the result back in x0.
 
    That covers what upstream's overrides take: integers and pointers (guest pointers are host pointers here), up to
-   eight of them, returning nothing, an integer of 8, 32 or 64 bits, or a bool. A function with floating-point
-   arguments or a by-value struct needs a thunk of its own (generated ones exist for NVN, src/bridge). */
+   eight of them, returning nothing, an integer of 8, 32 or 64 bits, or a bool (an 8-byte struct comes back in x0 /
+   rax on both sides, so it counts as a 64-bit integer). Floating-point arguments need a thunk of their own:
+   HOST_RET_VOID_FF takes two floats (oe::SetExpectedVolumeBalance); NVN has generated ones (src/bridge). */
 #include "host/hos.h"
 
 typedef uint64_t (*fn8)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t);
@@ -17,12 +18,17 @@ static void t_void(jit_context *c, void *fn) { ((fn8v)fn)(ARGS(c->x)); }
 static void t_u64(jit_context *c, void *fn) { c->x[0] = ((fn8)fn)(ARGS(c->x)); }
 static void t_u32(jit_context *c, void *fn) { c->x[0] = (uint32_t)((fn8)fn)(ARGS(c->x)); }
 static void t_u8(jit_context *c, void *fn) { c->x[0] = (uint8_t)((fn8)fn)(ARGS(c->x)); }
+static void t_void_ff(jit_context *c, void *fn) {   /* (float, float): s0 and s1, the low words of v0 and v1 */
+    float a, b; memcpy(&a, &c->v[0][0], 4); memcpy(&b, &c->v[1][0], 4);
+    ((void (*)(float, float))fn)(a, b);
+}
 
 static bridge_thunk thunk_of(int ret) {
     switch (ret) {
     case HOST_RET_VOID: return t_void;
     case HOST_RET_U8: return t_u8;
     case HOST_RET_U32: return t_u32;
+    case HOST_RET_VOID_FF: return t_void_ff;
     default: return t_u64;
     }
 }

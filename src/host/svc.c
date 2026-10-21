@@ -50,6 +50,7 @@ void runtime_trace_guest(uint64_t fp, uint64_t lr) {
 void host_init(ldr_set *mods) {
     host_mods = mods;
     threads_init();
+    host_input_start();
 }
 
 void host_set_trace(int svcs) { host_trace_svcs = svcs; }

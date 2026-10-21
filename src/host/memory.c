@@ -8,6 +8,8 @@
        +0x0000_0000  code: the modules (placeholder reservation, the loader commits them)
        +0x0fc0_0000  runtime page, 4 MiB: bridge stubs, return trap, user exception context, TLS blocks
        +0x1000_0000  stack region, 256 MiB (MapMemory targets; the main thread's stack at its top)
+       +0x2000_0000  host arena, 256 MiB: host data the game reads (shared fonts); upstream mallocs it, which on
+                     Windows can land above the 2^39 guest address space
        +0x3000_0000  heap, up to 4 GiB (SetHeapSize)
      alias region, 64 GiB at 0x70_0000_0000 (MapPhysicalMemory), or next to the low region if that is taken */
 #define _CRT_RAND_S   /* rand_s */
@@ -27,6 +29,8 @@
 #define STACK_SIZE 0x10000000ull
 #define HEAP_OFF (STACK_OFF + STACK_SIZE + 0x10000000ull)
 #define HEAP_CAP (4ull << 30)
+#define ARENA_OFF (STACK_OFF + STACK_SIZE)
+#define ARENA_SIZE (HEAP_OFF - ARENA_OFF)
 #define APP_POOL 0xcd500000ull     /* retail 3.2 GiB application pool (upstream app_pool without TOTK_OUTPUT_RES) */
 #define SYSTEM_RESOURCE_BUDGET (32ull << 20)
 #define GAME_PROGRAM_ID 0x0100f2c0115b6000ull
@@ -42,7 +46,7 @@
 #define TLS_STRIDE 0x3000
 #define TLS_COUNT ((RUNTIME_SIZE - RT_TLS) / TLS_STRIDE)
 
-static uint64_t low, alias_start, alias_size = ALIAS_SIZE_MAX, heap, heap_size, alias_bytes;
+static uint64_t low, alias_start, alias_size = ALIAS_SIZE_MAX, heap, heap_size, alias_bytes, arena_used;
 static bridge *stubs;
 static pal_mutex memory_lock = PAL_MUTEX_INIT;
 typedef struct { uint64_t dst, src, size; } StackMap;
@@ -108,6 +112,18 @@ int host_memory_init(char *err, size_t cap) {
         (unsigned long long)heap, (unsigned long long)HEAP_CAP, (unsigned long long)ALIAS_START,
         (unsigned long long)ALIAS_SIZE);
     return stubs ? 0 : -1;
+}
+
+void *host_guest_alloc(size_t size) {
+    uint64_t n = ((uint64_t)size + 4095) & ~4095ull;
+    pal_mutex_lock(&memory_lock);
+    if (!n || n > ARENA_SIZE - arena_used) die("host arena full (%llu of %llu bytes used, %zu more asked)",
+                                               (unsigned long long)arena_used, (unsigned long long)ARENA_SIZE, size);
+    uint64_t at = low + ARENA_OFF + arena_used;
+    arena_used += n;
+    pal_mutex_unlock(&memory_lock);
+    if (pal_commit((uintptr_t)at, (size_t)n, PAL_PROT_READ | PAL_PROT_WRITE)) die("host arena commit");
+    return (void *)(uintptr_t)at;
 }
 
 uint64_t host_tls_alloc(void) {
@@ -309,8 +325,9 @@ static void query_memory(uint64_t *r) {
     else if (module_query(addr, &base, &size, &state, &perm, &attr)) {}
     else if (addr >= rt && addr < rt + RUNTIME_SIZE) { state = 3; perm = 5; }    /* host-owned (upstream: host memory) */
     else if (addr >= heap && addr < heap + heap_size) { base = heap; size = heap_size; state = 5; perm = 3; }
+    else if (addr >= low + ARENA_OFF && addr < low + ARENA_OFF + ARENA_SIZE) { base = low + ARENA_OFF; size = ARENA_SIZE; state = 3; perm = 3; }
     else if (addr >= low && addr < low + LOW_SIZE) {
-        if (addr < heap) { base = low; size = heap - low; }
+        if (addr < heap) { base = low; size = ARENA_OFF; }
         else { base = heap + heap_size; size = low + LOW_SIZE - base; }
     }
     else if (addr >= low + LOW_SIZE && addr < ALIAS_START) { base = low + LOW_SIZE; size = ALIAS_START - base; state = 0x10; }
