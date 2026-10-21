@@ -1,0 +1,440 @@
+/* Vulkan backend: device, guest memory pools, submissions and their completion, and the gpu_ops table. */
+#include "gfx/vk/vk.h"
+#include <SDL3/SDL_vulkan.h>
+#include <stdatomic.h>
+
+#include "frontend/frontend.h"
+#include "nvn_dirty.h"
+#include "nvn_pool_index.h"
+
+VkInstance vk_inst;
+VkPhysicalDevice vk_phys;
+VkDevice vk_dev;
+VkQueue vk_q;
+uint32_t vk_qfam;
+VmaAllocator vk_vma;
+VkPhysicalDeviceProperties vk_props;
+VkSurfaceKHR vk_surface;
+pthread_mutex_t vk_mu = PTHREAD_MUTEX_INITIALIZER;
+
+uint64_t vk_ticks(void) { uint64_t ns = pal_now_ns(); return ns / 625 * 12 + ns % 625 * 12 / 625; }
+
+/* ---------- instance and device ---------- */
+static VKAPI_ATTR VkBool32 VKAPI_CALL on_debug(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
+                                               const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
+    (void)type; (void)user;
+    static int n;
+    if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && n++ < 400) VLOG("validation: %s", d->pMessage);
+    return VK_FALSE;
+}
+
+static int has_ext(const VkExtensionProperties *e, uint32_t n, const char *name) {
+    for (uint32_t i = 0; i < n; i++) if (!strcmp(e[i].extensionName, name)) return 1;
+    return 0;
+}
+
+static int create_instance(int validate) {
+    PFN_vkGetInstanceProcAddr gipa = (PFN_vkGetInstanceProcAddr)SDL_Vulkan_GetVkGetInstanceProcAddr();
+    if (!gipa) { VLOG("no Vulkan loader (vulkan-1.dll): %s", SDL_GetError()); return -1; }
+    volkInitializeCustom(gipa);
+    uint32_t n = 0;
+    const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n);
+    const char *ext[16]; uint32_t ne = 0;
+    for (uint32_t i = 0; i < n && ne < 15; i++) ext[ne++] = sdl_ext[i];
+    if (validate) ext[ne++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    const char *layer = "VK_LAYER_KHRONOS_validation";
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "WinTears", .apiVersion = VK_API_VERSION_1_3};
+    VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app, .enabledExtensionCount = ne,
+                               .ppEnabledExtensionNames = ext, .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = &layer};
+    VkResult r = vkCreateInstance(&ci, NULL, &vk_inst);
+    if (r != VK_SUCCESS && validate) { VLOG("validation layer not available (%d): running without it", (int)r); return create_instance(0); }
+    if (r != VK_SUCCESS) { VLOG("vkCreateInstance failed (%d)", (int)r); return -1; }
+    volkLoadInstanceOnly(vk_inst);
+    if (validate) {
+        VkDebugUtilsMessengerCreateInfoEXT di = {VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+            .pfnUserCallback = on_debug};
+        VkDebugUtilsMessengerEXT m; vkCreateDebugUtilsMessengerEXT(vk_inst, &di, NULL, &m);
+        VLOG("validation layer on (TOTK_VK_VALIDATE)");
+    }
+    return 0;
+}
+
+static const char *const DEV_EXT[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME};
+enum { NDEV_EXT = sizeof DEV_EXT / sizeof *DEV_EXT };
+
+/* A device with Vulkan 1.3, the extensions above and a queue for graphics, compute and the window. Discrete first. */
+static int pick_device(void) {
+    uint32_t n = 0; vkEnumeratePhysicalDevices(vk_inst, &n, NULL);
+    VkPhysicalDevice devs[16]; if (n > 16) n = 16;
+    vkEnumeratePhysicalDevices(vk_inst, &n, devs);
+    int best = -1, best_score = -1; uint32_t best_q = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        VkPhysicalDeviceProperties p; vkGetPhysicalDeviceProperties(devs[i], &p);
+        uint32_t ne = 0; vkEnumerateDeviceExtensionProperties(devs[i], NULL, &ne, NULL);
+        VkExtensionProperties *e = malloc(ne * sizeof *e); vkEnumerateDeviceExtensionProperties(devs[i], NULL, &ne, e);
+        int ok = p.apiVersion >= VK_API_VERSION_1_3;
+        for (int k = 0; k < NDEV_EXT; k++) if (!has_ext(e, ne, DEV_EXT[k])) { ok = 0; VLOG("%s: no %s", p.deviceName, DEV_EXT[k]); }
+        free(e);
+        uint32_t nq = 0; vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &nq, NULL);
+        VkQueueFamilyProperties q[16]; if (nq > 16) nq = 16;
+        vkGetPhysicalDeviceQueueFamilyProperties(devs[i], &nq, q);
+        int qf = -1;
+        for (uint32_t k = 0; k < nq && qf < 0; k++) {
+            VkBool32 pres = 0; vkGetPhysicalDeviceSurfaceSupportKHR(devs[i], k, vk_surface, &pres);
+            if ((q[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (q[k].queueFlags & VK_QUEUE_COMPUTE_BIT) && pres) qf = (int)k;
+        }
+        if (qf < 0) ok = 0;
+        int score = !ok ? -1 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
+        VLOG("GPU %u: %s (Vulkan %u.%u.%u)%s", i, p.deviceName, VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion),
+             VK_API_VERSION_PATCH(p.apiVersion), ok ? "" : " - not usable");
+        if (score > best_score) { best_score = score; best = (int)i; best_q = (uint32_t)qf; }
+    }
+    if (best < 0) { VLOG("no usable GPU (needs Vulkan 1.3 with %s)", VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME); return -1; }
+    vk_phys = devs[best]; vk_qfam = best_q;
+    vkGetPhysicalDeviceProperties(vk_phys, &vk_props);
+    return 0;
+}
+
+static VkDeviceSize g_host_align = 4096;
+
+static int create_device(void) {
+    /* Every feature the GPU has, except the robustness ones (bounds checks the game does not need, and they cost). */
+    VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
+    VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12};
+    VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
+    vkGetPhysicalDeviceFeatures2(vk_phys, &f);
+    f.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE;
+    if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) { VLOG("the GPU lacks dynamic rendering / synchronization2 / timeline semaphores"); return -1; }
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = vk_qfam, .queueCount = 1, .pQueuePriorities = &prio};
+    VkDeviceCreateInfo ci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
+                             .enabledExtensionCount = NDEV_EXT, .ppEnabledExtensionNames = DEV_EXT};
+    VkResult r = vkCreateDevice(vk_phys, &ci, NULL, &vk_dev);
+    if (r != VK_SUCCESS) { VLOG("vkCreateDevice failed (%d)", (int)r); return -1; }
+    volkLoadDevice(vk_dev);
+    vkGetDeviceQueue(vk_dev, vk_qfam, 0, &vk_q);
+    VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp};
+    vkGetPhysicalDeviceProperties2(vk_phys, &p2);
+    g_host_align = hp.minImportedHostPointerAlignment;
+    VLOG("device %s, driver %#x, imported memory alignment %llu, at most %u allocations, BC %s, ASTC %s",
+         vk_props.deviceName, vk_props.driverVersion, (unsigned long long)g_host_align, vk_props.limits.maxMemoryAllocationCount,
+         f.features.textureCompressionBC ? "yes" : "no", f.features.textureCompressionASTC_LDR ? "yes" : "no (decoded on upload)");
+    VmaVulkanFunctions vf = {.vkGetInstanceProcAddr = vkGetInstanceProcAddr, .vkGetDeviceProcAddr = vkGetDeviceProcAddr};
+    VmaAllocatorCreateInfo ai = {.physicalDevice = vk_phys, .device = vk_dev, .instance = vk_inst, .vulkanApiVersion = VK_API_VERSION_1_3,
+                                 .pVulkanFunctions = &vf};
+    VKC(vmaCreateAllocator(&ai, &vk_vma));
+    return 0;
+}
+
+/* ---------- guest memory pools ----------
+   Each GPU-visible pool becomes a VkBuffer over the game's memory (imported host memory, no copy). The game keeps a few
+   thousand pools alive, more than the allocation limit of some drivers (4096), so pools inside the guest heap share one
+   import of the whole heap; other pools (the alias region) get their own. */
+typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; int refs; } import_t;
+static pidx g_imports;               /* sorted by address, key = import_t * */
+static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_pool_n, g_import_n;
+
+static import_t *import_range(uintptr_t lo, uintptr_t hi) {
+    VkMemoryHostPointerPropertiesEXT hp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (vkGetMemoryHostPointerPropertiesEXT(vk_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)lo, &hp) != VK_SUCCESS || !hp.memoryTypeBits)
+        return NULL;
+    VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = hi - lo, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
+    VkBuffer buf;
+    if (vkCreateBuffer(vk_dev, &bi, NULL, &buf) != VK_SUCCESS) return NULL;
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(vk_dev, buf, &req);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(vk_phys, &mp);
+    uint32_t type = UINT32_MAX, bits = hp.memoryTypeBits & req.memoryTypeBits;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && type == UINT32_MAX; i++)   /* host coherent first: CPU and GPU see each other's writes */
+        if ((bits >> i & 1) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) type = i;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && type == UINT32_MAX; i++) if (bits >> i & 1) type = i;
+    VkImportMemoryHostPointerInfoEXT im = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+                                           .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = (void *)lo};
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = hi - lo, .memoryTypeIndex = type};
+    VkDeviceMemory mem;
+    if (type == UINT32_MAX || vkAllocateMemory(vk_dev, &mi, NULL, &mem) != VK_SUCCESS) { vkDestroyBuffer(vk_dev, buf, NULL); return NULL; }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) { vkFreeMemory(vk_dev, mem, NULL); vkDestroyBuffer(vk_dev, buf, NULL); return NULL; }
+    import_t *im_ = calloc(1, sizeof *im_);
+    *im_ = (import_t){lo, hi, mem, buf, 0};
+    pidx_ent e = {lo, hi, lo, im_, 0, im_, 0};
+    if (!pidx_insert(&g_imports, &e)) die("Vulkan: pool table");
+    g_import_n++;
+    return im_;
+}
+
+static void pool_add(const void *mem, uint64_t size) {
+    if (!size) return;
+    uintptr_t a = (uintptr_t)mem, b = a + size, lo = a & ~(uintptr_t)(g_host_align - 1), hi = (b + g_host_align - 1) & ~(uintptr_t)(g_host_align - 1);
+    pthread_mutex_lock(&g_pool_mu);
+    pidx_ent *e = pidx_find_mut(&g_imports, a, size);
+    import_t *im = e ? e->buf : NULL;
+    if (!im) {
+        uint64_t hb, hs; host_heap_range(&hb, &hs);
+        if (a >= hb && b <= hb + hs) im = import_range((uintptr_t)hb, (uintptr_t)(hb + hs));
+        if (!im) im = import_range(lo, hi);
+        if (!im) VK_ONCE("memory pool %p+%#llx cannot be imported: the GPU does not see it (first case)", mem, (unsigned long long)size);
+    }
+    if (im) im->refs++;
+    g_pool_n++;
+    pthread_mutex_unlock(&g_pool_mu);
+    nvn_dirty_add_range(mem, (size_t)size);
+}
+
+static void free_import(void *arg) { import_t *im = arg; vkDestroyBuffer(vk_dev, im->buf, NULL); vkFreeMemory(vk_dev, im->mem, NULL); free(im); }
+static void pool_del(const void *mem) {
+    nvn_dirty_remove_range(mem);
+    pthread_mutex_lock(&g_pool_mu);
+    pidx_ent *e = pidx_find_mut(&g_imports, (uintptr_t)mem, 1);
+    import_t *im = e ? e->buf : NULL;
+    uintptr_t lo = 0, hi = 0;
+    if (im && !--im->refs) {
+        uint64_t hb, hs; host_heap_range(&hb, &hs);
+        if (im->lo != (uintptr_t)hb) {   /* the heap import stays */
+            lo = im->lo; hi = im->hi;
+            pidx_remove(&g_imports, im, NULL);
+            g_import_n--;
+        } else im = NULL;
+    } else im = NULL;
+    g_pool_n--;
+    pthread_mutex_unlock(&g_pool_mu);
+    if (hi > lo) {
+        pthread_mutex_lock(&vk_mu);
+        vt_pool_gone(lo, hi);
+        vk_open(); vk_after(free_import, im);   /* once the GPU is done with it */
+        vk_flush(NULL, NULL);
+        pthread_mutex_unlock(&vk_mu);
+    }
+}
+
+int vk_buf(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
+    pthread_mutex_lock(&g_pool_mu);
+    const pidx_ent *e = pidx_find(&g_imports, (uintptr_t)addr, len ? len : 1);
+    if (e) { *buf = ((import_t *)e->buf)->buf; *off = addr - e->lo; }
+    pthread_mutex_unlock(&g_pool_mu);
+    return e != NULL;
+}
+
+/* ---------- submissions ---------- */
+typedef struct chunk { VkBuffer buf; VmaAllocation al; uint8_t *map; VkDeviceSize size, used; struct chunk *next; } chunk;
+typedef struct { void (*fn)(void *); void *arg; } act_t;
+typedef struct sub {
+    VkCommandPool pool; VkCommandBuffer pre, main;
+    uint64_t fence; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
+} sub;
+#define CHUNK_SIZE (64ull << 20)
+enum { MAX_IN_FLIGHT = 6 };
+static VkSemaphore g_tl;
+static sub *g_cur, *g_free_subs, *g_fly_head, *g_fly_tail;
+static chunk *g_free_chunks;
+static int g_in_flight, g_free_chunk_n;
+static uint64_t g_fence, g_done, g_serial;
+static _Atomic uint64_t g_game_fence;
+static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_done_cv = PTHREAD_COND_INITIALIZER;
+
+void vk_barrier(VkCommandBuffer c) {
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(c, &di);
+}
+
+static sub *take_sub(void) {
+    pthread_mutex_lock(&g_done_mu);
+    while (g_in_flight >= MAX_IN_FLIGHT) pthread_cond_wait(&g_done_cv, &g_done_mu);
+    sub *s = g_free_subs; if (s) g_free_subs = s->next;
+    pthread_mutex_unlock(&g_done_mu);
+    if (s) { VKC(vkResetCommandPool(vk_dev, s->pool, 0)); return s; }
+    s = calloc(1, sizeof *s);
+    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, .queueFamilyIndex = vk_qfam};
+    VKC(vkCreateCommandPool(vk_dev, &pi, NULL, &s->pool));
+    VkCommandBuffer cb[2];
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = s->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 2};
+    VKC(vkAllocateCommandBuffers(vk_dev, &ai, cb));
+    s->pre = cb[0]; s->main = cb[1];
+    return s;
+}
+
+void vk_open(void) {
+    if (g_cur) return;
+    sub *s = take_sub();
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VKC(vkBeginCommandBuffer(s->pre, &bi)); VKC(vkBeginCommandBuffer(s->main, &bi));
+    vk_barrier(s->pre);    /* after everything submitted earlier */
+    vk_barrier(s->main);   /* after this submission's uploads */
+    g_cur = s; g_serial++;
+}
+VkCommandBuffer vk_cmd(void) { vk_open(); return g_cur->main; }
+VkCommandBuffer vk_pre(void) { vk_open(); return g_cur->pre; }
+uint64_t vk_sub_serial(void) { return g_serial; }
+
+void vk_after(void (*fn)(void *), void *arg) {
+    vk_open();
+    sub *s = g_cur;
+    if (s->nact == s->cact) { s->cact = s->cact ? s->cact * 2 : 64; s->acts = realloc(s->acts, (size_t)s->cact * sizeof *s->acts); if (!s->acts) die("Vulkan: completion list"); }
+    s->acts[s->nact++] = (act_t){fn, arg};
+}
+
+static chunk *new_chunk(VkDeviceSize size) {
+    pthread_mutex_lock(&g_done_mu);
+    chunk *c = size <= CHUNK_SIZE ? g_free_chunks : NULL;
+    if (c) { g_free_chunks = c->next; g_free_chunk_n--; }
+    pthread_mutex_unlock(&g_done_mu);
+    if (c) { c->used = 0; return c; }
+    c = calloc(1, sizeof *c);
+    c->size = size > CHUNK_SIZE ? size : CHUNK_SIZE;
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = c->size,
+                             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VmaAllocationCreateInfo ac = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT, .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+    VmaAllocationInfo info;
+    VKC(vmaCreateBuffer(vk_vma, &bi, &ac, &c->buf, &c->al, &info));
+    c->map = info.pMappedData;
+    return c;
+}
+void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
+    vk_open();
+    if (align < 16) align = 16;
+    chunk *c = g_cur->chunks;
+    VkDeviceSize at = c ? (c->used + align - 1) & ~(align - 1) : 0;
+    if (!c || at + n > c->size) { c = new_chunk(n); c->next = g_cur->chunks; g_cur->chunks = c; at = 0; }
+    c->used = at + n; *buf = c->buf; *off = at;
+    return c->map + at;
+}
+
+uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo *signal) {
+    vk_open();
+    sub *s = g_cur;
+    VKC(vkEndCommandBuffer(s->pre)); VKC(vkEndCommandBuffer(s->main));
+    VkCommandBufferSubmitInfo cb[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->pre},
+                                       {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main}};
+    VkSemaphoreSubmitInfo sig[2] = {{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_tl, .value = g_fence + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
+    if (signal) sig[1] = *signal;
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = wait,
+                        .commandBufferInfoCount = 2, .pCommandBufferInfos = cb, .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig};
+    VkResult r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
+    if (r != VK_SUCCESS) die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
+    s->fence = ++g_fence; s->next = NULL;
+    g_cur = NULL;
+    pthread_mutex_lock(&g_done_mu);
+    if (g_fly_tail) g_fly_tail->next = s; else g_fly_head = s;
+    g_fly_tail = s; g_in_flight++;
+    pthread_cond_broadcast(&g_done_cv);
+    pthread_mutex_unlock(&g_done_mu);
+    return s->fence;
+}
+
+static void *done_thread(void *unused) {
+    (void)unused;
+    pal_thread_set_name("vk completion");
+    for (;;) {
+        pthread_mutex_lock(&g_done_mu);
+        while (!g_fly_head) pthread_cond_wait(&g_done_cv, &g_done_mu);
+        sub *s = g_fly_head;
+        pthread_mutex_unlock(&g_done_mu);
+        VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_tl, .pValues = &s->fence};
+        VkResult r = vkWaitSemaphores(vk_dev, &wi, UINT64_MAX);
+        if (r != VK_SUCCESS) die("Vulkan: waiting for the GPU failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
+        for (int i = 0; i < s->nact; i++) s->acts[i].fn(s->acts[i].arg);
+        s->nact = 0;
+        pthread_mutex_lock(&g_done_mu);
+        for (chunk *c = s->chunks, *nx; c; c = nx) {
+            nx = c->next;
+            if (c->size == CHUNK_SIZE && g_free_chunk_n < 4) { c->next = g_free_chunks; g_free_chunks = c; g_free_chunk_n++; }
+            else { vmaDestroyBuffer(vk_vma, c->buf, c->al); free(c); }
+        }
+        s->chunks = NULL;
+        g_fly_head = s->next; if (!g_fly_head) g_fly_tail = NULL;
+        g_done = s->fence; g_in_flight--;
+        s->next = g_free_subs; g_free_subs = s;
+        pthread_cond_broadcast(&g_done_cv);
+        pthread_mutex_unlock(&g_done_mu);
+    }
+    return NULL;
+}
+
+void vk_wait_done(uint64_t fence) {
+    pthread_mutex_lock(&g_done_mu);
+    while (g_done < fence) pthread_cond_wait(&g_done_cv, &g_done_mu);
+    pthread_mutex_unlock(&g_done_mu);
+}
+
+/* ---------- gpu_ops ---------- */
+static int init(void) {
+    if (!fe_window()) return -1;
+    const char *v = pal_getenv("TOTK_VK_VALIDATE");
+    if (create_instance(v && *v == '1')) return -1;
+    if (!SDL_Vulkan_CreateSurface(fe_window(), vk_inst, NULL, &vk_surface)) { VLOG("window surface: %s", SDL_GetError()); return -1; }
+    if (pick_device() || create_device()) return -1;
+    VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+    VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti};
+    VKC(vkCreateSemaphore(vk_dev, &si, NULL, &g_tl));
+    pthread_t t;
+    if (pthread_create(&t, NULL, done_thread, NULL)) die("Vulkan: completion thread");
+    pthread_detach(t);
+    vt_init();
+    if (vp_init()) return -1;
+    return 0;
+}
+
+static void pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
+    (void)p; (void)off; (void)n;   /* imported memory is coherent; what the GPU rendered into textures stays in the images */
+    VK_ONCE("the CPU reads pool memory the GPU wrote (InvalidateMappedRange): rendered textures are not written back yet");
+}
+static void set_tex_pool_n(int n) { vt_set_pool_n(n); }
+static void reg_tex(int id, const tex_t *t, const view_t *v) { vt_reg_tex(id, t, v); }
+static void reg_samp(int id, const samp_par *p) { vt_reg_samp(id, p); }
+static void tex_release(tex_t *t) { if (t->serial) vt_release_serial(t->serial); }
+static void prog_release(prog_t *p) { (void)p; }
+static void window_tex(uint64_t serial) { (void)serial; }
+
+static uint64_t submit(const uint64_t *handles, int n) {
+    pthread_mutex_lock(&vk_mu);
+    vk_open();
+    for (int i = 0; i < n; i++) vx_run((const uint8_t *)(uintptr_t)handles[i]);
+    vx_submit_done();
+    vx_end_pass();
+    uint64_t f = vk_flush(NULL, NULL);
+    atomic_store(&g_game_fence, f);
+    vt_end_submission();
+    pthread_mutex_unlock(&vk_mu);
+    static int said; if (!said++) VLOG("first submission (%d command lists)", n);
+    return f;
+}
+static uint64_t last_fence(void) { return atomic_load(&g_game_fence); }
+static int wait_fence(uint64_t fence, uint64_t timeout_ns) {
+    pthread_mutex_lock(&g_done_mu);
+    if (g_done < fence && timeout_ns) {
+        uint64_t end = pal_wall_time_ns() + (timeout_ns > (1ull << 62) ? (1ull << 62) : timeout_ns);
+        struct timespec ts = {(time_t)(end / 1000000000ull), (long)(end % 1000000000ull)};
+        while (g_done < fence && pthread_cond_timedwait(&g_done_cv, &g_done_mu, &ts) == 0) {}
+    }
+    int ok = g_done >= fence;
+    pthread_mutex_unlock(&g_done_mu);
+    return ok;
+}
+static void finish(void) {
+    pthread_mutex_lock(&vk_mu); uint64_t f = g_fence; pthread_mutex_unlock(&vk_mu);
+    vk_wait_done(f);
+}
+static uint64_t present(const tex_t *t, double period_s, const int crop[4]) {
+    (void)period_s;
+    pthread_mutex_lock(&vk_mu);
+    uint64_t f = vp_present(t, crop);
+    pthread_mutex_unlock(&vk_mu);
+    return f;
+}
+static void present_wait(uint64_t ticket) { (void)ticket; }   /* a present is submitted when gpu_present returns */
+static int display_hz(void) { return 60; }   /* the game's clock: its interval is in 60 Hz ticks (nvn.c present_period) */
+
+const gpu_ops gpu_vk_ops = {"vulkan", init, pool_add, pool_del, pool_invalidate, set_tex_pool_n, reg_tex, reg_samp, tex_release,
+                            prog_release, window_tex, vt_read_texels, vt_write_texels, vx_pin_refs, submit, last_fence, wait_fence,
+                            finish, present, present_wait, display_hz};

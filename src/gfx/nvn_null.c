@@ -13,22 +13,21 @@
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_fence, g_tickets;
 
-void gpu_init(void) {}
-const char *gpu_name(void) { return "null"; }
+static int init(void) { return 0; }
 
-void gpu_pool_add(const void *mem, uint64_t size) { (void)mem; (void)size; }
-void gpu_pool_del(const void *mem) { (void)mem; }
-void gpu_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { (void)p; (void)off; (void)n; }
+static void pool_add(const void *mem, uint64_t size) { (void)mem; (void)size; }
+static void pool_del(const void *mem) { (void)mem; }
+static void pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { (void)p; (void)off; (void)n; }
 
-void gpu_set_tex_pool_n(int n) { (void)n; }
-void gpu_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
-void gpu_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
-void gpu_tex_release(tex_t *t) { (void)t; }
-void gpu_prog_release(prog_t *p) { (void)p; }
-void gpu_window_tex(uint64_t serial) { (void)serial; }
-void gpu_pin_refs(void (*mark)(const void *)) { (void)mark; }
+static void set_tex_pool_n(int n) { (void)n; }
+static void reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
+static void reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
+static void tex_release(tex_t *t) { (void)t; }
+static void prog_release(prog_t *p) { (void)p; }
+static void window_tex(uint64_t serial) { (void)serial; }
+static void pin_refs(void (*mark)(const void *)) { (void)mark; }
 
-void gpu_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
+static void read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     (void)level; (void)layer0;
     static int said; if (!said++) LOG("[nvn-null] texture read back by the CPU: zeros (no GPU contents)");
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -37,14 +36,14 @@ void gpu_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     for (int z = 0; z < (r->depth > 0 ? r->depth : 1); z++)
         for (size_t y = 0; y < hb; y++) memset(dst + (size_t)z * img + y * row, 0, wb);
 }
-void gpu_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
+static void write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
     (void)t; (void)level; (void)layer0; (void)r; (void)src; (void)row; (void)img;
 }
 
 /* 19.2 MHz ticks on the clock of the game's CNTPCT reads (src/cpu/jit/jit.cpp default_cntpct) */
 static uint64_t gpu_ticks(void) { uint64_t ns = pal_now_ns(); return ns / 625 * 12 + ns % 625 * 12 / 625; }
 
-static void run(const uint8_t *p, int depth) {
+static void run_list(const uint8_t *p, int depth) {
     if (depth > 16) die("null backend: call depth over 16");
     for (;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
@@ -53,7 +52,7 @@ static void run(const uint8_t *p, int depth) {
         switch (h.op) {
         case OP_END: return;
         case OP_JUMP: memcpy(&p, a, 8); continue;
-        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); run((const uint8_t *)(uintptr_t)t, depth + 1); break; }
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); run_list((const uint8_t *)(uintptr_t)t, depth + 1); break; }
         case OP_SIGNAL_EVENT: {
             volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, a + 8, 4); memcpy(&v, a + 12, 4);
             if (m == NVN_EVENT_SIGNAL_MODE_ADD) *val += v; else *val = v;
@@ -83,21 +82,25 @@ static void run(const uint8_t *p, int depth) {
     }
 }
 
-uint64_t gpu_submit(const uint64_t *handles, int n) {
+static uint64_t submit(const uint64_t *handles, int n) {
     pthread_mutex_lock(&g_mu);
-    for (int i = 0; i < n; i++) run((const uint8_t *)(uintptr_t)handles[i], 0);
+    for (int i = 0; i < n; i++) run_list((const uint8_t *)(uintptr_t)handles[i], 0);
     uint64_t f = ++g_fence;
     pthread_mutex_unlock(&g_mu);
     static int said; if (!said++) LOG("[nvn-null] first submit (%d command lists)", n);
     return f;
 }
-uint64_t gpu_last_fence(void) { pthread_mutex_lock(&g_mu); uint64_t f = g_fence; pthread_mutex_unlock(&g_mu); return f; }
-int gpu_wait(uint64_t fence, uint64_t timeout_ns) { (void)timeout_ns; return fence <= gpu_last_fence(); }
-void gpu_finish(void) {}
+static uint64_t last_fence(void) { pthread_mutex_lock(&g_mu); uint64_t f = g_fence; pthread_mutex_unlock(&g_mu); return f; }
+static int wait_fence(uint64_t fence, uint64_t timeout_ns) { (void)timeout_ns; return fence <= last_fence(); }
+static void finish(void) {}
 
-uint64_t gpu_present(const tex_t *t, double period_s, const int crop[4]) {
+static uint64_t present(const tex_t *t, double period_s, const int crop[4]) {
     (void)t; (void)period_s; (void)crop;
     return __atomic_add_fetch(&g_tickets, 1, __ATOMIC_RELAXED);
 }
-void gpu_present_wait(uint64_t ticket) { (void)ticket; }
-int gpu_display_hz(void) { return 0; }
+static void present_wait(uint64_t ticket) { (void)ticket; }
+static int display_hz(void) { return 0; }
+
+const gpu_ops gpu_null_ops = {"null", init, pool_add, pool_del, pool_invalidate, set_tex_pool_n, reg_tex, reg_samp, tex_release,
+                              prog_release, window_tex, read_texels, write_texels, pin_refs, submit, last_fence, wait_fence, finish,
+                              present, present_wait, display_hz};

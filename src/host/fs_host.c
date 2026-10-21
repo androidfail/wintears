@@ -266,6 +266,7 @@ static unsigned read_file(uint64_t *out, uint64_t h, int64_t offset, void *buffe
     int mode;
     if (!out || offset < 0 || (!buffer && size) || !file_of(h, &f, &mode)) return R_INVALID_ARGUMENT;
     if (!(mode & OPEN_READ)) return R_OPEN_MODE;
+    if (size) dm_guest_write_prepare(buffer, (size_t)size);
     int64_t n = size ? pal_file_pread(f, buffer, (size_t)size, (uint64_t)offset) : 0;
     if (n < 0) runtime_fail("host save read failure");
     *out = (uint64_t)n;

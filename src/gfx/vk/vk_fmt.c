@@ -1,0 +1,85 @@
+/* NVN texture formats (nvn.h 0x01-0x9C) -> Vulkan, in NVN enum order, after upstream tex/nvn_fmt_mtl.c (which says
+   how each format is handled on Metal; the same choices here unless Vulkan has the exact format):
+   - "X" formats (RGBX, RGB_DXT1, BGRX) read alpha as 1 (view swizzle).
+   - Depth24 has no portable Vulkan format (AMD lacks D24S8): Depth32F / D32F_S8 as upstream; uploaded 24-bit depth
+     data is converted (convert = 1).
+   - 3-component RGB8/16/32 and the RGB10A2 signed kinds are expanded on upload (convert = 2), as upstream.
+   - *_UI2F / *_I2F (integer storage read as float) are the USCALED / SSCALED formats.
+   - 16-bit packed formats follow upstream's component order, read as least significant bits first; like upstream,
+     not checked against real game data.
+   - ASTC: the ASTC format when the GPU samples it, else decoded on upload (convert = 3, vk_tex.c). */
+#include "gfx/vk/vk.h"
+
+#define R VK_COMPONENT_SWIZZLE_R
+#define G VK_COMPONENT_SWIZZLE_G
+#define B VK_COMPONENT_SWIZZLE_B
+#define A VK_COMPONENT_SWIZZLE_A
+#define ONE VK_COMPONENT_SWIZZLE_ONE
+typedef struct { VkFormat f; uint8_t noalpha, rb, convert, depth, stencil; } ent;
+#define E(f) {VK_FORMAT_##f, 0, 0, 0, 0, 0}
+#define X(f) {VK_FORMAT_##f, 1, 0, 0, 0, 0}
+#define C(f) {VK_FORMAT_##f, 0, 0, 2, 0, 0}     /* expanded on upload */
+#define CX(f) {VK_FORMAT_##f, 1, 0, 2, 0, 0}
+#define SW(f) {VK_FORMAT_##f, 0, 1, 0, 0, 0}    /* r and b swapped */
+#define SWX(f) {VK_FORMAT_##f, 1, 1, 0, 0, 0}
+
+static const ent T[0x9D] = {
+    [0x01] = E(R8_UNORM), E(R8_SNORM), E(R8_UINT), E(R8_SINT),
+    [0x05] = E(R16_SFLOAT), E(R16_UNORM), E(R16_SNORM), E(R16_UINT), E(R16_SINT),
+    [0x0A] = E(R32_SFLOAT), E(R32_UINT), E(R32_SINT),
+    [0x0D] = E(R8G8_UNORM), E(R8G8_SNORM), E(R8G8_UINT), E(R8G8_SINT),
+    [0x11] = E(R16G16_SFLOAT), E(R16G16_UNORM), E(R16G16_SNORM), E(R16G16_UINT), E(R16G16_SINT),
+    [0x16] = E(R32G32_SFLOAT), E(R32G32_UINT), E(R32G32_SINT),
+    [0x19] = CX(R8G8B8A8_UNORM), CX(R8G8B8A8_SNORM), CX(R8G8B8A8_UINT), CX(R8G8B8A8_SINT),
+    [0x1D] = CX(R16G16B16A16_SFLOAT), CX(R16G16B16A16_UNORM), CX(R16G16B16A16_SNORM), CX(R16G16B16A16_UINT), CX(R16G16B16A16_SINT),
+    [0x22] = CX(R32G32B32A32_SFLOAT), CX(R32G32B32A32_UINT), CX(R32G32B32A32_SINT),
+    [0x25] = E(R8G8B8A8_UNORM), E(R8G8B8A8_SNORM), E(R8G8B8A8_UINT), E(R8G8B8A8_SINT),
+    [0x29] = E(R16G16B16A16_SFLOAT), E(R16G16B16A16_UNORM), E(R16G16B16A16_SNORM), E(R16G16B16A16_UINT), E(R16G16B16A16_SINT),
+    [0x2E] = E(R32G32B32A32_SFLOAT), E(R32G32B32A32_UINT), E(R32G32B32A32_SINT),
+    [0x31] = {VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 0, 0, 0, 1}, {VK_FORMAT_D16_UNORM, 0, 0, 0, 1, 0},
+    [0x33] = {VK_FORMAT_D32_SFLOAT, 0, 0, 1, 1, 0}, {VK_FORMAT_D32_SFLOAT, 0, 0, 0, 1, 0},
+    [0x35] = {VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 0, 1, 1, 1}, {VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 0, 0, 1, 1},
+    [0x37] = X(R8G8B8A8_SRGB), E(R8G8B8A8_SRGB),
+    [0x39] = E(R4G4B4A4_UNORM_PACK16), SWX(A1R5G5B5_UNORM_PACK16), SW(A1R5G5B5_UNORM_PACK16), E(B5G6R5_UNORM_PACK16),
+    [0x3D] = E(A2B10G10R10_UNORM_PACK32), E(A2B10G10R10_UINT_PACK32), E(B10G11R11_UFLOAT_PACK32), E(E5B9G9R9_UFLOAT_PACK32),
+    [0x41] = X(BC1_RGB_UNORM_BLOCK), E(BC1_RGBA_UNORM_BLOCK), E(BC2_UNORM_BLOCK), E(BC3_UNORM_BLOCK),
+             X(BC1_RGB_SRGB_BLOCK), E(BC1_RGBA_SRGB_BLOCK), E(BC2_SRGB_BLOCK), E(BC3_SRGB_BLOCK),
+    [0x49] = E(BC4_UNORM_BLOCK), E(BC4_SNORM_BLOCK), E(BC5_UNORM_BLOCK), E(BC5_SNORM_BLOCK),
+             E(BC7_UNORM_BLOCK), E(BC7_SRGB_BLOCK), E(BC6H_SFLOAT_BLOCK), E(BC6H_UFLOAT_BLOCK),
+    [0x51] = E(R8_USCALED), E(R8_SSCALED), E(R16_USCALED), E(R16_SSCALED), E(R32_UINT), E(R32_SINT),
+    [0x57] = E(R8G8_USCALED), E(R8G8_SSCALED), E(R16G16_USCALED), E(R16G16_SSCALED), E(R32G32_UINT), E(R32G32_SINT),
+    [0x5D] = CX(R8G8B8A8_USCALED), CX(R8G8B8A8_SSCALED), CX(R16G16B16A16_USCALED), CX(R16G16B16A16_SSCALED), CX(R32G32B32A32_UINT), CX(R32G32B32A32_SINT),
+    [0x63] = E(R8G8B8A8_USCALED), E(R8G8B8A8_SSCALED), E(R16G16B16A16_USCALED), E(R16G16B16A16_SSCALED), E(R32G32B32A32_UINT), E(R32G32B32A32_SINT),
+    [0x69] = C(R16G16B16A16_SNORM), C(R16G16B16A16_SINT), E(A2B10G10R10_USCALED_PACK32), C(R16G16B16A16_SSCALED),
+    [0x6D] = X(R8G8B8A8_UNORM), X(R8G8B8A8_SNORM), X(R8G8B8A8_UINT), X(R8G8B8A8_SINT),
+    [0x71] = X(R16G16B16A16_SFLOAT), X(R16G16B16A16_UNORM), X(R16G16B16A16_SNORM), X(R16G16B16A16_UINT), X(R16G16B16A16_SINT),
+    [0x76] = X(R32G32B32A32_SFLOAT), X(R32G32B32A32_UINT), X(R32G32B32A32_SINT),
+    [0x95] = E(R5G6B5_UNORM_PACK16), X(A1R5G5B5_UNORM_PACK16), E(A1R5G5B5_UNORM_PACK16), E(R5G5B5A1_UNORM_PACK16),
+    [0x99] = X(B8G8R8A8_UNORM), E(B8G8R8A8_UNORM), X(B8G8R8A8_SRGB), E(B8G8R8A8_SRGB),
+};
+
+/* NVN ASTC order: 4x4 5x4 5x5 6x5 6x6 8x5 8x6 8x8 10x5 10x6 10x8 10x10 12x10 12x12 (the Vulkan order, two per size) */
+static const VkFormat ASTC[14] = {VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_ASTC_5x4_UNORM_BLOCK, VK_FORMAT_ASTC_5x5_UNORM_BLOCK,
+    VK_FORMAT_ASTC_6x5_UNORM_BLOCK, VK_FORMAT_ASTC_6x6_UNORM_BLOCK, VK_FORMAT_ASTC_8x5_UNORM_BLOCK, VK_FORMAT_ASTC_8x6_UNORM_BLOCK,
+    VK_FORMAT_ASTC_8x8_UNORM_BLOCK, VK_FORMAT_ASTC_10x5_UNORM_BLOCK, VK_FORMAT_ASTC_10x6_UNORM_BLOCK, VK_FORMAT_ASTC_10x8_UNORM_BLOCK,
+    VK_FORMAT_ASTC_10x10_UNORM_BLOCK, VK_FORMAT_ASTC_12x10_UNORM_BLOCK, VK_FORMAT_ASTC_12x12_UNORM_BLOCK};
+
+static int astc_sampled = -1;
+int vk_fmt_of(int f, vk_fmt *out) {
+    ent e = {0};
+    if (f >= 0x79 && f <= 0x94) {
+        int k = (f - 0x79) % 14, srgb = f >= 0x87;
+        if (astc_sampled < 0) {
+            VkFormatProperties p; vkGetPhysicalDeviceFormatProperties(vk_phys, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, &p);
+            astc_sampled = (p.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+        }
+        if (astc_sampled) e = (ent){(VkFormat)(ASTC[k] + srgb), 0, 0, 0, 0, 0};   /* each _SRGB_BLOCK follows its _UNORM_BLOCK */
+        else e = (ent){srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 3, 0, 0};
+    } else if (f > 0 && f < (int)(sizeof T / sizeof *T)) e = T[f];
+    out->vk = e.f; out->depth = e.depth; out->stencil = e.stencil; out->convert = e.convert;
+    out->swz[0] = e.rb ? B : R; out->swz[1] = G; out->swz[2] = e.rb ? R : B; out->swz[3] = e.noalpha ? ONE : A;
+    return e.f != VK_FORMAT_UNDEFINED;
+}
+int vk_fmt_block_compressed(VkFormat f) {
+    return (f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) || (f >= VK_FORMAT_ASTC_4x4_SFLOAT_BLOCK && f <= VK_FORMAT_ASTC_12x12_SFLOAT_BLOCK);
+}

@@ -44,6 +44,7 @@ uint64_t host_return_trap(void);                  /* svc #HOST_RETURN_SVC */
 uint64_t host_main_stack(uint64_t *size);
 uint64_t host_object_page(void);                  /* a guest page for host tokens the game only passes back (vi Display, Layer) */
 void *host_guest_alloc(size_t size);              /* zeroed guest-visible memory for host data the game reads; never freed */
+void host_heap_range(uint64_t *base, uint64_t *size);   /* the guest heap now (SetHeapSize): one committed range */
 #define HOST_RETURN_SVC 0xfffeu
 
 /* threads.c */
@@ -113,5 +114,7 @@ const host_fn *host_service_override(const char *name);   /* upstream runtime_ov
 const host_fn *host_service_observer(const char *name);   /* upstream runtime_observer */
 
 /* svc.c */
+void dm_guest_write_prepare(void *addr, size_t n);                       /* upstream name: the host writes guest memory next */
+void dm_guest_write_prep_register(void (*fn)(void *addr, size_t n));     /* gfx/nvn_dirty.c */
 int host_svc(unsigned num, jit_context *c);       /* 1 = answered */
 extern int host_trace_svcs;

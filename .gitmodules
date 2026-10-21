@@ -7,3 +7,15 @@
 [submodule "externals/opus"]
 	path = externals/opus
 	url = https://github.com/xiph/opus
+[submodule "externals/SDL"]
+	path = externals/SDL
+	url = https://github.com/libsdl-org/SDL
+[submodule "externals/Vulkan-Headers"]
+	path = externals/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers
+[submodule "externals/volk"]
+	path = externals/volk
+	url = https://github.com/zeux/volk
+[submodule "externals/VulkanMemoryAllocator"]
+	path = externals/VulkanMemoryAllocator
+	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator

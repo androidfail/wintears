@@ -1,4 +1,5 @@
-/* nn::vi without a window, until the SDL3 frontend exists (phase 4). Upstream (runtime/frontend.m) overrides the same
+/* nn::vi: the game draws into its own NVN swapchain textures and the GPU backend shows them in the window
+   (gfx/vk/vk_present.c). Upstream (runtime/frontend.m) overrides the same
    five functions: Initialize, OpenDefaultDisplay, CreateLayer, GetNativeWindow and GetDisplayVsyncEvent. The display,
    the layer and the native window are tokens in guest memory the game only passes back; the vsync event is a real
    SystemEvent, signalled 60 times a second by a host thread, as the window's display link does upstream. */
@@ -35,7 +36,7 @@ static void *vsync_thread(void *unused) {
 
 static void vi_initialize(void) {
     vi_ready = 1;
-    LOG("VI display initialized (no window yet: the frontend is phase 4)");
+    LOG("VI display initialized");
 }
 static uint32_t vi_open(uint64_t *out) {
     if (!vi_ready || !out) return 0xf601;

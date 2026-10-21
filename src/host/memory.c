@@ -56,6 +56,9 @@ static unsigned char alias_pages[ALIAS_SIZE_MAX / 4096];
 static unsigned char tls_used[TLS_COUNT];
 
 #define ALIAS_START alias_start
+void host_heap_range(uint64_t *base, uint64_t *size) {
+    pal_mutex_lock(&memory_lock); *base = heap; *size = heap_size; pal_mutex_unlock(&memory_lock);
+}
 #define ALIAS_SIZE alias_size
 #define STACK_START (low + STACK_OFF)
 #define ASLR_START low

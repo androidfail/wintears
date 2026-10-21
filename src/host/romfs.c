@@ -392,6 +392,7 @@ unsigned runtime_romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buf
     if ((uint64_t)offset > fsize || (!buffer && size)) return INVALID;
     uint64_t n = size;
     if (n > fsize - (uint64_t)offset) n = fsize - (uint64_t)offset;
+    if (n) dm_guest_write_prepare(buffer, (size_t)n);
     if (n && pal_file_pread(f, buffer, (size_t)n, base + (uint64_t)offset) != (int64_t)n) runtime_fail("RomFS read failure");
     *out = n;
     return 0;

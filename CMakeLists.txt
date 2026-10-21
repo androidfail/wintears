@@ -96,9 +96,26 @@ if(WINTEARS_JIT)
   endforeach()
   string(APPEND NVN_NAMES_C "};\nconst unsigned nvn_name_count = sizeof nvn_names / sizeof *nvn_names;\n")
   file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/nvn_names.c CONTENT "${NVN_NAMES_C}")
-  add_library(gfx OBJECT src/gfx/nvn.c src/gfx/nvn_ext.c src/gfx/nvn_vpool.c src/gfx/nvn_null.c ${NVN_DIR}/nvn_tex.c ${CMAKE_BINARY_DIR}/nvn_names.c)
-  target_include_directories(gfx PUBLIC src ${NVN_DIR} ${NVN_DIR}/include)
-  target_link_libraries(gfx PUBLIC host)
+  # SDL3 (externals/SDL, static): the window, keyboard and controllers
+  set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+  set(SDL_STATIC ON CACHE BOOL "" FORCE)
+  set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+  set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+  set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+  add_subdirectory(externals/SDL EXCLUDE_FROM_ALL)
+  # Vulkan: headers, volk (loads vulkan-1.dll at run time), Vulkan Memory Allocator
+  set(TEX_DIR upstream/games/totk/third_party/d2r_gfx/gfx/tex)
+  add_library(gfx OBJECT src/gfx/nvn.c src/gfx/nvn_ext.c src/gfx/nvn_vpool.c src/gfx/nvn_null.c src/gfx/nvn_gpu.c src/gfx/nvn_dirty.c
+              src/gfx/vk/vk_dev.c src/gfx/vk/vk_fmt.c src/gfx/vk/vk_tex.c src/gfx/vk/vk_exec.c src/gfx/vk/vk_draw.c
+              src/gfx/vk/vk_present.c src/gfx/vk/vk_mem.cpp externals/volk/volk.c src/frontend/frontend.c
+              ${NVN_DIR}/nvn_tex.c ${TEX_DIR}/nvn_deswizzle.c ${CMAKE_BINARY_DIR}/nvn_names.c)
+  target_include_directories(gfx PUBLIC src ${NVN_DIR} ${NVN_DIR}/include ${TEX_DIR}
+                             externals/Vulkan-Headers/include externals/volk externals/VulkanMemoryAllocator/include)
+  target_compile_definitions(gfx PUBLIC VK_NO_PROTOTYPES)
+  target_compile_options(gfx PRIVATE -Wno-missing-field-initializers)   # Vulkan structs: {sType, .field = ...}
+  set_source_files_properties(src/gfx/vk/vk_mem.cpp PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-unused-variable;-Wno-missing-field-initializers")
+  target_link_libraries(gfx PUBLIC host SDL3::SDL3-static)
   add_executable(wintears src/app/main.c)
   target_link_libraries(wintears PRIVATE gfx)
   if(CMAKE_CROSSCOMPILING)

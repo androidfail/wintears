@@ -1,0 +1,319 @@
+/* Replay of the NVN recordings into Vulkan (upstream nvn_mtl.m mtl_exec and its helpers).
+
+   Render passes are dynamic rendering: SetRenderTargets ends the pass in progress, the next clear or draw begins one
+   on the new targets (load and store everything; images are in GENERAL layout). Clears inside a pass are
+   vkCmdClearAttachments within the scissor, as NVN clears are. Copies, uniform updates and texture clears end the pass
+   first. What the CPU sees of the GPU (event values, counter reports) happens on the completion thread once the
+   submission is done, in recording order. The state (targets, bindings) carries over between submissions, as on the
+   GPU's one queue. */
+#include "gfx/vk/vk.h"
+#include "vk_draw.h"
+
+vx_state S;
+static int g_pass;                  /* a render pass is open */
+static VkRect2D g_area;             /* its render area */
+static uint64_t g_stat_skip[8];
+
+/* ---------- CPU-visible effects ---------- */
+typedef struct { volatile uint32_t *val; uint32_t mode, value; } ev_act;
+static void do_event(void *arg) {
+    ev_act *e = arg;
+    if (e->mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += e->value; else *e->val = e->value;
+    free(e);
+}
+typedef struct { uint64_t type, addr; } ctr_act;
+static void do_counter(void *arg) {
+    ctr_act *c = arg;
+    /* NVNcounterData = {counter, timestamp}. Occlusion queries say "visible" until they are counted on the GPU. */
+    uint64_t rec[2] = {c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1u << 20 : 0, vk_ticks()};
+    dm_guest_write_prepare((void *)(uintptr_t)c->addr, sizeof rec);
+    memcpy((void *)(uintptr_t)c->addr, rec, sizeof rec);
+    free(c);
+}
+
+/* ---------- render passes ---------- */
+void vx_end_pass(void) {
+    if (!g_pass) return;
+    vkCmdEndRendering(vk_cmd());
+    vk_barrier(vk_cmd());
+    g_pass = 0;
+}
+
+/* The targets' images and views, prepared before the pass begins (uploads cannot happen inside one). */
+static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uint32_t *w, uint32_t *h, uint32_t *layers) {
+    *w = *h = UINT32_MAX; *layers = UINT32_MAX; int any = 0;
+    for (int i = 0; i < 8; i++) {
+        col[i] = NULL; cv[i] = VK_NULL_HANDLE;
+        if (i >= S.rt.n || !S.rt.color[i]) continue;
+        const view_t *v = S.rt.has_cview[i] ? &S.rt.cview[i] : NULL;
+        if (!(col[i] = vt_get(S.rt.color[i]))) continue;
+        if (!(cv[i] = vt_view(col[i], S.rt.color[i], v, 1))) { col[i] = NULL; continue; }
+        unsigned lv = v && v->set_levels ? v->base_level : 0; uint32_t a, b, c; vt_size(col[i], lv, &a, &b, &c);
+        uint32_t nl = v && v->set_layers && v->nlayers ? v->nlayers : vt_layers(col[i]);
+        *w = a < *w ? a : *w; *h = b < *h ? b : *h; *layers = nl < *layers ? nl : *layers;
+        any = 1;
+    }
+    *dep = NULL; *dv = VK_NULL_HANDLE;
+    if (S.rt.depth && (*dep = vt_get(S.rt.depth))) {
+        const view_t *v = S.rt.has_dview ? &S.rt.dview : NULL;
+        if ((*dv = vt_view(*dep, S.rt.depth, v, 1))) {
+            unsigned lv = v && v->set_levels ? v->base_level : 0; uint32_t a, b, c; vt_size(*dep, lv, &a, &b, &c);
+            uint32_t nl = v && v->set_layers && v->nlayers ? v->nlayers : vt_layers(*dep);
+            *w = a < *w ? a : *w; *h = b < *h ? b : *h; *layers = nl < *layers ? nl : *layers;
+            any = 1;
+        } else *dep = NULL;
+    }
+    if (*layers == UINT32_MAX || *layers > 1) *layers = 1;   /* shortcut: layered rendering draws into the first layer only */
+    return any;
+}
+
+/* Open a pass on the current targets; 0 when there is nothing to render into. */
+static int begin_pass(void) {
+    if (g_pass) return 1;
+    vtex *col[8], *dep; VkImageView cv[8], dv; uint32_t w, h, layers;
+    if (!S.has_rt || !targets(col, cv, &dep, &dv, &w, &h, &layers)) return 0;
+    VkRenderingAttachmentInfo ca[8], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sa;
+    int n = S.rt.n < 8 ? S.rt.n : 8;
+    for (int i = 0; i < n; i++) {
+        ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = cv[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+        if (col[i]) vt_written(col[i]);
+    }
+    int has_d = dep && (vt_aspect(dep) & VK_IMAGE_ASPECT_DEPTH_BIT), has_s = dep && (vt_aspect(dep) & VK_IMAGE_ASPECT_STENCIL_BIT);
+    if (dep) {
+        vt_written(dep);
+        da.imageView = dv; da.imageLayout = VK_IMAGE_LAYOUT_GENERAL; da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
+    sa = da;
+    g_area = (VkRect2D){{0, 0}, {w, h}};
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = g_area, .layerCount = layers,
+                          .colorAttachmentCount = (uint32_t)n, .pColorAttachments = ca,
+                          .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
+    S.pass_fmt.ncolor = n;
+    for (int i = 0; i < 8; i++) S.pass_fmt.color[i] = i < n && col[i] ? vt_vkformat(col[i]) : VK_FORMAT_UNDEFINED;
+    S.pass_fmt.depth = has_d ? vt_vkformat(dep) : VK_FORMAT_UNDEFINED;
+    S.pass_fmt.stencil = has_s ? vt_vkformat(dep) : VK_FORMAT_UNDEFINED;
+    S.pass_w = w; S.pass_h = h;
+    vkCmdBeginRendering(vk_cmd(), &ri);
+    g_pass = 1;
+    vd_pass_begun();
+    return 1;
+}
+int vx_begin_pass(void) { return begin_pass(); }
+
+/* The scissor rectangle within the pass area (NVN clears honour the scissor). */
+static VkRect2D clear_rect(void) {
+    VkRect2D r = g_area;
+    if (S.has_sc) {
+        int64_t x0 = S.sc.x > 0 ? S.sc.x : 0, y0 = S.sc.y > 0 ? S.sc.y : 0;
+        int64_t x1 = (int64_t)S.sc.x + S.sc.w, y1 = (int64_t)S.sc.y + S.sc.h;
+        if (x1 > g_area.extent.width) x1 = g_area.extent.width;
+        if (y1 > g_area.extent.height) y1 = g_area.extent.height;
+        r = (VkRect2D){{(int32_t)x0, (int32_t)y0}, {x1 > x0 ? (uint32_t)(x1 - x0) : 0, y1 > y0 ? (uint32_t)(y1 - y0) : 0}};
+    }
+    return r;
+}
+
+static void clear_color(const p_clear_color *c) {
+    if (S.render_disabled) return;
+    if (c->index < 0 || c->index >= S.rt.n || !S.rt.color[c->index] || !(c->mask & 0xf)) return;
+    if (!begin_pass()) return;
+    if (S.pass_fmt.color[c->index] == VK_FORMAT_UNDEFINED) return;
+    if ((c->mask & 0xf) != 0xf) { g_stat_skip[0]++; VK_ONCE("colour clear with channel mask %#x: done as a full clear for now", c->mask); }
+    VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index};
+    memcpy(ca.clearValue.color.float32, c->rgba, 16);   /* integer targets: NVN passes the integer bits the same way */
+    VkClearRect r = {clear_rect(), 0, 1};
+    if (r.rect.extent.width && r.rect.extent.height) vkCmdClearAttachments(vk_cmd(), 1, &ca, 1, &r);
+}
+static void clear_ds(const p_clear_ds *c) {
+    if (S.render_disabled || !S.rt.depth) return;
+    if (!begin_pass()) return;
+    VkImageAspectFlags asp = 0;
+    if (c->depth_mask && S.pass_fmt.depth != VK_FORMAT_UNDEFINED) asp |= VK_IMAGE_ASPECT_DEPTH_BIT;
+    if ((c->stencil_mask & 0xff) && S.pass_fmt.stencil != VK_FORMAT_UNDEFINED) {
+        asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        if ((c->stencil_mask & 0xff) != 0xff) VK_ONCE("stencil clear with write mask %#x: done as a full clear for now", c->stencil_mask);
+    }
+    if (!asp) return;
+    VkClearAttachment ca = {asp, 0, {.depthStencil = {c->depth, (uint32_t)c->stencil}}};
+    VkClearRect r = {clear_rect(), 0, 1};
+    if (r.rect.extent.width && r.rect.extent.height) vkCmdClearAttachments(vk_cmd(), 1, &ca, 1, &r);
+}
+
+/* ---------- copies ---------- */
+static void copy_b2b(uint64_t src, uint64_t dst, uint64_t n) {
+    VkBuffer sb, db; VkDeviceSize so, dof;
+    if (!n) return;
+    if (!vk_buf(src, n, &sb, &so) || !vk_buf(dst, n, &db, &dof) || (sb == db && src < dst + n && dst < src + n)) {
+        /* not both GPU-visible, or overlapping: done by the CPU at submit, as the null backend does */
+        VK_ONCE("buffer copy %#llx -> %#llx (%llu bytes) outside GPU memory or overlapping: copied by the CPU", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
+        dm_guest_write_prepare((void *)(uintptr_t)dst, (size_t)n);
+        memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)n);
+        return;
+    }
+    vx_end_pass();
+    VkBufferCopy r = {so, dof, n};
+    vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
+    vk_barrier(vk_cmd());
+}
+static void update_ub(uint64_t dst, const uint8_t *data, uint64_t n) {
+    VkBuffer db; VkDeviceSize off;
+    if (!n) return;
+    if (!vk_buf(dst, n, &db, &off) || (off & 3) || (n & 3)) {
+        VK_ONCE("uniform update at %#llx (%llu bytes) outside GPU memory or unaligned: written by the CPU", (unsigned long long)dst, (unsigned long long)n);
+        dm_guest_write_prepare((void *)(uintptr_t)dst, (size_t)n);
+        memcpy((void *)(uintptr_t)dst, data, (size_t)n);
+        return;
+    }
+    vx_end_pass();   /* shortcut: every inline uniform update ends the pass; upgrade to upstream's renamed copies if passes split too often */
+    for (uint64_t at = 0; at < n; at += 65536) vkCmdUpdateBuffer(vk_cmd(), db, off + at, n - at > 65536 ? 65536 : n - at, data + at);
+    vk_barrier(vk_cmd());
+}
+
+static unsigned view_level(const view_t *v, int has) { return has && v->set_levels ? v->base_level : 0; }
+static unsigned view_layer(const view_t *v, int has) { return has && v->set_layers ? v->min_layer : 0; }
+static VkImageAspectFlags copy_aspect(const vtex *e) { VkImageAspectFlags a = vt_aspect(e); return a == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : a; }
+/* region -> subresource layers + offset / extent (arrays: z is the layer) */
+static void region(const vtex *e, const NVNcopyRegion *r, unsigned level, unsigned layer0, VkImageSubresourceLayers *sub, VkOffset3D *o, VkExtent3D *x) {
+    uint32_t w, h, d; vt_size(e, level, &w, &h, &d);
+    int is3d = d > 1 || (vt_layers(e) == 1 && r->depth > 1);
+    *sub = (VkImageSubresourceLayers){copy_aspect(e), level, layer0 + (is3d ? 0 : (unsigned)r->zoffset), is3d ? 1 : (unsigned)(r->depth > 0 ? r->depth : 1)};
+    *o = (VkOffset3D){r->xoffset, r->yoffset, is3d ? r->zoffset : 0};
+    *x = (VkExtent3D){(uint32_t)r->width, (uint32_t)(r->height > 0 ? r->height : 1), is3d ? (uint32_t)(r->depth > 0 ? r->depth : 1) : 1};
+    if (sub->baseArrayLayer + sub->layerCount > vt_layers(e)) sub->layerCount = vt_layers(e) > sub->baseArrayLayer ? vt_layers(e) - sub->baseArrayLayer : 1;
+}
+static uint32_t row_texels(const tex_t *t, int64_t stride) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    return stride > 0 && bpb ? (uint32_t)(stride / bpb) * (uint32_t)bw : 0;
+}
+static void copy_b2t(const p_copy_b2t *c) {
+    vtex *e = c->tex ? vt_get(c->tex) : NULL;
+    if (!e) return;
+    int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
+    VkImageSubresourceLayers sub; VkOffset3D o; VkExtent3D x;
+    region(e, &c->r, view_level(&c->view, c->has_view), view_layer(&c->view, c->has_view), &sub, &o, &x);
+    uint64_t row = S.copy_stride > 0 ? (uint64_t)S.copy_stride : (uint64_t)((x.width + bw - 1) / bw) * bpb;
+    uint64_t n = row * ((x.height + bh - 1) / bh) * x.depth * sub.layerCount;
+    VkBuffer sb; VkDeviceSize so;
+    if (!vk_buf(c->src, n, &sb, &so)) { VK_ONCE("buffer-to-texture copy from %#llx: not GPU memory", (unsigned long long)c->src); return; }
+    vx_end_pass();
+    VkBufferImageCopy r = {.bufferOffset = so, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
+    vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    vk_barrier(vk_cmd());
+    vt_written(e);
+}
+static void copy_t2b(const p_copy_b2t *c) {   /* the T2B record: tex is the source, src the destination address */
+    vtex *e = c->tex ? vt_get(c->tex) : NULL;
+    if (!e) return;
+    int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
+    VkImageSubresourceLayers sub; VkOffset3D o; VkExtent3D x;
+    region(e, &c->r, view_level(&c->view, c->has_view), view_layer(&c->view, c->has_view), &sub, &o, &x);
+    uint64_t row = S.copy_stride > 0 ? (uint64_t)S.copy_stride : (uint64_t)((x.width + bw - 1) / bw) * bpb;
+    uint64_t n = row * ((x.height + bh - 1) / bh) * x.depth * sub.layerCount;
+    VkBuffer db; VkDeviceSize dof;
+    if (!vk_buf(c->src, n, &db, &dof)) { VK_ONCE("texture-to-buffer copy to %#llx: not GPU memory", (unsigned long long)c->src); return; }
+    vx_end_pass();
+    VkBufferImageCopy r = {.bufferOffset = dof, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
+    vkCmdCopyImageToBuffer(vk_cmd(), vt_image(e), VK_IMAGE_LAYOUT_GENERAL, db, 1, &r);
+    vk_barrier(vk_cmd());
+}
+static void copy_t2t(const p_copy_t2t *c) {
+    vtex *s = c->src ? vt_get(c->src) : NULL, *d = c->dst ? vt_get(c->dst) : NULL;
+    if (!s || !d) return;
+    VkImageSubresourceLayers ss, ds; VkOffset3D so, dof; VkExtent3D sx, dx;
+    region(s, &c->sr, view_level(&c->sv, c->has_sv), view_layer(&c->sv, c->has_sv), &ss, &so, &sx);
+    region(d, &c->dr, view_level(&c->dv, c->has_dv), view_layer(&c->dv, c->has_dv), &ds, &dof, &dx);
+    vx_end_pass();
+    int same = sx.width == dx.width && sx.height == dx.height && sx.depth == dx.depth && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT));
+    if (same && (vt_vkformat(s) == vt_vkformat(d) || (!vt_depth(s) && !vt_depth(d) && !vk_fmt_block_compressed(vt_vkformat(s)) && !vk_fmt_block_compressed(vt_vkformat(d))))) {
+        if (ds.layerCount != ss.layerCount) ds.layerCount = ss.layerCount = ss.layerCount < ds.layerCount ? ss.layerCount : ds.layerCount;
+        VkImageCopy r = {ss, so, ds, dof, sx};
+        vkCmdCopyImage(vk_cmd(), vt_image(s), VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    } else {
+        VkImageBlit r = {ss, {so, {so.x + (int32_t)sx.width, so.y + (int32_t)sx.height, so.z + (int32_t)sx.depth}},
+                         ds, {dof, {dof.x + (int32_t)dx.width, dof.y + (int32_t)dx.height, dof.z + (int32_t)dx.depth}}};
+        if (c->flags & NVN_COPY_FLAGS_MIRROR_X_BIT) { int32_t t = r.dstOffsets[0].x; r.dstOffsets[0].x = r.dstOffsets[1].x; r.dstOffsets[1].x = t; }
+        if (c->flags & NVN_COPY_FLAGS_MIRROR_Y_BIT) { int32_t t = r.dstOffsets[0].y; r.dstOffsets[0].y = r.dstOffsets[1].y; r.dstOffsets[1].y = t; }
+        if (ds.layerCount != ss.layerCount) ds.layerCount = ss.layerCount = ss.layerCount < ds.layerCount ? ss.layerCount : ds.layerCount;
+        r.srcSubresource = ss; r.dstSubresource = ds;
+        int linear = (c->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && !vt_depth(s);
+        vkCmdBlitImage(vk_cmd(), vt_image(s), VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    }
+    vk_barrier(vk_cmd());
+    vt_written(d);
+}
+static void clear_tex(const p_clear_tex *c) {
+    vtex *e = c->tex ? vt_get(c->tex) : NULL;
+    if (!e || vt_depth(e) || vk_fmt_block_compressed(vt_vkformat(e))) return;
+    if ((c->mask & 0xf) != 0xf) VK_ONCE("texture clear with channel mask %#x: done as a full clear for now", c->mask);
+    unsigned lv = view_level(&c->view, c->has_view);
+    VkImageSubresourceLayers sub; VkOffset3D o; VkExtent3D x;
+    region(e, &c->r, lv, view_layer(&c->view, c->has_view), &sub, &o, &x);
+    uint32_t w, h, d; vt_size(e, lv, &w, &h, &d);
+    if (o.x || o.y || x.width < w || x.height < h) VK_ONCE("partial texture clear (%ux%u of %ux%u): the whole level is cleared for now", x.width, x.height, w, h);
+    vx_end_pass();
+    VkClearColorValue v; memcpy(&v, c->c.u, 16);
+    VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, sub.baseArrayLayer, sub.layerCount};
+    vkCmdClearColorImage(vk_cmd(), vt_image(e), VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+    vk_barrier(vk_cmd());
+    vt_written(e);
+}
+
+/* TOTK: SetRenderEnableConditional, mode 0 = render if the two counters at addr / addr + 16 are equal. The counters
+   are written when earlier submissions complete; read at replay (shortcut: a counter reported earlier in the same
+   submission is not seen yet). */
+static int cond_eval(const p_render_cond *c) {
+    uint64_t a, b; memcpy(&a, (const void *)(uintptr_t)c->addr, 8); memcpy(&b, (const void *)(uintptr_t)(c->addr + 16), 8);
+    return c->mode == 0 ? a == b : a != b;
+}
+
+void vx_run(const uint8_t *p) {
+    for (;;) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) die("Vulkan replay: corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
+        const uint8_t *a = p + 8;
+        switch (h.op) {
+        case OP_END: return;
+        case OP_BEGIN: break;
+        case OP_JUMP: memcpy(&p, a, 8); continue;
+        case OP_CALL: { uint64_t t; memcpy(&t, a, 8); vx_run((const uint8_t *)(uintptr_t)t); break; }
+        case OP_SIGNAL_EVENT: {
+            ev_act *e = malloc(sizeof *e); memcpy(&e->val, a, 8); memcpy(&e->mode, a + 8, 4); memcpy(&e->value, a + 12, 4);
+            vk_after(do_event, e); break;
+        }
+        case OP_REPORT_COUNTER: { ctr_act *c = malloc(sizeof *c); memcpy(&c->type, a, 8); memcpy(&c->addr, a + 8, 8); vk_after(do_counter, c); break; }
+        case OP_RESET_COUNTER: break;
+        case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); copy_b2b(s, d, n); break; }
+        case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, a + 16, n); break; }
+        case OP_SET_RT: vx_end_pass(); memcpy(&S.rt, a, sizeof S.rt); S.has_rt = 1; break;
+        case OP_CLEAR_COLOR: clear_color((const p_clear_color *)a); break;
+        case OP_CLEAR_DS: clear_ds((const p_clear_ds *)a); break;
+        case OP_COPY_B2T: copy_b2t((const p_copy_b2t *)a); break;
+        case OP_COPY_T2B: copy_t2b((const p_copy_b2t *)a); break;
+        case OP_COPY_T2T: copy_t2t((const p_copy_t2t *)a); break;
+        case OP_CLEAR_TEX: clear_tex((const p_clear_tex *)a); break;
+        case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
+        case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.has_sc = 1; vd_state_op(h.op, a); break;
+        case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value; break;
+        case OP_RENDER_COND: S.render_disabled = !cond_eval((const p_render_cond *)a); break;
+        case OP_BARRIER: vx_end_pass(); vk_barrier(vk_cmd()); break;
+        case OP_DRAW: if (!S.render_disabled) vd_draw((const p_draw *)a, NULL); break;
+        case OP_DRAW_IDX: if (!S.render_disabled) vd_draw(NULL, (const p_draw_idx *)a); break;
+        case OP_DISPATCH: vd_dispatch((const p_dispatch *)a); break;
+        case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
+        default: vd_state_op(h.op, a); break;   /* binds and render state */
+        }
+        p += h.size;
+    }
+}
+
+void vx_submit_done(void) {}
+
+void vx_pin_refs(void (*mark)(const void *)) {
+    pthread_mutex_lock(&vk_mu);
+    if (S.has_rt) {
+        for (int i = 0; i < 8; i++) if (S.rt.color[i]) mark(S.rt.color[i]);
+        if (S.rt.depth) mark(S.rt.depth);
+    }
+    pthread_mutex_unlock(&vk_mu);
+}

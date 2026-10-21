@@ -1,6 +1,10 @@
-/* wintears.exe: the Windows runtime. For now one mode, the boot probe of phase 3A:
+/* wintears.exe: the Windows runtime.
 
-     wintears boot <TOTK_win folder> [--trace]
+     wintears boot <TOTK_win folder> [--trace] [--no-window]
+
+   With a window (the default) the game runs on its own thread and this thread runs the window's event loop
+   (frontend.c); closing the window ends the program. --no-window runs the game on this thread without one (the null
+   GPU backend draws nothing).
 
    It loads the game's original modules from <TOTK_win>/data/v0/exefs (main, subsdk0, sdk; rtld is not run: the
    loader links instead, as upstream does), relocates and links them into the host's guest layout, and runs the SDK's
@@ -11,6 +15,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <pthread.h>
+
+#include "frontend/frontend.h"
 #include "host/host.h"
 #include "loader/loader.h"
 #include "pal.h"
@@ -128,12 +135,33 @@ static int boot(const char *root, int trace) {
     return 0;
 }
 
+typedef struct { const char *root; int trace; } boot_args;
+static void *boot_thread(void *arg) {
+    const boot_args *b = arg;
+    int rc = boot(b->root, b->trace);
+    LOG("the game ended (%d)", rc);
+    exit(rc);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "boot")) {
-        int trace = 0;
-        for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--trace")) trace = 1;
-        return boot(argv[2], trace);
+        int trace = 0, window = 1;
+        for (int i = 3; i < argc; i++) {
+            if (!strcmp(argv[i], "--trace")) trace = 1;
+            else if (!strcmp(argv[i], "--no-window")) window = 0;
+        }
+        if (!window || fe_init("WinTears")) return boot(argv[2], trace);
+        static boot_args b;
+        b = (boot_args){argv[2], trace};
+        pthread_attr_t at;
+        pthread_attr_init(&at);
+        pthread_attr_setstacksize(&at, 64u << 20);
+        pthread_t t;
+        if (pthread_create(&t, &at, boot_thread, &b)) { LOG("cannot start the game thread"); return 1; }
+        fe_run();
+        LOG("window closed");
+        exit(0);
     }
-    fprintf(stderr, "usage: wintears boot <TOTK_win folder> [--trace]\n");
+    fprintf(stderr, "usage: wintears boot <TOTK_win folder> [--trace] [--no-window]\n");
     return 2;
 }
