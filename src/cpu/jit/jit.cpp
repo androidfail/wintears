@@ -126,6 +126,9 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
     uc.dczid_el0 = 4;                  /* DC ZVA zeroes 64 bytes, as on the Switch's Cortex-A57 */
     uc.ctr_el0 = 0x8444c004;
     uc.enable_cycle_counting = false;  /* runs until halted: preemption uses jit_halt */
+    /* Architecturally unpredictable forms run as the hardware does them instead of stopping: TOTK main+0x12497b8 has
+       "stlxr wzr, xzr, [x8]" (status register = data register), executed as the store with the status discarded. */
+    uc.define_unpredictable_behaviour = true;
     uc.code_cache_size = c->cfg.code_cache_bytes ? c->cfg.code_cache_bytes : 128u << 20;
     if (!cfg || cfg->fastmem) {
         uc.fastmem_pointer = uintptr_t{0};     /* identity mapping: host address == guest address */

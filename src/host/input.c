@@ -4,8 +4,8 @@
 
    The pad state comes from the frontend (host_input_set_pad); until the SDL3 frontend exists nothing sets it, so the
    game sees a connected controller with nothing pressed. TOTK_INPUT_SCRIPT="sec:button:ms,..." presses buttons at
-   given seconds after start (A, B, X, Y, L, R, ZL, ZR, PLUS, MINUS, UP, DOWN, LEFT, RIGHT, LSTICK, RSTICK): does the game
-   react, without a picture.
+   given seconds after start (A, B, X, Y, L, R, ZL, ZR, PLUS, MINUS, UP, DOWN, LEFT, RIGHT, LSTICK, RSTICK) or pushes a
+   stick all the way (LX+, LX-, LY+, LY-, RX+, RX-, RY+, RY-; LY+ is forward): does the game react, without a picture.
 
    Rumble and the six-axis sensor (upstream hid_feedback.c) are off until the frontend has a controller to drive:
    the game then gets no vibration or six-axis handles at all, exactly as upstream with TOTK_RUMBLE=0 / TOTK_GYRO=0. */
@@ -178,19 +178,33 @@ static uint64_t button_bit(const char *name, size_t n) {
         if (strlen(names[i]) == n && !strncmp(names[i], name, n)) return 1ull << i;
     return 0;
 }
+/* a stick direction: axis 0..3 (lx, ly, rx, ry) and sign, or -1 */
+static int stick_of(const char *name, size_t n, int *sign) {
+    static const char *const axes[] = {"LX", "LY", "RX", "RY"};
+    if (n != 3 || (name[2] != '+' && name[2] != '-')) return -1;
+    for (int i = 0; i < 4; i++) if (!strncmp(name, axes[i], 2)) { *sign = name[2] == '+' ? 1 : -1; return i; }
+    return -1;
+}
+static host_pad pad_now(void) { pthread_mutex_lock(&inputLock); host_pad p = current; pthread_mutex_unlock(&inputLock); return p; }
+static int32_t *axis(host_pad *p, int i) { return i == 0 ? &p->lx : i == 1 ? &p->ly : i == 2 ? &p->rx : &p->ry; }
 static void *input_script(void *arg) {
     const char *p = arg; uint64_t t0 = pal_now_ns();
     while (p && *p) {
         char *end; double at = strtod(p, &end); if (end == p || *end != ':') break;
-        p = end + 1; size_t n = strcspn(p, ":"); uint64_t bit = button_bit(p, n); if (!bit || p[n] != ':') break;
+        p = end + 1; const char *name = p; size_t n = strcspn(p, ":"); int sign = 0, stick = stick_of(p, n, &sign);
+        uint64_t bit = button_bit(p, n); if ((!bit && stick < 0) || p[n] != ':') break;
         p += n + 1; unsigned long ms = strtoul(p, &end, 10); if (end == p) break;
         p = *end == ',' ? end + 1 : end;
         uint64_t when = t0 + (uint64_t)(at * 1e9);
         if (when > pal_now_ns()) pal_sleep_ns(when - pal_now_ns());
-        LOG("[input] script: button %#llx down for %lu ms at %.1f s", (unsigned long long)bit, ms, at);
-        host_pad pad = current; pad.buttons |= bit; host_input_set_pad(&pad);
+        LOG("[input] script: %.*s for %lu ms at %.1f s", (int)n, name, ms, at);
+        host_pad pad = pad_now();
+        if (bit) pad.buttons |= bit; else *axis(&pad, stick) = sign * 32767;
+        host_input_set_pad(&pad);
         pal_sleep_ns((uint64_t)ms * 1000000);
-        pad = current; pad.buttons &= ~bit; host_input_set_pad(&pad);
+        pad = pad_now();
+        if (bit) pad.buttons &= ~bit; else *axis(&pad, stick) = 0;
+        host_input_set_pad(&pad);
     }
     if (p && *p) LOG("[input] TOTK_INPUT_SCRIPT: stopped at \"%s\" (want sec:button:ms,...)", p);
     return NULL;
