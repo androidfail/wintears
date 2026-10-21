@@ -212,6 +212,90 @@ void vd_shadows_flush(void) {   /* end of the submission, outside a pass: the GP
     if (g_nsh) vk_barrier(vk_cmd());
     g_nsh = 0;
 }
+/* Inline uniform updates without ending the pass (upstream's renaming, nvn_mtl.m mtl_sub_update). The game updates small
+   uniform ranges between draws about 210 times a frame; each was a GPU copy that ended the pass and drained the GPU. Now
+   an update is logged with its bytes, and a uniform binding that overlaps logged updates gets a private copy: memory, then
+   the flushed updates the GPU has not finished, then this submission's, in order. Draws before an update read the old
+   bytes, draws after it the new ones. The log reaches memory at the end of the submission, or earlier when a storage,
+   vertex or index buffer or a copy touches an updated range (vd_ub_guard). */
+typedef struct { uint64_t lo, hi, fence; uint8_t *data; } ub_upd;
+static ub_upd *g_upd, *g_inf; static int g_nupd, g_cupd, g_ninf, g_cinf;   /* this submission's / flushed, GPU not done */
+static uint64_t g_upd_lo = UINT64_MAX, g_upd_hi, g_upd_seq;
+typedef struct { uint64_t lo, n, seq, sub; VkBuffer b; VkDeviceSize off; } ub_copy;
+static ub_copy g_ubc[64]; static unsigned g_ubc_next;
+uint64_t vk_n_ubflush;
+static int ub_hit(uint64_t lo, uint64_t hi) {
+    if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return 0;
+    for (int i = 0; i < g_nupd; i++) if (g_upd[i].lo < hi && lo < g_upd[i].hi) return 1;
+    return 0;
+}
+static void ub_apply(const ub_upd *u, int n, uint64_t lo, uint8_t *out, uint64_t len) {
+    for (int i = 0; i < n; i++) {
+        uint64_t a = u[i].lo > lo ? u[i].lo : lo, b = u[i].hi < lo + len ? u[i].hi : lo + len;
+        if (a < b) memcpy(out + (a - lo), u[i].data + (a - u[i].lo), (size_t)(b - a));
+    }
+}
+/* the bytes of [lo, lo+len) as the GPU would read them at this point of the submission */
+static void ub_read(uint64_t lo, uint8_t *out, uint64_t len) {
+    if (pal_guarded_copy(out, (const void *)(uintptr_t)lo, (size_t)len)) memset(out, 0, (size_t)len);
+    if (g_ninf) {   /* drop what the GPU has finished: memory holds it now */
+        uint64_t done = vk_gpu_done(); int k = 0;
+        while (k < g_ninf && g_inf[k].fence <= done) free(g_inf[k++].data);
+        if (k) { memmove(g_inf, g_inf + k, (size_t)(g_ninf - k) * sizeof *g_inf); g_ninf -= k; }
+        ub_apply(g_inf, g_ninf, lo, out, len);
+    }
+    ub_apply(g_upd, g_nupd, lo, out, len);
+}
+static VkDescriptorBufferInfo ub_copy_of(uint64_t lo, uint64_t n, VkDeviceSize align) {
+    for (unsigned i = 0; i < 64; i++) { ub_copy *c = &g_ubc[i];
+        if (c->lo == lo && c->n == n && c->seq == g_upd_seq && c->sub == vk_sub_serial() && !(c->off % align)) return (VkDescriptorBufferInfo){c->b, c->off, n}; }
+    ub_copy *c = &g_ubc[g_ubc_next++ & 63];
+    ub_read(lo, vk_stage(n, align, &c->b, &c->off), n);
+    c->lo = lo; c->n = n; c->seq = g_upd_seq; c->sub = vk_sub_serial();
+    return (VkDescriptorBufferInfo){c->b, c->off, n};
+}
+int vd_ub_update(uint64_t dst, const void *data, uint64_t n) {
+    static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_UB_RENAME"); on = !(e && !atoi(e)); }   /* =0: A/B only */
+    if (!on) return 0;
+    int ov; if (shadow_of(dst, n, &ov) || ov) return 0;   /* a storage buffer the GPU writes this submission: copied in order */
+    if (g_nupd == g_cupd) { g_cupd = g_cupd ? g_cupd * 2 : 256; g_upd = realloc(g_upd, (size_t)g_cupd * sizeof *g_upd); }
+    uint8_t *d = malloc((size_t)n); memcpy(d, data, (size_t)n);
+    g_upd[g_nupd++] = (ub_upd){dst, dst + n, 0, d};
+    if (dst < g_upd_lo) g_upd_lo = dst;
+    if (dst + n > g_upd_hi) g_upd_hi = dst + n;
+    g_upd_seq++;
+    return 1;
+}
+static int ub_cmp(const void *a, const void *b) { uint64_t x = ((const ub_upd *)a)->lo, y = ((const ub_upd *)b)->lo; return x < y ? -1 : x > y; }
+void vd_ub_flush(void) {   /* the logged updates into memory, on the GPU timeline */
+    if (!g_nupd) return;
+    vk_n_ubflush++;
+    vx_end_pass();
+    ub_upd *s = malloc((size_t)g_nupd * sizeof *s); memcpy(s, g_upd, (size_t)g_nupd * sizeof *s);
+    qsort(s, (size_t)g_nupd, sizeof *s, ub_cmp);
+    for (int i = 0; i < g_nupd;) {   /* overlapping / touching updates merged: every byte of a merged range is covered by one */
+        uint64_t lo = s[i].lo, hi = s[i].hi; int j = i + 1;
+        for (; j < g_nupd && s[j].lo <= hi; j++) if (s[j].hi > hi) hi = s[j].hi;
+        VkBuffer db, sb; VkDeviceSize dof, so;
+        if (vk_buf(lo, hi - lo, &db, &dof)) {
+            uint8_t *p = vk_stage(hi - lo, 16, &sb, &so);
+            ub_apply(g_upd, g_nupd, lo, p, hi - lo);   /* in log order: the newest bytes win */
+            VkBufferCopy r = {so, dof, hi - lo}; vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
+        } else for (int k = 0; k < g_nupd; k++) if (g_upd[k].lo < hi && lo < g_upd[k].hi) {   /* spans pools: written by the CPU now */
+            dm_guest_write_prepare((void *)(uintptr_t)g_upd[k].lo, (size_t)(g_upd[k].hi - g_upd[k].lo));
+            memcpy((void *)(uintptr_t)g_upd[k].lo, g_upd[k].data, (size_t)(g_upd[k].hi - g_upd[k].lo));
+        }
+        i = j;
+    }
+    free(s);
+    vk_barrier(vk_cmd());
+    uint64_t f = vk_open_fence();
+    if (g_ninf + g_nupd > g_cinf) { g_cinf = (g_ninf + g_nupd) * 2; g_inf = realloc(g_inf, (size_t)g_cinf * sizeof *g_inf); }
+    for (int i = 0; i < g_nupd; i++) { g_upd[i].fence = f; g_inf[g_ninf++] = g_upd[i]; }
+    g_nupd = 0; g_upd_lo = UINT64_MAX; g_upd_hi = 0;
+}
+void vd_ub_guard(uint64_t lo, uint64_t hi) { if (ub_hit(lo, hi)) vd_ub_flush(); }
+
 static VkDescriptorBufferInfo ubo_at(uint64_t addr, uint64_t size) {
     VkBuffer b; VkDeviceSize off;
     if (!addr || !vk_buf(addr, 1, &b, &off)) return (VkDescriptorBufferInfo){g_zero, 0, ZERO_SIZE};
@@ -220,12 +304,11 @@ static VkDescriptorBufferInfo ubo_at(uint64_t addr, uint64_t size) {
     VkDeviceSize al = vk_props.limits.minUniformBufferOffsetAlignment, range = size && size < 65536 ? size : 65536;
     if (off % al) {
         VK_ONCE("uniform buffer at %#llx is not %llu-byte aligned: its bytes are copied at record time", (unsigned long long)addr, (unsigned long long)al);
-        VkBuffer sb; VkDeviceSize so; void *p = vk_stage(range, al, &sb, &so);
-        if (pal_guarded_copy(p, (const void *)(uintptr_t)addr, (size_t)range)) memset(p, 0, (size_t)range);
-        return (VkDescriptorBufferInfo){sb, so, range};
+        return ub_copy_of(addr, range, al);
     }
     VkBuffer b2; VkDeviceSize o2;   /* as much of the 64 KiB the shader may read as the pool has */
     while (range > 256 && !vk_buf(addr, range, &b2, &o2)) range >>= 1;
+    if (ub_hit(addr, addr + range)) return ub_copy_of(addr, range, al);
     return (VkDescriptorBufferInfo){b, off, range};
 }
 static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size, int rw) {
@@ -233,6 +316,10 @@ static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size, int rw) {
     if (!addr || !vk_buf(addr, 1, &b, &off)) return (VkDescriptorBufferInfo){g_zero, 0, ZERO_SIZE};
     { VkDeviceSize lo = off & ~(VkDeviceSize)15, range = (size ? size : 65536) + (off - lo);
       uint64_t ga = addr - (off - lo); int ov;
+      if (ub_hit(ga, ga + range)) {   /* uniform bytes updated this submission, read as storage */
+          if (!rw) return ub_copy_of(ga, range < vk_props.limits.maxStorageBufferRange ? range : vk_props.limits.maxStorageBufferRange, vk_props.limits.minStorageBufferOffsetAlignment);
+          vd_ub_flush();
+      }
       const shadow *x = shadow_of(ga, range, &ov);
       if (!x && rw && !ov) x = shadow_make(ga, range);
       if (!x && rw && ov) VK_ONCE("written storage buffer %#llx+%#llx overlaps another one in part: left in system memory", (unsigned long long)ga, (unsigned long long)range);
@@ -581,6 +668,11 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     if (!pr || !vs_has_stage(pr, 0)) { g_skipped[0]++; return; }
     vk_shader *vs = vs_stage(pr, 0), *fs = vs_has_stage(pr, 1) ? vs_stage(pr, 1) : NULL;
     if (!vs || (vs_has_stage(pr, 1) && !fs)) { g_skipped[1]++; return; }
+    if (g_nupd) {   /* vertex / index buffers read memory: logged uniform updates there reach it first */
+        for (int i = 0; i < S.nattr && i < 16; i++) { va_st va; memcpy(&va, &S.attr[i], 4);
+            if (va.fmt && va.stream < 16 && S.vbuf[va.stream].address) vd_ub_guard(S.vbuf[va.stream].address, S.vbuf[va.stream].address + (S.vbuf[va.stream].size ? S.vbuf[va.stream].size : 1)); }
+        if (di) vd_ub_guard(di->ibuf, di->ibuf + (uint64_t)di->count * 4);
+    }
     /* the descriptor sets first: they may upload textures (into this submission's upload buffer, before the pass) */
     VkDescriptorSet s0 = stage_set(vs, 0), s1 = fs ? stage_set(fs, 1) : VK_NULL_HANDLE;
     if (!vx_begin_pass()) { g_skipped[2]++; return; }

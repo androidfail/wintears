@@ -242,7 +242,10 @@ static _Atomic uint64_t g_game_fence;
 static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_done_cv = PTHREAD_COND_INITIALIZER;
 
+uint64_t vk_open_fence(void) { return g_fence + 1; }
+uint64_t vk_gpu_done(void) { uint64_t v = 0; vkGetSemaphoreCounterValue(vk_dev, g_tl, &v); return v; }
 void vk_barrier(VkCommandBuffer c) {
+    vk_n_barrier++;
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
@@ -404,7 +407,7 @@ static void tex_release(tex_t *t) { if (t->serial) vt_release_serial(t->serial);
 static void prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&vk_mu); vs_prog_release(p->serial); pthread_mutex_unlock(&vk_mu); }
 static void window_tex(uint64_t serial) { (void)serial; }
 
-uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex;
+uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_barrier;
 static uint64_t g_sub_max;
 static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;
 static uint64_t submit(const uint64_t *handles, int n) {
@@ -425,10 +428,10 @@ static uint64_t submit(const uint64_t *handles, int n) {
     if (now - last >= 10000000000ull) {
         last = now;
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
-        extern uint64_t g_sh_bytes;
-        VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
-             (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
-        g_sh_bytes = 0; g_sub_max = vk_ns_xlate = vk_ns_pipe = vk_ns_tex = 0;
+        extern uint64_t g_sh_bytes, vk_n_ubflush;
+        VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
+             (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
+        g_sh_bytes = 0; g_sub_max = vk_ns_xlate = vk_ns_pipe = vk_ns_tex = vk_n_pass = vk_n_ubo = vk_n_ubflush = vk_n_barrier = 0;
     }
     static int said; if (!said++) VLOG("first submission (%d command lists)", n);
     return f;

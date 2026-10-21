@@ -145,6 +145,7 @@ static int begin_pass(void) {
     for (int i = 0; i < n; i++) if (col[i]) { S.pass_samples = vt_samples(col[i]); break; }
     if (dep && S.pass_samples == 1) S.pass_samples = vt_samples(dep);
     if (vk_passlog_on) g_pass_q = ptime_begin();
+    vk_n_pass++;
     vkCmdBeginRendering(vk_cmd(), &ri);
     g_pass = 1;
     vd_pass_begun();
@@ -196,6 +197,7 @@ static void clear_ds(const p_clear_ds *c) {
 static void copy_b2b(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
     if (!n) return;
+    vd_ub_guard(src, src + n); vd_ub_guard(dst, dst + n);
     if (!vk_buf(src, n, &sb, &so) || !vk_buf(dst, n, &db, &dof) || (sb == db && src < dst + n && dst < src + n)) {
         /* not both GPU-visible, or overlapping: done by the CPU at submit, as the null backend does */
         VK_ONCE("buffer copy %#llx -> %#llx (%llu bytes) outside GPU memory or overlapping: copied by the CPU", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
@@ -217,7 +219,10 @@ static void update_ub(uint64_t dst, const uint8_t *data, uint64_t n) {
         memcpy((void *)(uintptr_t)dst, data, (size_t)n);
         return;
     }
-    vx_end_pass();   /* shortcut: every inline uniform update ends the pass; upgrade to upstream's renamed copies if passes split too often */
+    vk_n_ubo++;
+    if (vd_ub_update(dst, data, n)) return;
+    vd_ub_flush();   /* earlier logged updates first: the order of writes is kept */
+    vx_end_pass();
     for (uint64_t at = 0; at < n; at += 65536) vkCmdUpdateBuffer(vk_cmd(), db, off + at, n - at > 65536 ? 65536 : n - at, data + at);
     vk_barrier(vk_cmd());
 }
@@ -247,6 +252,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     uint64_t row = S.copy_stride > 0 ? (uint64_t)S.copy_stride : (uint64_t)((x.width + bw - 1) / bw) * bpb;
     uint64_t n = row * ((x.height + bh - 1) / bh) * x.depth * sub.layerCount;
     VkBuffer sb; VkDeviceSize so;
+    vd_ub_guard(c->src, c->src + n);
     if (!vk_buf(c->src, n, &sb, &so)) { VK_ONCE("buffer-to-texture copy from %#llx: not GPU memory", (unsigned long long)c->src); return; }
     vx_end_pass();
     VkBufferImageCopy r = {.bufferOffset = so, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
@@ -263,6 +269,7 @@ static void copy_t2b(const p_copy_b2t *c) {   /* the T2B record: tex is the sour
     uint64_t row = S.copy_stride > 0 ? (uint64_t)S.copy_stride : (uint64_t)((x.width + bw - 1) / bw) * bpb;
     uint64_t n = row * ((x.height + bh - 1) / bh) * x.depth * sub.layerCount;
     VkBuffer db; VkDeviceSize dof;
+    vd_ub_guard(c->src, c->src + n);
     if (!vk_buf(c->src, n, &db, &dof)) { VK_ONCE("texture-to-buffer copy to %#llx: not GPU memory", (unsigned long long)c->src); return; }
     vx_end_pass();
     VkBufferImageCopy r = {.bufferOffset = dof, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
@@ -362,7 +369,7 @@ void vx_run(const uint8_t *p) {
 }
 
 void vd_shadows_flush(void);
-void vx_submit_done(void) { vx_end_pass(); vd_shadows_flush(); }
+void vx_submit_done(void) { vd_ub_flush(); vx_end_pass(); vd_shadows_flush(); }
 
 void vx_pin_refs(void (*mark)(const void *)) {
     pthread_mutex_lock(&vk_mu);

@@ -32,3 +32,6 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di);
 void vd_dispatch(const p_dispatch *d);
 void vd_pass_begun(void);                   /* dynamic state must be set again */
 void vd_init(void);
+int vd_ub_update(uint64_t dst, const void *data, uint64_t n);   /* 1: logged (renamed), 0: write it on the GPU timeline */
+void vd_ub_guard(uint64_t lo, uint64_t hi);   /* before a non-uniform GPU access to [lo, hi) */
+void vd_ub_flush(void);

@@ -49,8 +49,10 @@ void vk_open(void);
 uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo *signal);
 VkCommandBuffer vk_cmd(void);   /* the replay's command buffer */
 VkCommandBuffer vk_pre(void);   /* runs before it in the same submission: uploads and image initialisation */
-extern uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex;   /* time spent translating shaders, creating pipelines, uploading textures (render thread) */
-uint64_t vk_sub_serial(void);   /* counts submissions: "once per submission" checks */
+extern uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_barrier;   /* time spent translating shaders, creating pipelines, uploading textures (render thread) */
+uint64_t vk_sub_serial(void);
+uint64_t vk_open_fence(void);   /* the fence the submission being recorded will signal */
+uint64_t vk_gpu_done(void);     /* the last fence the GPU has finished */   /* counts submissions: "once per submission" checks */
 /* Staging memory (host visible) for the open submission, freed when it completes. */
 void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off);
 /* fn(arg) on the completion thread once the open submission has completed (in submission order). */

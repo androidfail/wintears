@@ -112,8 +112,10 @@ Not an option: getting game files from anywhere but the user's own dump.
      Not done yet: buffer textures (bound as zeros), partial-mask clears,
      layered rendering (first layer only), 24-bit depth uploads, writing rendered textures back to pool memory
      (InvalidateMappedRange), occlusion queries (always "visible"), the instance divisor extension, physical pools
-     the driver cannot import (one 111 MiB pool), background shader translation, performance (full barriers, GENERAL
-     layouts, a pass split at every inline uniform update).
+     the driver cannot import (one 111 MiB pool), background shader translation, performance (full barriers between
+     passes, copies and dispatches, about 285 a frame; GENERAL layouts). Inline uniform updates (about 210 a frame) are
+     renamed as upstream does (`vd_ub_update` in `vk_draw.c`; `TOTK_UB_RENAME=0` for A/B): passes no longer split at
+     them, barriers per frame went from about 510 to 285.
    - **NVN layer, left out of the port so far** (`src/gfx/nvn.c` header comment): CPU-visible physical memory pools
      (`src/gfx/nvn_vpool.c`: they would alias the game's private heap memory), the recording-copy marks in control memory (copies of control memory the game frees to
      its heap stay until it is re-added), the translation thread, the game's frame-step patches.
