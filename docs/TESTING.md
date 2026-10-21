@@ -10,10 +10,18 @@ Most bugs can only be found with the real game, and the game files stay on your 
    ```
    git clone --recursive https://github.com/androidfail/wintears
    cd wintears
-   git checkout claude/porting-plan
    ```
 3. Keep your game file (`.xci` or `.nsp`, version 1.0.0) and your `prod.keys` somewhere outside the repository, for
    example `D:\Games\TOTK\`. They must never be copied into the repository, a pull request, an issue or a chat.
+
+### Finding your files if you use Ryujinx
+
+- **The game file:** in Ryujinx, open *Options → Settings → UI → Game Directories*. Those are the folders Ryujinx
+  scans; your `.xci` or `.nsp` is in one of them. Ryujinx's list view can also show a *Path* column. Use the base game
+  file (version 1.0.0), not an update file: Ryujinx keeps updates as separate files (*Manage Title Updates*).
+- **prod.keys:** *File → Open Ryujinx Folder*, then `system\prod.keys` (usually `%APPDATA%\Ryujinx\system\prod.keys`).
+- **Shared fonts for an NSP:** Ryujinx's installed firmware works with
+  `--firmware "%APPDATA%\Ryujinx\bis\system\Contents\registered"`.
 
 ## Each round
 
