@@ -39,6 +39,14 @@ Most bugs can only be found with the real game, and the game files stay on your 
 
    Logs contain file names, sizes and hashes, never key values or game content.
 
+## If the build stops at "1/3 code"
+
+Run the diagnostic and send its output (it prints no key values):
+
+```
+python tools\nsp_info.py "<path to your game file>" -k "%APPDATA%\Ryujinx\system\prod.keys"
+```
+
 ## What not to send
 
 - Your `prod.keys`, `title.keys` or any key value.
