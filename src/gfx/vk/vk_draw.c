@@ -173,9 +173,48 @@ static void drv_fill(uint8_t *d, int bank, int stage) {   /* upstream driver_ban
 }
 
 /* a uniform buffer at a guest address: the pool buffer when aligned, else a copy of its bytes now */
+/* Storage buffers the GPU writes get a video-memory copy for the submission: GPU atomics on system memory (the
+   game's pools) cross PCIe one by one (one fragment shader took 45 ms). The copy is filled from pool memory when the
+   submission starts and written back when it ends; every bind of those bytes in the submission uses it. */
+typedef struct { uint64_t lo, hi; VkBuffer host; VkDeviceSize host_off; VkBuffer dev; VmaAllocation al; } shadow;
+static shadow *g_sh; static int g_nsh, g_csh; static uint64_t g_sh_sub;
+static void shadow_free(void *arg) { shadow *x = arg; vmaDestroyBuffer(vk_vma, x->dev, x->al); free(x); }
+static void shadows_now(void) { if (g_sh_sub != vk_sub_serial()) { g_nsh = 0; g_sh_sub = vk_sub_serial(); } }
+static const shadow *shadow_of(uint64_t a, uint64_t n, int *overlap) {
+    shadows_now(); *overlap = 0;
+    for (int i = 0; i < g_nsh; i++) {
+        if (a >= g_sh[i].lo && a + n <= g_sh[i].hi) return &g_sh[i];
+        if (a < g_sh[i].hi && a + n > g_sh[i].lo) *overlap = 1;
+    }
+    return NULL;
+}
+static const shadow *shadow_make(uint64_t a, uint64_t n) {
+    VkBuffer hb; VkDeviceSize ho;
+    if (!vk_buf(a, n, &hb, &ho)) return NULL;
+    if (g_nsh == g_csh) { g_csh = g_csh ? g_csh * 2 : 32; g_sh = realloc(g_sh, (size_t)g_csh * sizeof *g_sh); }
+    shadow *x = &g_sh[g_nsh++];
+    *x = (shadow){a, a + n, hb, ho};
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VKC(vmaCreateBuffer(vk_vma, &bi, &ac, &x->dev, &x->al, NULL));
+    VkBufferCopy r = {ho, 0, n};
+    vkCmdCopyBuffer(vk_pre(), hb, x->dev, 1, &r);
+    vk_barrier(vk_pre());
+    shadow *keep = malloc(sizeof *keep); *keep = *x; vk_after(shadow_free, keep);
+    return x;
+}
+void vd_shadows_flush(void) {   /* end of the submission, outside a pass: the GPU's writes back into pool memory */
+    shadows_now();
+    for (int i = 0; i < g_nsh; i++) { VkBufferCopy r = {0, g_sh[i].host_off, g_sh[i].hi - g_sh[i].lo}; vkCmdCopyBuffer(vk_cmd(), g_sh[i].dev, g_sh[i].host, 1, &r); }
+    if (g_nsh) vk_barrier(vk_cmd());
+    g_nsh = 0;
+}
 static VkDescriptorBufferInfo ubo_at(uint64_t addr, uint64_t size) {
     VkBuffer b; VkDeviceSize off;
     if (!addr || !vk_buf(addr, 1, &b, &off)) return (VkDescriptorBufferInfo){g_zero, 0, ZERO_SIZE};
+    { int ov; const shadow *x = shadow_of(addr, size ? size : 256, &ov); if (x && !((addr - x->lo) % vk_props.limits.minUniformBufferOffsetAlignment))
+        return (VkDescriptorBufferInfo){x->dev, addr - x->lo, (size ? size : 256) < 65536 ? (size ? size : 256) : 65536}; }
     VkDeviceSize al = vk_props.limits.minUniformBufferOffsetAlignment, range = size && size < 65536 ? size : 65536;
     if (off % al) {
         VK_ONCE("uniform buffer at %#llx is not %llu-byte aligned: its bytes are copied at record time", (unsigned long long)addr, (unsigned long long)al);
@@ -187,9 +226,15 @@ static VkDescriptorBufferInfo ubo_at(uint64_t addr, uint64_t size) {
     while (range > 256 && !vk_buf(addr, range, &b2, &o2)) range >>= 1;
     return (VkDescriptorBufferInfo){b, off, range};
 }
-static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size) {
+static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size, int rw) {
     VkBuffer b; VkDeviceSize off;
     if (!addr || !vk_buf(addr, 1, &b, &off)) return (VkDescriptorBufferInfo){g_zero, 0, ZERO_SIZE};
+    { VkDeviceSize lo = off & ~(VkDeviceSize)15, range = (size ? size : 65536) + (off - lo);
+      uint64_t ga = addr - (off - lo); int ov;
+      const shadow *x = shadow_of(ga, range, &ov);
+      if (!x && rw && !ov) x = shadow_make(ga, range);
+      if (!x && rw && ov) VK_ONCE("written storage buffer %#llx+%#llx overlaps another one in part: left in system memory", (unsigned long long)ga, (unsigned long long)range);
+      if (x) return (VkDescriptorBufferInfo){x->dev, ga - x->lo, range}; }
     /* bound at the 16-byte boundary below: the translator adds the address's low bits itself (Ryujinx storage buffer alignment) */
     VkDeviceSize lo = off & ~(VkDeviceSize)15, range = (size ? size : 65536) + (off - lo);
     if (range > vk_props.limits.maxStorageBufferRange) range = vk_props.limits.maxStorageBufferRange;
@@ -206,9 +251,14 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
     enum { MAXW = 96, MAXI = 512 };
     VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXI]; VkDescriptorImageInfo ii[MAXI]; VkBufferView bv[MAXI];
     int nw = 0, nb = 0, ni = 0, nv = 0;
+    static char exp_key[32]; static int exp_bind = -2;   /* TOTK_EXP_DUMMY=<shader name prefix>:<binding>: that binding gets dummy data (diagnostic) */
+    if (exp_bind == -2) { const char *e = pal_getenv("TOTK_EXP_DUMMY"); exp_bind = -1; if (e && strchr(e, ':')) { snprintf(exp_key, sizeof exp_key, "%.*s", (int)(strchr(e, ':') - e), e); exp_bind = atoi(strchr(e, ':') + 1); } }
+    int exp_me = exp_bind >= 0 && !strncmp(sh->name, exp_key, strlen(exp_key));
     for (int i = 0; i < sh->nb && nw < MAXW; i++) {
         const vs_bind *b = &sh->b[i];
         uint32_t cnt = b->count;
+        vs_bind dummy_b;
+        if (exp_me && b->binding == exp_bind) { dummy_b = *b; dummy_b.kind = RB_NONE; b = &dummy_b; }
         VkWriteDescriptorSet *x = &w[nw++];
         *x = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b->binding, .descriptorCount = cnt,
                                     .descriptorType = vs_desc_type(b->type)};
@@ -225,18 +275,19 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                 d = (VkDescriptorBufferInfo){sb, so, 0xA00};
                 break;
             }
-            case RB_CBUF: if (b->reg >= 0 && b->reg < 16) d = b->type == DT_UBO ? ubo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size) : ssbo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size); break;
-            case RB_SBUF: if (b->reg >= 0 && b->reg < 16) d = ssbo_at(S.ssbo[st][b->reg].addr, S.ssbo[st][b->reg].size); break;
-            case RB_UBOPTR: if (b->reg >= 0 && b->reg < 16) d = ssbo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size); break;
+            case RB_CBUF: if (b->reg >= 0 && b->reg < 16) d = b->type == DT_UBO ? ubo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size) : ssbo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, b->rw); break;
+            case RB_SBUF: if (b->reg >= 0 && b->reg < 16) d = ssbo_at(S.ssbo[st][b->reg].addr, S.ssbo[st][b->reg].size, b->rw); break;
+            case RB_UBOPTR: if (b->reg >= 0 && b->reg < 16) d = ssbo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, b->rw); break;
             case RB_SBUFUBO: if (b->reg >= 0 && b->reg < 16 && S.ubo[st][b->reg].addr) {
                 uint64_t va = 0;   /* the shader loads this storage buffer's address from the user uniform (upstream: read at bind time) */
-                if (S.ubo[st][b->reg].size >= (uint64_t)b->off + 8 && !pal_guarded_copy(&va, (const void *)(uintptr_t)(S.ubo[st][b->reg].addr + b->off), 8)) d = ssbo_at(va, 65536);
+                if (S.ubo[st][b->reg].size >= (uint64_t)b->off + 8 && !pal_guarded_copy(&va, (const void *)(uintptr_t)(S.ubo[st][b->reg].addr + b->off), 8)) d = ssbo_at(va, 65536, b->rw);
                 break;
             }
             default: break;
             }
             if (b->type == DT_UBO && d.range > 65536) d.range = 65536;
-            { extern int vk_passlog_on; if (vk_passlog_on) VLOG("[pass]   st%d b%d %s kind %d reg %d -> %s", st, b->binding, b->type == DT_UBO ? "ubo" : "ssbo", b->kind, b->reg, d.buffer == g_zero ? "zero" : "real"); }
+            { extern int vk_passlog_on; if (vk_passlog_on) VLOG("[pass]   st%d b%d %s kind %d reg %d -> %s off %#llx range %#llx (ssbo addr %#llx size %#llx)", st, b->binding, b->type == DT_UBO ? "ubo" : "ssbo", b->kind, b->reg, d.buffer == g_zero ? "zero" : "real",
+                (unsigned long long)d.offset, (unsigned long long)d.range, b->reg >= 0 && b->reg < 16 ? (unsigned long long)S.ssbo[st][b->reg].addr : 0ull, b->reg >= 0 && b->reg < 16 ? (unsigned long long)S.ssbo[st][b->reg].size : 0ull); }
             for (uint32_t k = 0; k < cnt; k++) bi[nb + k] = d;
             x->pBufferInfo = &bi[nb]; nb += (int)cnt;
         } else if (b->type == DT_UTB || b->type == DT_STB) {
@@ -256,6 +307,8 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                     vtex *e = vt_get(&s.t);
                     VkImageView v = e ? vt_view(e, &s.t, s.has_v ? &s.v : NULL, VT_SAMPLED, (VkImageViewType)b->view) : VK_NULL_HANDLE;
                     if (v) d.imageView = v;
+                    extern int vk_passlog_on;
+                    if (vk_passlog_on) VLOG("[pass]     tex %ux%ux%u levels %u fmt %#x target %d flags %#x", s.t.d.width, s.t.d.height, s.t.d.depth, s.t.d.levels, s.t.d.format, s.t.d.target, s.t.d.flags);
                 }
                 int sid = (int)((b->sreg >= 0 && b->sreg < 128 ? S.samp[st][b->sreg] : h) >> 20) & 0xfff;
                 samp_par sp; if (sid && vt_slot_samp(sid, &sp)) d.sampler = vt_sampler(&sp);
@@ -514,6 +567,7 @@ static int quad_indices(VkCommandBuffer c, const uint8_t *src, int itype, int fi
     return 1;
 }
 
+static void draw_inner(VkCommandBuffer c, const p_draw *dw, const p_draw_idx *di, int prim, int quads);
 void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     g_draws++;
     if (!g_state_ready) state_reset();
@@ -539,6 +593,14 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     dynamic_state(c, prim);
     vertex_buffers(c, vs);
     int quads = prim == NVN_DRAW_PRIMITIVE_QUADS;
+    uint32_t vx_draw_time_begin(void); void vx_draw_time_end(uint32_t q, const char *what);
+    uint32_t tq = vx_draw_time_begin();
+    char what[160]; if (tq != UINT32_MAX) snprintf(what, sizeof what, "%.16s + %.16s", vs->name, fs ? fs->name : "-");
+    draw_inner(c, dw, di, prim, quads);
+    vx_draw_time_end(tq, what);
+}
+static void draw_inner(VkCommandBuffer c, const p_draw *dw, const p_draw_idx *di, int prim, int quads) {
+    (void)prim;
     if (dw) {
         uint32_t inst = dw->instances > 0 ? (uint32_t)dw->instances : 1;
         if (quads) { uint32_t n; if (quad_indices(c, NULL, 0, dw->first, dw->count, 0, &n)) vkCmdDrawIndexed(c, n, inst, 0, 0, (uint32_t)dw->base_instance); return; }

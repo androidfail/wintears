@@ -39,6 +39,35 @@ static int plog(void) {
     return vk_passlog_on = g_plog && vk_present_count() == (uint64_t)g_plog;
 }
 static int g_pass_draws, g_pass_clears;
+/* GPU time of each pass of the logged frame (timestamps) */
+static VkQueryPool g_qp; static uint32_t g_q;
+typedef struct { uint32_t q; char what[160]; } ptime;
+static void ptime_log(void *arg) {
+    ptime *t = arg; uint64_t ts[2];
+    if (vkGetQueryPoolResults(vk_dev, g_qp, t->q, 2, sizeof ts, ts, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+        VLOG("[pass] %.3f ms GPU: %s", (double)(ts[1] - ts[0]) * vk_props.limits.timestampPeriod / 1e6, t->what);
+    free(t);
+}
+static uint32_t ptime_begin(void) {
+    if (!g_qp) {
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 8192};
+        VKC(vkCreateQueryPool(vk_dev, &qi, NULL, &g_qp));
+        vkResetQueryPool(vk_dev, g_qp, 0, 8192);
+    }
+    if (g_q + 2 > 8192) return UINT32_MAX;
+    uint32_t q = g_q; g_q += 2;
+    vkCmdWriteTimestamp2(vk_cmd(), VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_qp, q);
+    return q;
+}
+static uint32_t g_pass_q = UINT32_MAX;
+/* per draw in the logged frame */
+uint32_t vx_draw_time_begin(void) { return vk_passlog_on ? ptime_begin() : UINT32_MAX; }
+void vx_draw_time_end(uint32_t q, const char *what) {
+    if (q == UINT32_MAX) return;
+    vkCmdWriteTimestamp2(vk_cmd(), VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_qp, q + 1);
+    ptime *t = malloc(sizeof *t); t->q = q; snprintf(t->what, sizeof t->what, "draw %s", what);
+    vk_after(ptime_log, t);
+}
 void vx_note_draw(void) { g_pass_draws++; }
 
 /* ---------- render passes ---------- */
@@ -46,8 +75,14 @@ void vx_end_pass(void) {
     if (!g_pass) return;
     if (plog()) VLOG("[pass] %ux%u colors %d (%d %d) depth %d: %d draws, %d clears", S.pass_w, S.pass_h, S.pass_fmt.ncolor, (int)S.pass_fmt.color[0], (int)S.pass_fmt.color[1],
                      (int)S.pass_fmt.depth, g_pass_draws, g_pass_clears);
-    g_pass_draws = g_pass_clears = 0;
     vkCmdEndRendering(vk_cmd());
+    if (g_pass_q != UINT32_MAX) {
+        vkCmdWriteTimestamp2(vk_cmd(), VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_qp, g_pass_q + 1);
+        ptime *t = malloc(sizeof *t); t->q = g_pass_q;
+        snprintf(t->what, sizeof t->what, "%ux%u colors %d (%d) depth %d, %d draws", S.pass_w, S.pass_h, S.pass_fmt.ncolor, (int)S.pass_fmt.color[0], (int)S.pass_fmt.depth, g_pass_draws);
+        vk_after(ptime_log, t); g_pass_q = UINT32_MAX;
+    }
+    g_pass_draws = g_pass_clears = 0;
     vk_barrier(vk_cmd());
     g_pass = 0;
 }
@@ -109,6 +144,7 @@ static int begin_pass(void) {
     S.pass_w = w; S.pass_h = h; S.pass_samples = 1;
     for (int i = 0; i < n; i++) if (col[i]) { S.pass_samples = vt_samples(col[i]); break; }
     if (dep && S.pass_samples == 1) S.pass_samples = vt_samples(dep);
+    if (vk_passlog_on) g_pass_q = ptime_begin();
     vkCmdBeginRendering(vk_cmd(), &ri);
     g_pass = 1;
     vd_pass_begun();
@@ -325,7 +361,8 @@ void vx_run(const uint8_t *p) {
     }
 }
 
-void vx_submit_done(void) {}
+void vd_shadows_flush(void);
+void vx_submit_done(void) { vx_end_pass(); vd_shadows_flush(); }
 
 void vx_pin_refs(void (*mark)(const void *)) {
     pthread_mutex_lock(&vk_mu);
