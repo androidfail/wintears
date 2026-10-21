@@ -41,7 +41,8 @@ Most bugs can only be found with the real game, and the game files stay on your 
 
 ## If the build stops at "1/3 code"
 
-Run the diagnostic and send its output (it prints no key values):
+NSPs whose sections were decrypted by a conversion tool (encryption type 1) are supported. For anything else, run the
+diagnostic and send its output (it prints no key values):
 
 ```
 python tools\nsp_info.py "<path to your game file>" -k "%APPDATA%\Ryujinx\system\prod.keys"

@@ -13,26 +13,46 @@ import test_game_containers as fx  # noqa: E402
 from cryptography.hazmat.primitives.ciphers import modes  # noqa: E402
 
 
-def plain_nca():
-    """A Program NCA whose code section is not encrypted (encryption type 1), as some NSP converters write."""
-    pfs = fx.partition([('main', b'synthetic main'), ('main.npdm', b'synthetic metadata')])
+def plain_pfs0(files):
+    """(FS header, section data) of a hashed PFS0 section with encryption type 1 (none)."""
+    pfs = fx.partition(files)
     fs = bytearray(512)
     fs[2:5] = bytes([1, 2, 1])
     hashes = hashlib.sha256(pfs).digest()
     fs[8:40] = hashlib.sha256(hashes).digest()
     struct.pack_into('<IIQQQQ', fs, 0x28, 4096, 2, 0, len(hashes), 512, len(pfs))
-    data = hashes.ljust(512, b'\0') + pfs.ljust(512, b'\0')
+    return fs, hashes.ljust(512, b'\0') + pfs.ljust(512, b'\0')
+
+
+def plain_nca(romfs=False, logo=False, orphan_rights=False):
+    """A Program NCA whose sections are not encrypted (encryption type 1), as some NSP converters write: the code
+    section, optionally a RomFS and a logo PFS0 (as in the real layout), and optionally a rights ID whose ticket is
+    not in the file (the key must then never be needed)."""
+    sections = [plain_pfs0([('main', b'synthetic main'), ('main.npdm', b'synthetic metadata')])]
+    if romfs:
+        fs, image = fx.ivfc(fx.romfs())
+        fs[4] = 1
+        sections.append((fs, image))
+    if logo:
+        sections.append(plain_pfs0([('NintendoLogo.png', b'synthetic logo')]))
     hdr = bytearray(0xc00)
     hdr[0x200:0x204] = b'NCA3'
     hdr[0x206] = 1
     struct.pack_into('<Q', hdr, 0x210, fx.TITLE)
-    hdr[0x300:0x340] = fx.encrypt(fx.AREA, modes.ECB(), bytes(32) + fx.CONTENT + bytes(16))
-    struct.pack_into('<II', hdr, 0x240, 0xc00 // 512, (0xc00 + len(data)) // 512)
-    hdr[0x400:0x600] = fs
-    hdr[0x280:0x2a0] = hashlib.sha256(fs).digest()
-    struct.pack_into('<Q', hdr, 0x208, len(hdr) + len(data))
+    if orphan_rights:
+        hdr[0x230:0x240] = fx.RIGHTS
+    else:
+        hdr[0x300:0x340] = fx.encrypt(fx.AREA, modes.ECB(), bytes(32) + fx.CONTENT + bytes(16))
+    body = b''
+    for i, (fs, data) in enumerate(sections):
+        start = 0xc00 + len(body)
+        struct.pack_into('<II', hdr, 0x240 + i * 16, start // 512, (start + len(data)) // 512)
+        hdr[0x400 + i * 512:0x600 + i * 512] = fs
+        hdr[0x280 + i * 32:0x2a0 + i * 32] = hashlib.sha256(fs).digest()
+        body += data
+    struct.pack_into('<Q', hdr, 0x208, len(hdr) + len(body))
     return b''.join(fx.encrypt(fx.HEADER, modes.XTS(i.to_bytes(16, 'big')), hdr[i * 512:(i + 1) * 512])
-                    for i in range(6)) + data
+                    for i in range(6)) + body
 
 
 class NspInfo(unittest.TestCase):
@@ -71,6 +91,11 @@ class NspInfo(unittest.TestCase):
         self.assertIn('encryption 1 = none', text)
         self.assertIn('plain PFS0 yes', text)
         self.assertIn('NOT encrypted', verdicts[0])
+
+    def test_logo_section_gives_no_second_verdict(self):
+        text, verdicts = self.run_on(fx.partition([('program.nca', plain_nca(romfs=True, logo=True))]))
+        self.assertEqual(text.count('code data:'), 1)
+        self.assertEqual(len(verdicts), 1)
 
     def test_other_title(self):
         _, verdicts = self.run_on(fx.game_image('nsp', title=0x0100000000010000))

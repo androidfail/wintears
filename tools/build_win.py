@@ -39,6 +39,7 @@ UPSTREAM = REPO / 'upstream'
 GAME = UPSTREAM / 'games/totk'
 sys.path.insert(0, str(UPSTREAM))
 import build_app as mng   # noqa: E402  (upstream helpers: hash checks, container detection, genuine-dump checks)
+import upstream_patches   # noqa: E402
 
 BuildError = mng.BuildError
 say, run, sha256, check = mng.say, mng.run, mng.sha256, mng.check
@@ -62,7 +63,8 @@ def venv_python(venv):
 
 
 def prepare_work(work, logs):
-    """work/totk: a copy of upstream's game folder (its scripts write extracted/ next to themselves)."""
+    """work/totk: a copy of upstream's game folder (its scripts write extracted/ next to themselves), with
+    tools/upstream_patches.py applied (e.g. NSPs whose sections are not encrypted)."""
     tree = work / 'totk'
     tree.mkdir(parents=True, exist_ok=True)
     for item in GAME.iterdir():
@@ -73,6 +75,10 @@ def prepare_work(work, logs):
             shutil.copytree(item, dst, dirs_exist_ok=True)
         else:
             shutil.copy2(item, dst)
+    try:
+        upstream_patches.apply(tree)
+    except upstream_patches.PatchError as e:
+        raise BuildError(str(e)) from None
     for d in ('analysis', 'build'):
         (tree / d).mkdir(exist_ok=True)
     venv = work / 'venv'

@@ -45,6 +45,7 @@ def describe(game, keys_path, out=print):
             generation = max(hdr[0x206], hdr[0x220])
             out(f'NCA {record["name"]}: {content}, title {record["title_id"]}, key generation {generation}, '
                 f'{"needs a ticket (rights ID set)" if rights else "key area (no ticket needed)"}')
+            code_seen = False
             for i in range(4):
                 start, end = struct.unpack_from('<II', hdr, 0x240 + 16 * i)
                 if not start:
@@ -53,8 +54,10 @@ def describe(game, keys_path, out=print):
                 crypt = CRYPT.get(fs[4], f'unknown ({fs[4]})')
                 out(f'  section {i}: {FS_TYPE.get(fs[2], fs[2])}, hash {HASH_TYPE.get(fs[3], fs[3])}, '
                     f'encryption {fs[4]} = {crypt}, {(end - start) * 512:,} bytes')
-                if record['content_type'] != 0 or fs[2:4] != b'\x01\x02':
+                # the code section is the first hashed PFS0 (as in extract_exefs.py); a later one is the logo
+                if record['content_type'] != 0 or fs[2:4] != b'\x01\x02' or code_seen:
                     continue
+                code_seen = True
                 # the code section: does its PFS0 read as plain data, or after AES-CTR decryption?
                 pfsoff = struct.unpack_from('<Q', fs, 0x40)[0]
                 absolute = start * 512 + pfsoff
@@ -78,8 +81,8 @@ def describe(game, keys_path, out=print):
                     verdicts.append('the code section is standard AES-CTR: extraction should work')
                 elif fs[4] == 1 and plain:
                     verdicts.append('the code section is NOT encrypted (type 1): this NSP was converted by a tool that '
-                                    'removed section encryption. The extraction scripts need support for unencrypted '
-                                    'sections (see docs/HANDOFF.md)')
+                                    'removed section encryption. tools/build_win.py supports this (it patches the '
+                                    'extraction scripts, see tools/upstream_patches.py)')
                 elif fs[4] == 4:
                     verdicts.append('the code section is an update patch (BKTR): this is an update file, not the '
                                     'base game')

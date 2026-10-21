@@ -19,52 +19,38 @@ of natively; everything else follows MNG's design, with graphics on Vulkan.
 | `src/cpu/jit` | dynarmic A64 wrapper: one core per virtual core, identity-mapped fastmem, exclusive monitor, svc/halt/exception stops, 19.2 MHz counter | `tests/jit_test.cpp`, 39 checks |
 | `src/bridge` | guest stubs (`svc #0x1000+n; ret`) + generated typed thunks (AAPCS64 → Win64); 422 NVN thunks from upstream's `NVN(...)` definitions | `tests/bridge_test.c`, 17 checks |
 | `tools/build_win.py` | extracts and verifies 1.0.0 ExeFS/RomFS/fonts/overlays with upstream's scripts, writes `TOTK_win/` + manifest, `--check` | `tools/tests`, 11 tests |
-| `tools/nsp_info.py` | describes a game file's NCAs and section encryption (no key values), with a verdict | `tools/tests/test_nsp_info.py`, 4 tests |
+| `tools/nsp_info.py` | describes a game file's NCAs and section encryption (no key values), with a verdict | `tools/tests/test_nsp_info.py`, 5 tests |
+| `tools/upstream_patches.py` | exact text patches applied to the work copy of upstream's scripts (never to `upstream/`); now: NSPs with unencrypted sections (type 1) | `tools/tests/test_upstream_patches.py`, 6 tests |
 | Loader, Horizon host, Vulkan, frontend | not started (task list below) | |
 
-## Current blocker: the user's NSP
+## Current blocker: the user's NSP has a rebuilt RomFS
 
-The user's first real run (`tools\build_win.py Zelda.nsp -k prod.keys --firmware <Ryujinx firmware>`) stopped in
-upstream's `extract_exefs.py`:
+History (2026-10-20, local session):
 
-```
-require(fs[4] == 3, 'Only AES-CTR ExeFS is supported')  ->  ValueError: Only AES-CTR ExeFS is supported
-```
+1. The first real run stopped in `extract_exefs.py` with `Only AES-CTR ExeFS is supported`.
+2. `tools/nsp_info.py` on `Zelda.nsp`: Program NCA `b74b2a7f...nca` (expected name `9d827368...nca`), key area (no
+   ticket), key generation 0; section 0 ExeFS, section 1 RomFS, section 2 logo PFS0, **all encryption type 1
+   (none)**. Control and Meta NCAs are normal AES-CTR. So a conversion tool removed the section encryption.
+3. Fixed: `tools/upstream_patches.py` patches the work copies of `extract_exefs.py` and `extract_romfs.py` to read
+   type 1 sections as they are and derive the key only for AES-CTR sections. Every hash check is unchanged.
+   Upstream PR with the same change: not done yet (outward-facing, ask the user).
+4. Second run: **ExeFS passes** (main, rtld, sdk, subsdk0 byte-identical to 1.0.0; main.npdm "another genuine
+   dump"). **RomFS: all six IVFC levels verify, but the image differs from 1.0.0:** size 17,069,139,636 instead of
+   17,069,139,640, SHA-256 `2fc73227...` instead of `4751542f...`, 304,207 files. Not trailing zeros or table
+   padding (both tested). Upstream's two per-file checks (`make_romfs_patches.py`: the Common.Product.100 layout
+   archive and `DmF_SY_GameOver.bfevfl`) pass, so file contents look genuine, but the converter rebuilt the RomFS
+   image (other table layout, IVFC recomputed). The IVFC master hash sits in an FS header whose NCA signature
+   nobody checks, so IVFC passing proves only internal consistency, not that it is 1.0.0.
 
-So the base Program NCA was found (title and metadata checks passed, the NCA header decrypted and its FS header hash
-matched), but the ExeFS section's encryption type is not 3 (AES-CTR). Most likely it is 1 ("none"): some NSP
-conversion tools remove section encryption. It could also be an update file (type 4, BKTR).
+Options (the user decides):
 
-**Step 1:** have the user run, from the repo folder:
+- **A clean dump** (recommended): re-dump the game from the user's own Switch (cartridge → XCI, or installed → NSP
+  with nxdumptool, no conversion options). Upstream's whole-image hash then matches and nothing else changes.
+- **Accept rebuilt RomFS images**: would need per-file reference hashes of 1.0.0 (path, size, SHA-256: no game
+  data) to verify file by file instead of the image hash; upstream has none, so this means asking MNG to publish
+  such a list or producing it from a clean dump. Also check that nothing downstream depends on file offsets in
+  the image (`runtime/romfs.c`, `prepare_romfs_backend.py`, shader seeds) rather than on `index.json`.
 
-```
-python tools\nsp_info.py "<path to>\Zelda.nsp" -k "%APPDATA%\Ryujinx\system\prod.keys"
-```
-
-and read the `verdict:` line. It prints no key values, so the output is safe to paste.
-
-**Step 2, by verdict:**
-
-- **"NOT encrypted (type 1)"**: add support for unencrypted sections. Rules: `upstream/` is a pinned submodule and is
-  never edited. Options, in order of preference:
-  1. Patch the *work copies* at build time: `build_win.prepare_work` copies `upstream/games/totk/scripts` into
-     `<work>/totk/scripts`; apply small, exact text patches there (a `patches/` folder + an apply step that fails
-     loudly if the expected text is missing). Places to change:
-     - `extract_exefs.py`: `require(fs[4] == 3, ...)` → accept 1 too; in `section_read`, skip `decrypt(...)` when
-       `fs[4] == 1`; compute `ctr_key` only when needed (`nca_ctr_key` fails for a rights-managed NCA whose ticket
-       was removed along with the encryption).
-     - `extract_romfs.py`: `if fs[2:5]!=bytes([0,3,3]):continue` → also accept `[0,3,1]`; skip decryption in
-       `read` for type 1; same lazy key.
-     - `extract_shared_fonts.py` probably needs nothing: fonts come from Ryujinx's firmware NCAs, which are standard.
-  2. Contribute the same change upstream to MNG as a PR, then bump the submodule.
-  - All hash checks after extraction (ExeFS file hashes, RomFS SHA-256, IVFC levels) stay as they are: they check the
-    decrypted content, so a converted NSP of the same 1.0.0 game must still match exactly.
-  - Test with the `plain_nca()` fixture in `tools/tests/test_nsp_info.py` (an NCA with an unencrypted code section);
-    extend it with an unencrypted RomFS section for `extract_romfs.py`.
-- **"update patch (BKTR)"**: the file is an update, not the base game. Find the base 1.0.0 file (Ryujinx keeps
-  updates separately: right-click the game → *Manage Title Updates* shows their paths).
-- **"not the TOTK base game"**: wrong file.
-- **"standard AES-CTR"**: then the failure is elsewhere; look at `TOTK_build\logs\extract_exefs.log`.
 
 Not an option: getting game files from anywhere but the user's own dump.
 
