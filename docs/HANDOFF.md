@@ -22,7 +22,9 @@ of natively; everything else follows MNG's design, with graphics on Vulkan.
 | `tools/romfs_rebuild.py` | rewrites a RomFS image re-packed by a converter in Nintendo's layout; `build_win` keeps it only if it matches the verified 1.0.0 hash | `tools/tests/test_romfs_rebuild.py`, 6 tests |
 | `tools/nsp_info.py` | describes a game file's NCAs and section encryption (no key values), with a verdict | `tools/tests/test_nsp_info.py`, 5 tests |
 | `tools/upstream_patches.py` | exact text patches applied to the work copy of upstream's scripts (never to `upstream/`); now: NSPs with unencrypted sections (type 1) | `tools/tests/test_upstream_patches.py`, 6 tests |
-| Loader, Horizon host, Vulkan, frontend | not started (task list below) | |
+| `src/loader` | maps the **original** NSO modules (LZ4) into guest memory, RELR/RELA/JMPREL relocations, cross-module linking with a resolver hook for host overrides, segment protections, address-to-module lookup; all parsed at run time, no generated tables | `tests/loader_test.c`, 43 checks (two synthetic NSOs, a JIT call through a resolved PLT slot) |
+| `wintears.exe boot <TOTK_win>` | loads main/subsdk0/sdk at upstream's guest layout, runs the SDK's `nn::init::Start` in the JIT, logs svcs (`--trace`), stops at the first unimplemented one with registers and the guest call chain | run by hand on the real game |
+| Horizon host, Vulkan, frontend | not started (task list below) | |
 
 ## The user's NSP: unencrypted sections and a re-packed RomFS (solved)
 
@@ -59,17 +61,23 @@ History (2026-10-20, local session):
 
 Not an option: getting game files from anywhere but the user's own dump.
 
-## Next tasks after the data build works
+## Next tasks
 
-1. **Loader for the JIT** (task "Phase 3A next"). Port `upstream/games/totk/runtime/loader.c` to load the
-   *original* (unrewritten) `main`, `sdk`, `subsdk0` from `TOTK_win/data/v0/exefs`: decompress NSO segments
-   (see `upstream/games/totk/scripts/prepare_modules.py` and `third_party/d2r/nsoimg.py`), map them at MNG's layout
-   inside a `pal_reserve_fixed` range, apply relocations (RELA kinds 257/1025/1026/1027, and RELR via
-   `third_party/d2r/relr.py`'s logic), resolve imports across modules. Imports MNG binds to host functions
-   (`runtime_override`, `runtime_observer`) become `bridge_add` stub addresses instead of host pointers.
-   Then run `nn::init::Start` in a `jit_core` and log every svc until the first unimplemented one.
-   Upstream's generator `scripts/prepare_runtime.py` works on rewritten images; we need an equivalent for originals.
-2. **Horizon host**: port `upstream/games/totk/runtime/*.c` (threads, services, ipc, fs_host, romfs, time, account,
+1. ~~Loader for the JIT~~ **done (2026-10-20).** First real boot probe on the user's files:
+   ```
+   mapped main    at 0x300000000 size 0x4666000, 704 symbols
+   mapped subsdk0 at 0x304800000 size 0x6a9000, 11622 symbols
+   mapped sdk     at 0x305000000 size 0xdd9000, 27761 symbols
+   linked main    relative 502345, symbolic 2091 (cross-module 2079, weak zero 12)
+   ENTER original nn::init::Start at sdk+0xfa060          (the address upstream's loader names: layout confirmed)
+   first unimplemented svc: 0x29 GetInfo at sdk+0x1584b0  (x1 = 11: random entropy)
+   ```
+   No import is undefined in all modules. Not done yet, on purpose: host overrides (`runtime_override`,
+   `runtime_observer`: the resolver's phase 0 returns 0, so the SDK's own code runs everywhere), MNG's game patches
+   (`game_patches.c`), the DT_INIT constructor-state check (`ctor_flag`), NSO segment SHA-256 checks (build_win
+   already verifies the ExeFS files). The guest layout constants live at the top of `src/app/main.c` and match
+   upstream `services.c` (low region from 0x3_0000_0000: stack +0x1000_0000, heap +0x3000_0000; alias 0x70_0000_0000).
+2. **Horizon host** (next): start with what the boot probe asks for (GetInfo, then memory, threads, IPC). Port `upstream/games/totk/runtime/*.c` (threads, services, ipc, fs_host, romfs, time, account,
    audio) onto `src/pal`, replacing `pthread`/`mach_*`/`dispatch_*`/signals per the table in the plan (section 6,
    phase 2). Key points:
    - MNG's scheduler (`threads.c`) already limits running guest threads to virtual cores: give each virtual core a
@@ -89,8 +97,9 @@ Not an option: getting game files from anywhere but the user's own dump.
 
 ## Building and testing
 
-Native Windows (what the local session will likely use): install [MSYS2](https://www.msys2.org/), open the UCRT64
-shell, then:
+Native Windows: MSYS2 is installed on the user's PC (`C:\msys64`, UCRT64: gcc 16, cmake, ninja, boost). From another
+shell: set `MSYSTEM=UCRT64` and run `C:\msys64\usr\bin\bash.exe -lc "..."`. Fresh machine: install
+[MSYS2](https://www.msys2.org/), open the UCRT64 shell, then:
 
 ```
 pacman -S --needed mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,boost} git

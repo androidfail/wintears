@@ -52,6 +52,20 @@ if(WINTEARS_JIT)
   target_link_libraries(bridge PUBLIC cpu_jit pal)
 endif()
 
+# ---- module loader (original NSO modules) ----
+add_library(loader STATIC src/loader/loader.c)
+target_include_directories(loader PUBLIC src)
+target_link_libraries(loader PUBLIC pal)
+
+# ---- the runtime (phase 3A: boot probe) ----
+if(WINTEARS_JIT)
+  add_executable(wintears src/app/main.c)
+  target_link_libraries(wintears PRIVATE loader bridge cpu_jit pal)
+  if(CMAKE_CROSSCOMPILING)
+    target_link_options(wintears PRIVATE -static)
+  endif()
+endif()
+
 # ---- tests ----
 if(WINTEARS_TESTS)
   enable_testing()
@@ -67,6 +81,9 @@ if(WINTEARS_TESTS)
     target_include_directories(bridge_test PRIVATE tests)
     target_link_libraries(bridge_test PRIVATE bridge)
     add_test(NAME bridge COMMAND bridge_test)
+    add_executable(loader_test tests/loader_test.c)
+    target_link_libraries(loader_test PRIVATE loader cpu_jit pal)
+    add_test(NAME loader COMMAND loader_test)
   endif()
   if(CMAKE_CROSSCOMPILING)
     # MinGW runtime DLLs next to the tests so Wine (and a copied folder on Windows) finds them.
@@ -74,6 +91,7 @@ if(WINTEARS_TESTS)
     if(WINTEARS_JIT)
       target_link_options(jit_test PRIVATE -static)
       target_link_options(bridge_test PRIVATE -static)
+      target_link_options(loader_test PRIVATE -static)
     endif()
   endif()
 endif()
