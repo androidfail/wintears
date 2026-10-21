@@ -53,7 +53,7 @@ build/wintears.exe boot D:/Games/TOTK/TOTK_win
 `build_xlate.py` needs the .NET 10 SDK and the Visual Studio C++ build tools (both are on your PC). The game opens a
 window and draws with Vulkan. Keyboard (as on the Mac version): WASD left stick, arrow keys right stick, J = A,
 K / Space = B, I = X, U = Y, Q = L, E = R, Left Alt = ZL, Left Shift = ZR, Enter = Plus, Tab / Escape = Minus,
-F G H T = d-pad; F11 = fullscreen. A controller works too (Switch layout by position: east = A, south = B).
+F G H T = d-pad (left, down, right, up), Z / C = left / right stick click, hold Left Ctrl to walk; F11 = fullscreen. A controller works too (Switch layout by position: east = A, south = B).
 
 The first start reads the whole 17 GB RomFS image once to check it (a minute or two); later starts skip that while the
 file is unchanged. Shaders are translated the first time they appear (short stutters), then cached in

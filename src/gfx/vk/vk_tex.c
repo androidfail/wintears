@@ -16,6 +16,8 @@
 #include "nvn_dirty.h"
 #include "nvn_hmap.h"
 
+int vk_astc_decode(const uint8_t *src, size_t n, unsigned bw, unsigned bh, unsigned w, unsigned h, int srgb, uint8_t *dst);   /* vk_astc.cpp */
+
 typedef struct { uint64_t mem, size; uint32_t w, h, d, levels, target, samples, cls, pad; } stor_key;   /* 48 bytes, no padding holes */
 typedef struct { VkFormat f; VkImageViewType type; uint32_t base_level, levels, base_layer, layers; VkComponentSwizzle swz[4]; VkImageAspectFlags aspect; } view_key;
 typedef struct { view_key k; VkImageView v; } view_ent;
@@ -106,7 +108,7 @@ static void init_layout(vtex *e) {   /* UNDEFINED -> GENERAL, in the uploads com
     vk_barrier(vk_pre());
 }
 
-static uint64_t g_images, g_image_bytes;
+static uint64_t g_images, g_image_bytes, g_uploads, g_upload_bytes, g_upload_ns, g_reuploads, g_untracked;
 static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     vtex *e = calloc(1, sizeof *e);
     e->k = *k; e->f = *f; e->fmt = f->vk; e->levels = k->levels;
@@ -165,11 +167,14 @@ static void expand_rgb(uint8_t *dst, const uint8_t *src, size_t texels, unsigned
 }
 
 static void upload(vtex *e, const tex_t *t) {
-    if (e->f.convert == 1 || e->f.convert == 3) {
-        VK_ONCE("texture format %#x needs a conversion not written yet (%s): left blank", t->d.format, e->f.convert == 3 ? "ASTC decode" : "24-bit depth");
+    if (e->f.convert == 1) {
+        VK_ONCE("texture format %#x needs a conversion not written yet (24-bit depth): left blank", t->d.format);
         e->uploaded = 1; e->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, (size_t)t->L.size);
         return;
     }
+    uint64_t t0 = pal_now_ns();
+    g_uploads++; g_upload_bytes += t->L.size; if (e->uploaded) g_reuploads++;
+    if (!nvn_dirty_tracked(t->mem, (size_t)t->L.size)) g_untracked++;
     e->stamp = nvn_dirty_now();
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* before copying: a write from here on is seen at the next check */
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -185,10 +190,16 @@ static void upload(vtex *e, const tex_t *t) {
                 VK_ONCE("texture %ux%u format %#x target %d flags %#x: layout not supported for upload", t->d.width, t->d.height, t->d.format, t->d.target, t->d.flags);
                 free(lin); goto done;
             }
-            size_t out_n = e->f.convert == 2 ? n / 3 * 4 : n;
+            size_t out_n = e->f.convert == 2 ? n / 3 * 4 : e->f.convert == 3 ? (size_t)w * h * d * 4 : n;
             VkBuffer sb; VkDeviceSize so;
             uint8_t *dst = vk_stage(out_n, 16, &sb, &so);
-            if (e->f.convert == 2) {
+            if (e->f.convert == 3) {
+                for (uint32_t z = 0; z < d; z++)
+                    if (vk_astc_decode(lin + z * slice, slice, (unsigned)bw, (unsigned)bh, w, h, t->d.format >= 0x87, dst + (size_t)z * w * h * 4)) {
+                        VK_ONCE("ASTC %dx%d texture %ux%u did not decode: left blank", bw, bh, w, h);
+                        memset(dst + (size_t)z * w * h * 4, 0, (size_t)w * h * 4);
+                    }
+            } else if (e->f.convert == 2) {
                 int is_int = (t->d.format >= 0x1B && t->d.format <= 0x1C) || (t->d.format >= 0x20 && t->d.format <= 0x21) || (t->d.format >= 0x23 && t->d.format <= 0x24);
                 expand_rgb(dst, lin, (size_t)w * h * d, (unsigned)bpb / 3, is_int);
             } else memcpy(dst, lin, n);
@@ -201,6 +212,7 @@ static void upload(vtex *e, const tex_t *t) {
 done:
     vk_barrier(c);
     e->uploaded = 1;
+    g_upload_ns += pal_now_ns() - t0;
 }
 
 vtex *vt_get(const tex_t *t) {
@@ -310,9 +322,18 @@ void vt_pool_gone(uintptr_t lo, uintptr_t hi) { range r = {lo, hi}; drop_where(i
 static int idle(const vtex *e, const void *arg) { return e->used_sub + 600 < *(const uint64_t *)arg; }
 void vt_end_submission(void) {
     uint64_t now = vk_sub_serial();
+    static uint64_t last_log;
+    uint64_t t = pal_now_ns();
+    if (!last_log) last_log = t;
+    if (t - last_log >= 10000000000ull) {
+        last_log = t;
+        VLOG("%llu images (%.1f MiB of game texture storage); uploads %llu (%llu again, %llu untracked), %.1f MiB, %.0f ms",
+             (unsigned long long)g_images, g_image_bytes / 1048576.0, (unsigned long long)g_uploads, (unsigned long long)g_reuploads,
+             (unsigned long long)g_untracked, g_upload_bytes / 1048576.0, g_upload_ns / 1e6);
+        g_uploads = g_reuploads = g_untracked = g_upload_bytes = g_upload_ns = 0;
+    }
     if (now % 64) return;
     drop_where(idle, &now, 0);   /* unused for 600 submissions: no submission in flight uses them */
-    if (now % 1800 == 0) VLOG("%llu images (%.1f MiB of game texture storage)", (unsigned long long)g_images, g_image_bytes / 1048576.0);
 }
 
 /* ---------- texture / sampler pool slots ---------- */

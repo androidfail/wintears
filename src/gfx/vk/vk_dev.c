@@ -229,7 +229,7 @@ typedef struct chunk { VkBuffer buf; VmaAllocation al; uint8_t *map; VkDeviceSiz
 typedef struct { void (*fn)(void *); void *arg; } act_t;
 typedef struct sub {
     VkCommandPool pool; VkCommandBuffer pre, main;
-    uint64_t fence; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
+    uint64_t fence, t_submit; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
 } sub;
 #define CHUNK_SIZE (64ull << 20)
 enum { MAX_IN_FLIGHT = 6 };
@@ -324,7 +324,7 @@ uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo
                         .commandBufferInfoCount = 2, .pCommandBufferInfos = cb, .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig};
     VkResult r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
     if (r != VK_SUCCESS) die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
-    s->fence = ++g_fence; s->next = NULL;
+    s->fence = ++g_fence; s->next = NULL; s->t_submit = pal_now_ns();
     g_cur = NULL;
     pthread_mutex_lock(&g_done_mu);
     if (g_fly_tail) g_fly_tail->next = s; else g_fly_head = s;
@@ -334,6 +334,7 @@ uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo
     return s->fence;
 }
 
+static void lat_note(uint64_t ns);
 static void *done_thread(void *unused) {
     (void)unused;
     pal_thread_set_name("vk completion");
@@ -345,6 +346,7 @@ static void *done_thread(void *unused) {
         VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_tl, .pValues = &s->fence};
         VkResult r = vkWaitSemaphores(vk_dev, &wi, UINT64_MAX);
         if (r != VK_SUCCESS) die("Vulkan: waiting for the GPU failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
+        lat_note(pal_now_ns() - s->t_submit);
         for (int i = 0; i < s->nact; i++) s->acts[i].fn(s->acts[i].arg);
         s->nact = 0;
         pthread_mutex_lock(&g_done_mu);
@@ -398,7 +400,9 @@ static void tex_release(tex_t *t) { if (t->serial) vt_release_serial(t->serial);
 static void prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&vk_mu); vs_prog_release(p->serial); pthread_mutex_unlock(&vk_mu); }
 static void window_tex(uint64_t serial) { (void)serial; }
 
+static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;
 static uint64_t submit(const uint64_t *handles, int n) {
+    uint64_t t0 = pal_now_ns();
     pthread_mutex_lock(&vk_mu);
     vk_open();
     for (int i = 0; i < n; i++) vx_run((const uint8_t *)(uintptr_t)handles[i]);
@@ -408,11 +412,22 @@ static uint64_t submit(const uint64_t *handles, int n) {
     atomic_store(&g_game_fence, f);
     vt_end_submission();
     pthread_mutex_unlock(&vk_mu);
+    atomic_fetch_add(&g_sub_ns, pal_now_ns() - t0); atomic_fetch_add(&g_sub_n, 1);
+    static uint64_t last; uint64_t now = pal_now_ns();
+    if (!last) last = now;
+    if (now - last >= 10000000000ull) {
+        last = now;
+        uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
+        VLOG("last 10 s: %llu submissions, replay %.0f ms in all; submit-to-done %.2f ms on average; game waited %.0f ms for the GPU",
+             (unsigned long long)sn, sns / 1e6, ln ? lns / 1e6 / ln : 0.0, w / 1e6);
+    }
     static int said; if (!said++) VLOG("first submission (%d command lists)", n);
     return f;
 }
+static void lat_note(uint64_t ns) { atomic_fetch_add(&g_gpu_lat_ns, ns); atomic_fetch_add(&g_gpu_lat_n, 1); }
 static uint64_t last_fence(void) { return atomic_load(&g_game_fence); }
 static int wait_fence(uint64_t fence, uint64_t timeout_ns) {
+    uint64_t t0 = pal_now_ns();
     pthread_mutex_lock(&g_done_mu);
     if (g_done < fence && timeout_ns) {
         uint64_t end = pal_wall_time_ns() + (timeout_ns > (1ull << 62) ? (1ull << 62) : timeout_ns);
@@ -421,6 +436,7 @@ static int wait_fence(uint64_t fence, uint64_t timeout_ns) {
     }
     int ok = g_done >= fence;
     pthread_mutex_unlock(&g_done_mu);
+    if (timeout_ns) atomic_fetch_add(&g_wait_ns, pal_now_ns() - t0);
     return ok;
 }
 static void finish(void) {

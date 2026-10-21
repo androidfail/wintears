@@ -1,6 +1,7 @@
 /* SDL3 window and input. Keyboard keys follow upstream runtime/input.c (by position on a Mac keyboard: WASD left
    stick, arrows right stick, J A, K / Space B, I X, U Y, Q L, E R, Left Alt ZL, Left Shift ZR, Z left stick click,
-   C right stick click, Enter Plus, Tab / Escape Minus, F G H T d-pad). Controllers are mapped by button position, the
+   C right stick click, Enter Plus, Tab / Escape Minus, F G H T d-pad; Left Ctrl held: walk).
+   Controllers are mapped by button position, the
    Switch's own layout (upstream controller_map.h default): east A, south B, north X, west Y; triggers are ZL / ZR.
    F11 toggles borderless fullscreen (not Alt+Enter: Alt is ZL). */
 #include <SDL3/SDL.h>
@@ -55,8 +56,9 @@ static void update_pad(void) {
     const bool *k = SDL_GetKeyboardState(NULL);
     host_pad p = {0};
     for (int i = 0; i < SDL_SCANCODE_COUNT; i++) if (k[i]) p.buttons |= key_button((SDL_Scancode)i);
-    p.lx = 32767 * (k[SDL_SCANCODE_D] - k[SDL_SCANCODE_A]);
-    p.ly = 32767 * (k[SDL_SCANCODE_W] - k[SDL_SCANCODE_S]);
+    int tilt = k[SDL_SCANCODE_LCTRL] ? 12000 : 32767;   /* Left Ctrl: the left stick part way (walk) */
+    p.lx = tilt * (k[SDL_SCANCODE_D] - k[SDL_SCANCODE_A]);
+    p.ly = tilt * (k[SDL_SCANCODE_W] - k[SDL_SCANCODE_S]);
     p.rx = 32767 * (k[SDL_SCANCODE_RIGHT] - k[SDL_SCANCODE_LEFT]);
     p.ry = 32767 * (k[SDL_SCANCODE_UP] - k[SDL_SCANCODE_DOWN]);
     for (int i = 0; i < 8; i++) {

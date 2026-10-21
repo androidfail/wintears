@@ -104,10 +104,17 @@ if(WINTEARS_JIT)
   set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
   add_subdirectory(externals/SDL EXCLUDE_FROM_ALL)
+  # ASTC decoder (externals/astc-encoder): desktop GPUs cannot sample ASTC, the game's main texture format
+  set(ASTCENC_ISA_SSE41 ON CACHE BOOL "" FORCE)
+  set(ASTCENC_DECOMPRESSOR ON CACHE BOOL "" FORCE)
+  set(ASTCENC_CLI OFF CACHE BOOL "" FORCE)
+  set(ASTCENC_WERROR OFF CACHE BOOL "" FORCE)
+  set(ASTCENC_UNIVERSAL_BUILD OFF CACHE BOOL "" FORCE)
+  add_subdirectory(externals/astc-encoder EXCLUDE_FROM_ALL)
   # Vulkan: headers, volk (loads vulkan-1.dll at run time), Vulkan Memory Allocator
   set(TEX_DIR upstream/games/totk/third_party/d2r_gfx/gfx/tex)
   add_library(gfx OBJECT src/gfx/nvn.c src/gfx/nvn_ext.c src/gfx/nvn_vpool.c src/gfx/nvn_null.c src/gfx/nvn_gpu.c src/gfx/nvn_dirty.c
-              src/gfx/vk/vk_dev.c src/gfx/vk/vk_fmt.c src/gfx/vk/vk_tex.c src/gfx/vk/vk_exec.c src/gfx/vk/vk_draw.c src/gfx/vk/vk_shader.c src/gfx/vk/vk_shot.c
+              src/gfx/vk/vk_dev.c src/gfx/vk/vk_fmt.c src/gfx/vk/vk_tex.c src/gfx/vk/vk_exec.c src/gfx/vk/vk_draw.c src/gfx/vk/vk_shader.c src/gfx/vk/vk_shot.c src/gfx/vk/vk_astc.cpp
               src/gfx/vk/vk_present.c src/gfx/vk/vk_mem.cpp externals/volk/volk.c src/frontend/frontend.c
               ${NVN_DIR}/nvn_tex.c ${TEX_DIR}/nvn_deswizzle.c ${CMAKE_BINARY_DIR}/nvn_names.c)
   target_include_directories(gfx PUBLIC src ${NVN_DIR} ${NVN_DIR}/include ${TEX_DIR}
@@ -115,7 +122,7 @@ if(WINTEARS_JIT)
   target_compile_definitions(gfx PUBLIC VK_NO_PROTOTYPES)
   target_compile_options(gfx PRIVATE -Wno-missing-field-initializers)   # Vulkan structs: {sType, .field = ...}
   set_source_files_properties(src/gfx/vk/vk_mem.cpp PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-unused-variable;-Wno-missing-field-initializers")
-  target_link_libraries(gfx PUBLIC host SDL3::SDL3-static)
+  target_link_libraries(gfx PUBLIC host SDL3::SDL3-static astcdec-sse4.1-static)
   add_executable(wintears src/app/main.c)
   target_link_libraries(wintears PRIVATE gfx)
   if(CMAKE_CROSSCOMPILING)

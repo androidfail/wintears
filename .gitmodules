@@ -19,3 +19,6 @@
 [submodule "externals/VulkanMemoryAllocator"]
 	path = externals/VulkanMemoryAllocator
 	url = https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+[submodule "externals/astc-encoder"]
+	path = externals/astc-encoder
+	url = https://github.com/ARM-software/astc-encoder
