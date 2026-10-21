@@ -111,7 +111,7 @@ void pal_sleep_ns(uint64_t ns);         /* high-resolution where the OS offers i
 /* ---- files and paths (UTF-8 everywhere) -------------------------------------------------------------------- */
 
 typedef struct pal_file pal_file;
-enum { PAL_FILE_READ = 1, PAL_FILE_WRITE = 2, PAL_FILE_CREATE = 4, PAL_FILE_TRUNCATE = 8 };
+enum { PAL_FILE_READ = 1, PAL_FILE_WRITE = 2, PAL_FILE_CREATE = 4, PAL_FILE_TRUNCATE = 8, PAL_FILE_EXCL = 16 };   /* EXCL: with CREATE, fail if it exists */
 pal_file *pal_file_open(const char *path_utf8, unsigned mode);
 void pal_file_close(pal_file *f);
 int64_t pal_file_size(pal_file *f);
@@ -124,6 +124,23 @@ const void *pal_file_map(pal_file *f, uint64_t *size_out);
 void pal_file_unmap(const void *p);
 
 int pal_mkdirs(const char *path_utf8);           /* like mkdir -p; 0 on success or if it exists */
+
+/* File and directory operations for the guest's file systems (save data). They return 0 or one of these: */
+enum { PAL_ERR = -1, PAL_ENOENT = -2, PAL_EEXIST = -3, PAL_ENOTEMPTY = -4 };
+int pal_last_file_error(void);                   /* why the last pal_file_open / pal_dir_open on this thread failed */
+typedef struct { int is_dir; uint64_t size, mtime_ns, volume, index; } pal_stat;   /* volume + index: the file's identity */
+int pal_stat_path(const char *path_utf8, pal_stat *out);
+int pal_file_stat(pal_file *f, pal_stat *out);
+int pal_file_truncate(pal_file *f, uint64_t size);
+int pal_mkdir(const char *path_utf8);            /* one level; PAL_EEXIST if it is there */
+int pal_remove_file(const char *path_utf8);
+int pal_remove_dir(const char *path_utf8);       /* empty directories only (PAL_ENOTEMPTY) */
+int pal_rename(const char *from, const char *to);   /* fails with PAL_EEXIST if the target exists */
+typedef struct pal_dir pal_dir;
+pal_dir *pal_dir_open(const char *path_utf8);
+/* The next entry other than "." and "..": 1 with its name, 0 at the end. */
+int pal_dir_next(pal_dir *d, char *name, size_t cap, int *is_dir, uint64_t *size);
+void pal_dir_close(pal_dir *d);
 int pal_rename_replace(const char *from, const char *to);   /* atomic replace on the same volume */
 int pal_path_exists(const char *path_utf8);
 /* %LOCALAPPDATA%\WinTears\<app> (created). Returns the length written, 0 on failure. */

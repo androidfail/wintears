@@ -103,6 +103,13 @@ static int boot(const char *root, int trace) {
     if (!mods || load_modules(root)) return 1;
     host_init(mods);
     host_set_trace(trace);
+    char data[1100], profile[1100];
+    snprintf(data, sizeof data, "%s/data", root);
+    const char *p = pal_getenv("TOTK_PROFILE_DIR");
+    if (p) snprintf(profile, sizeof profile, "%s", p);
+    else if (!pal_user_data_dir("totk", profile, sizeof profile)) { LOG("no profile folder"); return 1; }
+    host_set_dirs(data, profile);
+    LOG("game data %s, profile %s", data, profile);
 
     const char *start_name = "_ZN2nn4init5StartEmmPFvvES2_S2_";
     uint64_t start = ldr_symbol(mods, start_name);

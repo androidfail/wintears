@@ -28,6 +28,9 @@ uint64_t host_code_size(void);
 bridge *host_bridge(void);
 
 void host_init(ldr_set *mods);
+/* The game data folder (<TOTK_win>/data) and the player's profile folder (saves, account: TOTK_PROFILE_DIR, or
+   %LOCALAPPDATA%/WinTears/totk). Set before the guest starts. */
+void host_set_dirs(const char *data_dir, const char *profile_dir);
 /* The loader's resolver, phase 0: the guest address of the host function that replaces this import (a bridge stub),
    or 0 to keep the game's own. */
 uint64_t host_override(const char *name, unsigned kind);

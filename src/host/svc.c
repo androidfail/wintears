@@ -54,6 +54,15 @@ void host_init(ldr_set *mods) {
 
 void host_set_trace(int svcs) { host_trace_svcs = svcs; }
 
+static char data_dir[1024], profile_dir[1024];
+void host_set_dirs(const char *data, const char *profile) {
+    snprintf(data_dir, sizeof data_dir, "%s", data);
+    snprintf(profile_dir, sizeof profile_dir, "%s", profile);
+    if (pal_mkdirs(profile_dir)) die("cannot create the profile folder %s", profile_dir);
+}
+const char *host_data_dir(void) { return data_dir; }
+const char *host_profile_dir(void) { return profile_dir; }
+
 uint64_t host_symbol(const char *name) { return ldr_symbol(host_mods, name); }
 
 void host_describe(uint64_t a, char *out, size_t cap) {

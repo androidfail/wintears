@@ -554,3 +554,41 @@ void runtime_event_signal(uint32_t hw) {
     pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
     e->signaled = 1; wake_sync_waiters(); pthread_mutex_unlock(&G);
 }
+
+/* ---------- SystemEvent of the service layer (upstream threads.c) ----------
+   On the Switch a service hands the client the readable end of a kernel event, and the guest waits on it through the
+   SDK's nn::os. Here the SDK's own CreateSystemEvent(inter-process = true) runs on a guest thread, creating the kernel
+   event through svc 0x45; the writable handle is kept, and any thread (also a host thread, such as the vsync timer)
+   can then signal it. */
+static struct { uint64_t ev; uint32_t wh; } g_se[512];
+static int g_nse;
+static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t se_find(uint64_t ev) {
+    for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
+    return 0;
+}
+void hle_bind_system_event(uint64_t ev, int autoclear) {   /* on a guest thread: it runs SDK code */
+    pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
+    if (wh) return;
+    if (!me_or_null()) die("hle_bind_system_event must run on a guest thread");
+    uint64_t create = host_symbol("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
+    uint64_t getw = host_symbol("_ZN2nn2os30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE");
+    if (!create || !getw) die("nn::os SystemEvent functions missing");
+    uint64_t args[3] = {ev, (uint64_t)autoclear, 1};
+    uint32_t r = (uint32_t)host_guest_call(create, 3, args);
+    if (r) die("CreateSystemEvent failed %#x", r);
+    wh = (uint32_t)host_guest_call(getw, 1, &ev);
+    pthread_mutex_lock(&g_se_lock);
+    if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent binding table full");
+    g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
+    pthread_mutex_unlock(&g_se_lock);
+}
+void hle_signal_system_event(uint64_t ev) {   /* bound events only, from any thread */
+    pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
+    if (!wh) die("signal of an unbound SystemEvent");
+    pthread_mutex_lock(&G);
+    event_t *e = h_get(wh, O_EVENT_W);
+    if (!e) die("SystemEvent writable handle %#x is gone", wh);
+    e->signaled = 1; wake_sync_waiters();
+    pthread_mutex_unlock(&G);
+}

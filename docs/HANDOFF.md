@@ -24,7 +24,8 @@ of natively; everything else follows MNG's design, with graphics on Vulkan.
 | `tools/upstream_patches.py` | exact text patches applied to the work copy of upstream's scripts (never to `upstream/`); now: NSPs with unencrypted sections (type 1) | `tools/tests/test_upstream_patches.py`, 6 tests |
 | `src/loader` | maps the **original** NSO modules (LZ4) into guest memory, RELR/RELA/JMPREL relocations, cross-module linking with a resolver hook for host overrides, segment protections, address-to-module lookup; all parsed at run time, no generated tables | `tests/loader_test.c`, 43 checks (two synthetic NSOs, a JIT call through a resolved PLT slot) |
 | `wintears.exe boot <TOTK_win>` | loads main/subsdk0/sdk at upstream's guest layout, runs the SDK's `nn::init::Start` in the JIT, logs svcs (`--trace`), stops at the first unimplemented one with registers and the guest call chain | run by hand on the real game |
-| Horizon host, Vulkan, frontend | not started (task list below) | |
+| `src/host` (Horizon host) | ported from upstream `runtime/`: memory regions and svcs (`memory.c`), threads and sync on virtual cores with one `jit_core` each (`threads.c`), upstream `ipc.c` compiled unchanged, SDK overrides through bridge stubs (`overrides.c`; oe/aoc/diag/err/pctl and observers in `services.c`), RomFS backend and fs host (`romfs.c`, `fs_host.c`), local account (`account.c`); windowless `vi` with a 60 Hz vsync and graphics stand-ins (`vi_stub.c`, `gfx_stub.c`) | through the boot probe on the real game; no unit tests yet |
+| Frontend, NVN layer / Vulkan | not started (task list below) | |
 
 ## The user's NSP: unencrypted sections and a re-packed RomFS (solved)
 
@@ -77,23 +78,34 @@ Not an option: getting game files from anywhere but the user's own dump.
    (`game_patches.c`), the DT_INIT constructor-state check (`ctor_flag`), NSO segment SHA-256 checks (build_win
    already verifies the ExeFS files). The guest layout constants live at the top of `src/app/main.c` and match
    upstream `services.c` (low region from 0x3_0000_0000: stack +0x1000_0000, heap +0x3000_0000; alias 0x70_0000_0000).
-2. **Horizon host** (next): start with what the boot probe asks for (GetInfo, then memory, threads, IPC). Port `upstream/games/totk/runtime/*.c` (threads, services, ipc, fs_host, romfs, time, account,
-   audio) onto `src/pal`, replacing `pthread`/`mach_*`/`dispatch_*`/signals per the table in the plan (section 6,
-   phase 2). Key points:
-   - MNG's scheduler (`threads.c`) already limits running guest threads to virtual cores: give each virtual core a
-     `jit_core`; a thread loads its context into the core it owns. svcs exit the JIT (`JIT_STOP_SVC`), so blocking
-     host calls happen outside it. Preemption uses `jit_halt` instead of `SIGUSR2`.
-   - MNG's gates (`gate.S`, `hle_stack.S`) and the rewriter's thread slots are not needed on the JIT track:
-     dynarmic gives svc callbacks and `tpidr_el0`/`tpidrro_el0` directly (`jit_context`).
-   - Host calls back into guest code (thread entry, NVN callbacks) need a "guest call" helper: save context, set
-     `pc = fn`, `x30 =` a return-trap stub (e.g. `svc #0xFFFE`), run until the trap, restore.
-   - `upstream/.../nvn_impl.h` registers implementations with a Mach-O section (`__DATA,swnvn`). On Windows, shadow
-     it with our own `nvn_impl.h` (earlier in the include path) that uses a PE grouped section (`.nvn$b` between
-     `$a`/`$c` markers) or a generated table.
-   - `long` is 32-bit on Windows: audit reused code (~540 plain `long`/`unsigned long` uses), starting with structs
-     that mirror guest memory.
-3. **Frontend** (SDL3: window, input, audio), then **Vulkan** (phase 5 in the plan). The bridge thunks already exist
-   for all NVN entry points.
+2. **Horizon host**: started (2026-10-20). The boot probe on the user's files now runs `nn::init::Start`,
+   `nnosInitialize`, `nninitInitializeSdkModule` (with upstream's overrides), `nninitStartup`, all three DT_INIT
+   constructors and the game's `nnMain` up to graphics start-up: `nv::InitializeGraphics`, `nn::vi` (display, layer,
+   vsync event), `nvnBootstrapLoader(nvnDeviceInitialize / nvnDeviceGetProcAddress)` and stops at **the first NVN
+   call, `nvnDeviceGetProcAddress` from `main+0xe9d57c`**. No guest thread has been created and no RomFS file read
+   yet: the game sets graphics up first. How it is built:
+   - Each guest thread is a pthread (winpthreads) running its registers on the `jit_core` of the virtual core it
+     holds (3 cores, upstream's scheduler). A better thread waiting for a core calls `jit_halt` on the owner, which
+     gives the core up at the halt (`runtime_core_checkpoint`). Host-to-guest calls (`host_guest_call`) run nested on
+     the calling guest thread, returning through a trap stub (`svc #0xfffe`).
+   - Overrides (upstream `runtime_override` / `runtime_observer`) bind imports to bridge stubs with generic thunks:
+     x0..x7 as Win64 integer arguments, result back as void / u8 / u32 / u64. Floating-point arguments or by-value
+     structs need their own thunk (none so far).
+   - Upstream files compile unchanged where they can (`ipc.c`, with `-include src/host/upstream_compat.h`); the
+     others are adapted copies in `src/host` with the same names and functions, so upstream fixes merge by hand.
+   - The RomFS needs `runtime-index.bin` and `romfs-config.txt` from `tools/build_win.py` (run it again on an older
+     output folder). The image is hashed once; `.romfs-verified-v1` next to it keeps the proof.
+   - Saves and the account id live in `%LOCALAPPDATA%\WinTears\totk` (or `TOTK_PROFILE_DIR`).
+3. **Next, in order:**
+   - **NVN layer** (phase 5, the next stop): port `third_party/d2r_gfx/gfx/nvn/hle_nvn.c` (2.9k lines) with a null
+     backend first (objects and memory pools tracked, nothing drawn), so the game runs on into its threads and RomFS
+     reads; then Vulkan in place of `nvn_mtl.m` (14k lines). The 422 generated NVN thunks in `src/bridge` are its
+     entry points (`nvnBootstrapLoader` / `nvnDeviceGetProcAddress` return their stubs).
+   - **Host tests**: guest programs (`tests/guest`) that exercise the sync svcs (mutex hand-off, condition variable
+     order, address arbiter, events, WaitSynchronization timeouts) on several threads.
+   - **More overrides** as the probe asks: time, input, shared fonts, codecs, movie, applet, swkbd, audio renderer.
+   - **Frontend** (SDL3: window, input, audio) replaces `vi_stub.c`.
+   - `long` is 32-bit on Windows: audit reused code (~540 plain `long`/`unsigned long` uses) as files are ported.
 
 ## Building and testing
 
@@ -127,6 +139,12 @@ Regenerated files (CI checks they are current):
 - **dynarmic fork:** `azahar-emu/dynarmic` is maintained; `merryhime/dynarmic` is gone from GitHub.
 - **Upstream Python tests** that need macOS (`clonefile`, app bundles) fail elsewhere; CI runs only the portable ones
   (`test_game_containers test_relr test_mod_manifest test_romfs_paths test_shader_list`).
+- **winpthreads' first TLS key is 0**: upstream's `g_keythr ? pthread_getspecific(...) : NULL` idiom then reads as
+  "no key". `src/host/threads.c` keeps a separate flag.
+- **MSYS login shells drop `LOCALAPPDATA`** from the environment of the programs they start: the PAL asks the shell
+  API (`SHGetKnownFolderPath`) first.
+- **Shell heredocs and backslashes**: in this tool setup, `\\0` / `\\n` inside a heredoc edit script land in files as
+  real NUL bytes / newlines. Write edit scripts to a file first.
 - **Python 3.14** is required by upstream's scripts (zstd in the standard library).
 
 ## The user

@@ -62,6 +62,49 @@ static void test_reserve_and_alias(void) {
     CHECK(pal_unreserve(BASE, RESERVE) == 0);
 }
 
+/* File helpers for the guest's save storage: create, stat, truncate, list, rename, remove, error codes. */
+static void test_file_ops(void) {
+    char dir[512], a[600], b[600], sub[600], name[64];
+    DWORD n = GetTempPathA(sizeof dir - 64, dir);
+    CHECK(n > 0);
+    snprintf(dir + n, sizeof dir - n, "wintears-pal-%lu", (unsigned long)GetCurrentProcessId());
+    snprintf(a, sizeof a, "%s\\a.bin", dir);
+    snprintf(b, sizeof b, "%s\\b.bin", dir);
+    snprintf(sub, sizeof sub, "%s\\sub", dir);
+    CHECK(pal_mkdir(dir) == 0);
+    CHECK(pal_mkdir(dir) == PAL_EEXIST);
+    pal_stat st;
+    CHECK(pal_stat_path(a, &st) == PAL_ENOENT);
+    pal_file *f = pal_file_open(a, PAL_FILE_READ | PAL_FILE_WRITE | PAL_FILE_CREATE | PAL_FILE_EXCL);
+    CHECK(f != NULL);
+    CHECK(pal_file_open(a, PAL_FILE_WRITE | PAL_FILE_CREATE | PAL_FILE_EXCL) == NULL && pal_last_file_error() == PAL_EEXIST);
+    CHECK(f && pal_file_truncate(f, 12345) == 0);
+    CHECK(f && pal_file_stat(f, &st) == 0 && st.size == 12345 && !st.is_dir);
+    pal_file_close(f);
+    CHECK(pal_file_open(b, PAL_FILE_READ) == NULL && pal_last_file_error() == PAL_ENOENT);
+    CHECK(pal_mkdir(sub) == 0);
+    CHECK(pal_stat_path(sub, &st) == 0 && st.is_dir);
+    int files = 0, dirs = 0, is_dir;
+    uint64_t size;
+    pal_dir *d = pal_dir_open(dir);
+    CHECK(d != NULL);
+    while (d && pal_dir_next(d, name, sizeof name, &is_dir, &size)) {
+        if (is_dir) dirs++;
+        else { files++; CHECK(size == 12345 && !strcmp(name, "a.bin")); }
+    }
+    pal_dir_close(d);
+    CHECK(files == 1 && dirs == 1);
+    CHECK(pal_remove_dir(dir) == PAL_ENOTEMPTY);
+    CHECK(pal_rename(a, b) == 0);
+    f = pal_file_open(a, PAL_FILE_WRITE | PAL_FILE_CREATE);
+    pal_file_close(f);
+    CHECK(pal_rename(a, b) == PAL_EEXIST);
+    CHECK(pal_remove_file(a) == 0);
+    CHECK(pal_remove_file(b) == 0 && pal_remove_file(b) == PAL_ENOENT);
+    CHECK(pal_remove_dir(sub) == 0 && pal_remove_dir(dir) == 0);
+    CHECK(pal_dir_open(dir) == NULL && pal_last_file_error() == PAL_ENOENT);
+}
+
 /* A dynamic region (Horizon heap / alias): page ranges committed and given back in any order. */
 static void test_dynamic(void) {
     uintptr_t d = BASE + 16 * GiB;
@@ -197,6 +240,7 @@ static void test_files(void) {
 int main(void) {
     test_reserve_and_alias();
     test_dynamic();
+    test_file_ops();
     test_write_tracking();
     test_threads();
     test_time();

@@ -9,7 +9,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <knownfolders.h>
 #include <process.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -374,8 +376,9 @@ pal_file *pal_file_open(const char *path_utf8, unsigned mode) {
     wchar_t *w = wide(path_utf8);
     if (!w) return NULL;
     DWORD access = (mode & PAL_FILE_READ ? GENERIC_READ : 0) | (mode & PAL_FILE_WRITE ? GENERIC_WRITE : 0);
-    DWORD disp = (mode & PAL_FILE_CREATE) ? ((mode & PAL_FILE_TRUNCATE) ? CREATE_ALWAYS : OPEN_ALWAYS)
-                                          : ((mode & PAL_FILE_TRUNCATE) ? TRUNCATE_EXISTING : OPEN_EXISTING);
+    DWORD disp = (mode & PAL_FILE_CREATE)
+                     ? ((mode & PAL_FILE_EXCL) ? CREATE_NEW : (mode & PAL_FILE_TRUNCATE) ? CREATE_ALWAYS : OPEN_ALWAYS)
+                     : ((mode & PAL_FILE_TRUNCATE) ? TRUNCATE_EXISTING : OPEN_EXISTING);
     HANDLE h = CreateFileW(w, access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, disp,
                            FILE_ATTRIBUTE_NORMAL, NULL);
     free(w);
@@ -463,6 +466,121 @@ int pal_mkdirs(const char *path_utf8) {
     return (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) ? 0 : rc ? rc : -1;
 }
 
+static int map_error(DWORD e) {
+    switch (e) {
+    case ERROR_FILE_NOT_FOUND: case ERROR_PATH_NOT_FOUND: case ERROR_INVALID_NAME: case ERROR_DIRECTORY: return PAL_ENOENT;
+    case ERROR_FILE_EXISTS: case ERROR_ALREADY_EXISTS: return PAL_EEXIST;
+    case ERROR_DIR_NOT_EMPTY: return PAL_ENOTEMPTY;
+    default: return PAL_ERR;
+    }
+}
+
+int pal_last_file_error(void) { return map_error(GetLastError()); }
+
+static uint64_t filetime_ns(FILETIME t) { return (((uint64_t)t.dwHighDateTime << 32 | t.dwLowDateTime) - 116444736000000000ull) * 100; }
+
+int pal_file_stat(pal_file *f, pal_stat *out) {
+    BY_HANDLE_FILE_INFORMATION i;
+    if (!GetFileInformationByHandle(f->h, &i)) return map_error(GetLastError());
+    out->is_dir = !!(i.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+    out->size = (uint64_t)i.nFileSizeHigh << 32 | i.nFileSizeLow;
+    out->mtime_ns = filetime_ns(i.ftLastWriteTime);
+    out->volume = i.dwVolumeSerialNumber;
+    out->index = (uint64_t)i.nFileIndexHigh << 32 | i.nFileIndexLow;
+    return 0;
+}
+
+int pal_stat_path(const char *path_utf8, pal_stat *out) {
+    wchar_t *w = wide(path_utf8);
+    if (!w) return PAL_ERR;
+    /* FILE_FLAG_BACKUP_SEMANTICS opens directories too; no access rights are needed for the information */
+    HANDLE h = CreateFileW(w, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(w);
+    if (h == INVALID_HANDLE_VALUE) return map_error(GetLastError());
+    struct pal_file f = {h, NULL};
+    int rc = pal_file_stat(&f, out);
+    CloseHandle(h);
+    return rc;
+}
+
+int pal_file_truncate(pal_file *f, uint64_t size) {
+    FILE_END_OF_FILE_INFO e;
+    e.EndOfFile.QuadPart = (LONGLONG)size;
+    return SetFileInformationByHandle(f->h, FileEndOfFileInfo, &e, sizeof e) ? 0 : map_error(GetLastError());
+}
+
+int pal_mkdir(const char *path_utf8) {
+    wchar_t *w = wide(path_utf8);
+    int ok = w && CreateDirectoryW(w, NULL);
+    int rc = ok ? 0 : map_error(GetLastError());
+    free(w);
+    return rc;
+}
+
+int pal_remove_file(const char *path_utf8) {
+    wchar_t *w = wide(path_utf8);
+    int ok = w && DeleteFileW(w);
+    int rc = ok ? 0 : map_error(GetLastError());
+    free(w);
+    return rc;
+}
+
+int pal_remove_dir(const char *path_utf8) {
+    wchar_t *w = wide(path_utf8);
+    int ok = w && RemoveDirectoryW(w);
+    int rc = ok ? 0 : map_error(GetLastError());
+    free(w);
+    return rc;
+}
+
+int pal_rename(const char *from, const char *to) {
+    wchar_t *a = wide(from), *b = wide(to);
+    int ok = a && b && MoveFileExW(a, b, MOVEFILE_WRITE_THROUGH);
+    int rc = ok ? 0 : map_error(GetLastError());
+    free(a); free(b);
+    return rc;
+}
+
+struct pal_dir { HANDLE h; WIN32_FIND_DATAW d; int pending; };
+
+pal_dir *pal_dir_open(const char *path_utf8) {
+    size_t n = strlen(path_utf8);
+    char *pattern = (char *)malloc(n + 3);
+    if (!pattern) return NULL;
+    memcpy(pattern, path_utf8, n);
+    memcpy(pattern + n, "\\*", 3);
+    wchar_t *w = wide(pattern);
+    free(pattern);
+    if (!w) return NULL;
+    pal_dir *d = (pal_dir *)calloc(1, sizeof *d);
+    if (!d) { free(w); return NULL; }
+    d->h = FindFirstFileW(w, &d->d);
+    free(w);
+    if (d->h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        free(d);
+        SetLastError(e);
+        return NULL;
+    }
+    d->pending = 1;
+    return d;
+}
+
+int pal_dir_next(pal_dir *d, char *name, size_t cap, int *is_dir, uint64_t *size) {
+    for (;;) {
+        if (!d->pending && !FindNextFileW(d->h, &d->d)) return 0;
+        d->pending = 0;
+        if (!wcscmp(d->d.cFileName, L".") || !wcscmp(d->d.cFileName, L"..")) continue;
+        if (!utf8(d->d.cFileName, name, cap)) continue;   /* a name too long for the caller is skipped */
+        if (is_dir) *is_dir = !!(d->d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
+        if (size) *size = (uint64_t)d->d.nFileSizeHigh << 32 | d->d.nFileSizeLow;
+        return 1;
+    }
+}
+
+void pal_dir_close(pal_dir *d) { if (d) { FindClose(d->h); free(d); } }
+
 int pal_rename_replace(const char *from, const char *to) {
     wchar_t *a = wide(from), *b = wide(to);
     int ok = a && b && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
@@ -480,7 +598,15 @@ int pal_path_exists(const char *path_utf8) {
 
 size_t pal_user_data_dir(const char *app, char *out, size_t cap) {
     wchar_t base[MAX_PATH];
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    PWSTR known = NULL;
+    DWORD n = 0;
+    /* the shell's answer first: shells that rebuild the environment (MSYS login shells) can drop LOCALAPPDATA */
+    if (SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &known) == S_OK && wcslen(known) < MAX_PATH) {
+        wcscpy(base, known);
+        n = (DWORD)wcslen(base);
+    }
+    CoTaskMemFree(known);
+    if (!n) n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
     if (!n || n >= MAX_PATH) {
         n = GetEnvironmentVariableW(L"USERPROFILE", base, MAX_PATH - 20);
         if (!n || n >= MAX_PATH - 20) return 0;

@@ -29,7 +29,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
 endif()
 add_library(pal STATIC ${PAL_SOURCES})
 target_include_directories(pal PUBLIC src/pal)
-target_link_libraries(pal PUBLIC synchronization)
+target_link_libraries(pal PUBLIC synchronization shell32 ole32 uuid)
 
 # ---- CPU backend: dynarmic ----
 if(WINTEARS_JIT)
@@ -63,11 +63,13 @@ if(WINTEARS_JIT)
   set(MNG_RUNTIME upstream/games/totk/runtime)
   set(MNG_HOST_SOURCES ${MNG_RUNTIME}/ipc.c)   # compiled unchanged
   add_library(host STATIC src/host/svc.c src/host/memory.c src/host/threads.c src/host/overrides.c
-              src/host/services.c ${MNG_HOST_SOURCES})
+              src/host/services.c src/host/sha256.c src/host/romfs.c src/host/fs_host.c src/host/account.c
+              src/host/gfx_stub.c src/host/vi_stub.c
+              ${MNG_HOST_SOURCES})
   set_source_files_properties(${MNG_HOST_SOURCES} PROPERTIES
     COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/src/host/upstream_compat.h;-Wno-unused-parameter")
   target_include_directories(host PUBLIC src)
-  target_link_libraries(host PUBLIC loader bridge cpu_jit pal pthread)
+  target_link_libraries(host PUBLIC loader bridge cpu_jit pal pthread bcrypt)
   add_executable(wintears src/app/main.c)
   target_link_libraries(wintears PRIVATE host)
   if(CMAKE_CROSSCOMPILING)

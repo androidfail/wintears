@@ -37,6 +37,7 @@
 #define RT_STUBS_SIZE 0x10000
 #define RT_TRAP 0x10000
 #define RT_EXCEPTION 0x11000
+#define RT_OBJECTS 0x12000
 #define RT_TLS 0x20000
 #define TLS_STRIDE 0x3000
 #define TLS_COUNT ((RUNTIME_SIZE - RT_TLS) / TLS_STRIDE)
@@ -61,6 +62,7 @@ uint64_t host_code_size(void) { return CODE_SIZE; }
 bridge *host_bridge(void) { return stubs; }
 uint64_t host_runtime_page(void) { return low + RUNTIME_OFF; }
 uint64_t host_return_trap(void) { return low + RUNTIME_OFF + RT_TRAP; }
+uint64_t host_object_page(void) { return low + RUNTIME_OFF + RT_OBJECTS; }
 uint64_t host_main_stack(uint64_t *size) { *size = MAIN_STACK_SIZE; return low + STACK_OFF + STACK_SIZE - MAIN_STACK_SIZE; }
 
 static void release(uint64_t at, uint64_t size) { if (size) pal_unreserve((uintptr_t)at, (size_t)size); }

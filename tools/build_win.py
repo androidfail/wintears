@@ -25,10 +25,12 @@ This reuses the upstream build steps (upstream/build_app.py, upstream/games/totk
 orchestration (rsync, symlinks, xcrun, codesign, APFS clones, app bundles) is replaced.
 """
 import argparse
+import hashlib
 import json
 import os
 import platform
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -155,6 +157,7 @@ def step_data(tree, py, game, keys, logs, *, firmware=None, shared_fonts=None):
             run([py, 'scripts/extract_shared_fonts.py', '--keys', keys, *source, '--output', fonts],
                 logs / 'shared_fonts.log', cwd=tree)
         mng.validate_fonts(fonts)
+    runtime_index(romfs)
     if not (tree / 'extracted/v0/romfs-patches/manifest.tsv').exists():
         say('2/3 data: RomFS overlays (quick-menu capture timing, game-over retry)')
         run([py, 'scripts/make_romfs_patches.py'], logs / 'romfs_patches.log', cwd=tree)
@@ -162,6 +165,23 @@ def step_data(tree, py, game, keys, logs, *, firmware=None, shared_fonts=None):
         say('2/3 data: RomFS overlay for the 2560x1440 output')
         run([py, 'scripts/make_output_res_overlay.py', '2560x1440'], logs / 'output_res_overlay.log', cwd=tree)
     return romfs, fonts
+
+
+def runtime_index(romfs):
+    """runtime-index.bin, the RomFS file table the runtime reads (upstream scripts/prepare_romfs_backend.py's format:
+    "TOTKRFS1", file count, string offset, then per file offset/size/name offset/name length, then the names), and
+    romfs-config.txt with what upstream compiles into romfs_config.h: the image size and SHA-256 and the index's
+    SHA-256. The runtime checks both before it serves a byte."""
+    report = json.loads((romfs / 'index.json').read_text())
+    strings, rows = bytearray(), bytearray()
+    for item in report['files']:
+        name = item['path'].encode() + b'\0'
+        rows += struct.pack('<QQII', item['offset'], item['size'], len(strings), len(name))
+        strings += name
+    index = struct.pack('<8sQQ', b'TOTKRFS1', len(report['files']), 24 + len(rows)) + rows + strings
+    (romfs / 'runtime-index.bin').write_bytes(index)
+    (romfs / 'romfs-config.txt').write_text(f"image_size {report['romfs_size']}\nimage_sha256 {report['romfs_sha256']}\n"
+                                            f"index_sha256 {hashlib.sha256(index).hexdigest()}\n")
 
 
 def canonical_romfs(romfs):
@@ -210,7 +230,7 @@ def place(src, dst):
 def output_files(tree, exefs, romfs, fonts):
     """(published path, source) for everything the runtime reads."""
     files = [(f'data/v0/exefs/{n}', exefs / n) for n in EXPECTED['exefs_sha256']]
-    files += [('data/v0/romfs/romfs.bin', romfs / 'romfs.bin'), ('data/v0/romfs/index.json', romfs / 'index.json')]
+    files += [(f'data/v0/romfs/{n}', romfs / n) for n in ('romfs.bin', 'index.json', 'runtime-index.bin', 'romfs-config.txt')]
     for sub in ('romfs-patches', 'romfs-patches-out'):
         base = tree / 'extracted/v0' / sub
         files += [(f'data/v0/{sub}/{p.relative_to(base).as_posix()}', p) for p in sorted(base.rglob('*')) if p.is_file()]

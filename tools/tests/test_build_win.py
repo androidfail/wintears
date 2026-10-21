@@ -36,6 +36,8 @@ class FakeTree:
         self.romfs_bytes = b'R' * 4096
         self.write(self.romfs / 'romfs.bin', self.romfs_bytes)
         self.write(self.romfs / 'index.json', b'{}')
+        self.write(self.romfs / 'runtime-index.bin', b'TOTKRFS1')
+        self.write(self.romfs / 'romfs-config.txt', b'image_size 4096\n')
         self.write(self.tree / 'extracted/v0/romfs-patches/manifest.tsv', b'# none\n')
         self.write(self.tree / 'extracted/v0/romfs-patches/UI/a.bin', b'overlay')
         self.write(self.tree / 'extracted/v0/romfs-patches-out/2560x1440/manifest.tsv', b'# none\n')
@@ -147,6 +149,25 @@ class Code(unittest.TestCase):
         self.assertFalse((self.fake.tree / 'rewritten').exists())
         for call in run.call_args_list:
             self.assertNotIn('patch_nso.py', ' '.join(map(str, call.args[0])))
+
+
+class RuntimeIndex(unittest.TestCase):
+    def test_format_is_upstreams(self):
+        with tempfile.TemporaryDirectory() as t:
+            romfs = Path(t)
+            files = [{'path': 'A/b.txt', 'offset': 0x200, 'size': 5}, {'path': 'Z.bin', 'offset': 0x210, 'size': 0}]
+            (romfs / 'index.json').write_text(json.dumps({'files': files, 'romfs_size': 4096, 'romfs_sha256': 'ab' * 32}))
+            build_win.runtime_index(romfs)
+            data = (romfs / 'runtime-index.bin').read_bytes()
+            self.assertEqual(data[:8], b'TOTKRFS1')
+            import struct
+            count, strings = struct.unpack_from('<QQ', data, 8)
+            self.assertEqual((count, strings), (2, 24 + 2 * 24))
+            self.assertEqual(struct.unpack_from('<QQII', data, 24), (0x200, 5, 0, 8))
+            self.assertEqual(struct.unpack_from('<QQII', data, 48), (0x210, 0, 8, 6))
+            self.assertEqual(data[strings:], b'A/b.txt\0Z.bin\0')
+            config = dict(line.split() for line in (romfs / 'romfs-config.txt').read_text().splitlines())
+            self.assertEqual(config, {'image_size': '4096', 'image_sha256': 'ab' * 32, 'index_sha256': sha(data)})
 
 
 class Work(unittest.TestCase):

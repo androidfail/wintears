@@ -9,14 +9,18 @@
 #include "host/host.h"
 #include "pal.h"
 
-void host_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-_Noreturn void host_fail(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void host_log(const char *fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
+_Noreturn void host_fail(const char *fmt, ...) __attribute__((format(gnu_printf, 1, 2)));
 #define LOG(...) host_log(__VA_ARGS__)
 #define die(...) host_fail(__VA_ARGS__)
 _Noreturn void runtime_fail(const char *message);   /* upstream name */
 #define now_ns pal_now_ns
 #define guest_ns pal_now_ns
 static inline int dm_detclock_enabled(void) { return 0; }
+
+/* A host function replacing an SDK function, and how its result goes back to the guest's x0 (overrides.c). */
+enum { HOST_RET_VOID, HOST_RET_U8, HOST_RET_U32, HOST_RET_U64 };
+typedef struct { const char *name; void *fn; int ret; } host_fn;
 
 extern ldr_set *host_mods;
 void host_describe(uint64_t addr, char *out, size_t cap);
@@ -37,6 +41,7 @@ uint64_t host_tls_alloc(void);                    /* a thread's TLS block (TLR a
 void host_tls_free(uint64_t tls);
 uint64_t host_return_trap(void);                  /* svc #HOST_RETURN_SVC */
 uint64_t host_main_stack(uint64_t *size);
+uint64_t host_object_page(void);                  /* a guest page for host tokens the game only passes back (vi Display, Layer) */
 #define HOST_RETURN_SVC 0xfffeu
 
 /* threads.c */
@@ -50,6 +55,8 @@ void *runtime_handle_get(uint32_t h, int session);
 uint32_t runtime_event_new(void);
 uint32_t runtime_event_readable(uint32_t writable);
 void runtime_event_signal(uint32_t writable);
+void hle_bind_system_event(uint64_t ev, int autoclear);   /* guest SystemEventType: created by the SDK, signalled by the host */
+void hle_signal_system_event(uint64_t ev);
 
 /* upstream ipc.c (compiled unchanged) */
 int runtime_ipc_svc(unsigned num, uint64_t *regs);
@@ -57,9 +64,34 @@ void runtime_trace_guest(uint64_t fp, uint64_t lr);
 #include <pthread.h>
 extern pthread_key_t runtime_keys[8];   /* [2]: the thread's TLR (IPC message buffer), as upstream */
 
+/* sha256.c */
+typedef struct { void *h; } host_sha256;
+void host_sha256_begin(host_sha256 *s);
+void host_sha256_update(host_sha256 *s, const void *p, size_t n);
+void host_sha256_hex(host_sha256 *s, char hex[65]);
+
+/* paths: the game data (<TOTK_win>/data) and the player's profile (saves, account) */
+const char *host_data_dir(void);
+const char *host_profile_dir(void);
+
+/* romfs.c, fs_host.c, account.c (upstream files of the same names) */
+void runtime_fs_init(void);
+int runtime_romfs_owns(const char *path);
+int runtime_romfs_handle(uint64_t h);
+unsigned runtime_romfs_open(uint64_t *out, const char *path, int mode);
+unsigned runtime_romfs_read(uint64_t *out, uint64_t h, int64_t offset, void *buffer, uint64_t size);
+unsigned runtime_romfs_size(int64_t *out, uint64_t h);
+void runtime_romfs_close(uint64_t h);
+unsigned runtime_romfs_entry_type(int *out, const char *path);
+void runtime_fs_log(const char *what, const char *path);
+void runtime_account_uid(uint64_t out[2]);
+const host_fn *host_fs_override(const char *name);        /* romfs.c + fs_host.c */
+const host_fn *host_fs_host_override(const char *name);   /* fs_host.c */
+const host_fn *host_account_override(const char *name);   /* account.c */
+const host_fn *host_gfx_override(const char *name);       /* gfx_stub.c */
+const host_fn *host_vi_override(const char *name);        /* vi_stub.c */
+
 /* overrides.c / services.c: host functions that replace SDK functions */
-enum { HOST_RET_VOID, HOST_RET_U8, HOST_RET_U32, HOST_RET_U64 };
-typedef struct { const char *name; void *fn; int ret; } host_fn;
 const host_fn *host_service_override(const char *name);   /* upstream runtime_override */
 const host_fn *host_service_observer(const char *name);   /* upstream runtime_observer */
 

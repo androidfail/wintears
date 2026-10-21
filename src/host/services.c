@@ -21,7 +21,7 @@ static int host_aoc_list(int *out, int offset, int count) {
 static void host_error_init(void) { LOG("error contexts: local diagnostics"); }
 static void host_pctl_init(void) { LOG("local application parental controls initialized"); }
 static void host_abort_init(void) { LOG("native crash observer initialized"); }
-static void host_fs_init(void) { die("nn::fs::InitializeForApplication: the fs host (upstream fs_host.c, romfs.c) is not ported yet"); }
+static void host_fs_init(void) { runtime_fs_init(); }
 static void cpu_boost(int mode) { if (mode < 0 || mode > 2) die("unknown CPU boost mode"); LOG("CPU boost request %d: Windows manages CPU frequency", mode); }
 
 /* TOTK_OPERATION_MODE=handheld reports handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of docked
@@ -161,5 +161,12 @@ static const host_fn *find(const host_fn *t, size_t n, const char *name) {
     for (size_t i = 0; i < n; i++) if (!strcmp(t[i].name, name)) return &t[i];
     return NULL;
 }
-const host_fn *host_service_override(const char *name) { return find(overrides, sizeof overrides / sizeof *overrides, name); }
+const host_fn *host_service_override(const char *name) {
+    const host_fn *f = find(overrides, sizeof overrides / sizeof *overrides, name);
+    if (!f) f = host_account_override(name);
+    if (!f) f = host_fs_override(name);
+    if (!f) f = host_gfx_override(name);
+    if (!f) f = host_vi_override(name);
+    return f;
+}
 const host_fn *host_service_observer(const char *name) { return find(observers, sizeof observers / sizeof *observers, name); }
