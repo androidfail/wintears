@@ -212,7 +212,7 @@ static void upload(vtex *e, const tex_t *t) {
 done:
     vk_barrier(c);
     e->uploaded = 1;
-    g_upload_ns += pal_now_ns() - t0;
+    g_upload_ns += pal_now_ns() - t0; vk_ns_tex += pal_now_ns() - t0;
 }
 
 vtex *vt_get(const tex_t *t) {

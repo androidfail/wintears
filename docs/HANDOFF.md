@@ -27,7 +27,7 @@ of natively; everything else follows MNG's design, with graphics on Vulkan.
 | `src/host` (Horizon host) | ported from upstream `runtime/`: memory regions and svcs (`memory.c`), threads and sync on virtual cores with one `jit_core` each (`threads.c`), upstream `ipc.c` compiled unchanged, SDK overrides through bridge stubs (`overrides.c`; oe/aoc/diag/err/pctl and observers in `services.c`), RomFS backend and fs host (`romfs.c`, `fs_host.c`), local account (`account.c`); windowless `vi` with a 60 Hz vsync (`vi_stub.c`), the SDK's graphics entry points (`gfx_bridge.c`) | through the boot probe on the real game; no unit tests yet |
 | `src/gfx` (NVN layer) | port of upstream `hle_nvn.c` + `totk_nvn_ext.c` (421 of upstream's 422 NVN functions, same signatures and object layouts; `nvn_obj.h`, `nvn_tex.c` used unchanged), each reached through its generated bridge thunk; physical / virtual pools as sections and placeholder views (`nvn_vpool.c`); the GPU backend interface (`nvn_backend.h`) with the **null backend** (`nvn_null.c`: event values, counter reports, buffer copies and uniform updates at submit, nothing drawn) | `tests/nvn_test.c`, 47 checks (recording lifetimes, memory accounting, deferred binds, submit effects, texture layout, physical / virtual pool aliasing); the game's graphics start-up on the real game |
 | `src/frontend` | SDL3 window on the main thread (the game on its own thread), keyboard and controllers to the Switch controller, F11 fullscreen | by hand |
-| `src/gfx/vk` (Vulkan backend) | device, guest pools as imported host memory (the heap as one import), NVN textures as images keyed by storage, uploads from pool memory with the ported dirty-page tracker (`src/gfx/nvn_dirty.c`), clears, copies, events / counters on a completion thread, present into the window; draws and dispatches with run-time shader translation (`tools/build_xlate.py` builds `wt_xlate.exe`: upstream's translator, `tools/wt_xlate/VkService.cs` for Vulkan output), pipelines with Vulkan 1.3 dynamic state, per-draw descriptor sets. `TOTK_SHOT=frame:path.png`, `TOTK_PASSLOG=frame` for checks | the real game: the title scene renders (2026-10-21); ASTC textures still blank |
+| `src/gfx/vk` (Vulkan backend) | device, guest pools as imported host memory (the heap as one import), NVN textures as images keyed by storage, uploads from pool memory with the ported dirty-page tracker (`src/gfx/nvn_dirty.c`), clears, copies, events / counters on a completion thread, present into the window; draws and dispatches with run-time shader translation (`tools/build_xlate.py` builds `wt_xlate.exe`: upstream's translator, `tools/wt_xlate/VkService.cs` for Vulkan output), pipelines with Vulkan 1.3 dynamic state, per-draw descriptor sets. `TOTK_SHOT=frame:path.png`, `TOTK_PASSLOG=frame` for checks | the real game: playable in a window at 30 fps (2026-10-21); `tools/prepare_shaders.py` translates the shaders before play |
 
 ## The user's NSP: unencrypted sections and a re-packed RomFS (solved)
 
@@ -103,8 +103,13 @@ Not an option: getting game files from anywhere but the user's own dump.
      output folder). The image is hashed once; `.romfs-verified-v1` next to it keeps the proof.
    - Saves and the account id live in `%LOCALAPPDATA%\WinTears\totk` (or `TOTK_PROFILE_DIR`).
 3. **Next, in order:**
-   - **Next (Vulkan backend, 2026-10-21):** the game draws its title scene. Not done yet: ASTC decoding on upload
-     (most of the game's textures; desktop GPUs have no ASTC), buffer textures (bound as zeros), partial-mask clears,
+   - **Next (Vulkan backend, 2026-10-21):** the game is playable (ASTC decoded on upload; written storage buffers in
+     video memory per submission). Measured on the RTX 4070: about 3 ms of replay per frame once shaders are cached; the
+     GPU's "13 ms" per frame is the GPU idling at 400-650 MHz (the game asks for 30 fps), not a bottleneck. Copying
+     read-only uniform / storage / vertex / index buffers into video memory was tried and gained nothing (NVIDIA caches
+     system-memory reads). Stutters were shader translation (up to 2.8 s in a new area): `tools/prepare_shaders.py`
+     now translates ahead of play; the 10 s log line splits replay time into translation, pipelines, textures.
+     Not done yet: buffer textures (bound as zeros), partial-mask clears,
      layered rendering (first layer only), 24-bit depth uploads, writing rendered textures back to pool memory
      (InvalidateMappedRange), occlusion queries (always "visible"), the instance divisor extension, physical pools
      the driver cannot import (one 111 MiB pool), background shader translation, performance (full barriers, GENERAL

@@ -177,6 +177,7 @@ static void drv_fill(uint8_t *d, int bank, int stage) {   /* upstream driver_ban
    game's pools) cross PCIe one by one (one fragment shader took 45 ms). The copy is filled from pool memory when the
    submission starts and written back when it ends; every bind of those bytes in the submission uses it. */
 typedef struct { uint64_t lo, hi; VkBuffer host; VkDeviceSize host_off; VkBuffer dev; VmaAllocation al; } shadow;
+uint64_t g_sh_bytes;
 static shadow *g_sh; static int g_nsh, g_csh; static uint64_t g_sh_sub;
 static void shadow_free(void *arg) { shadow *x = arg; vmaDestroyBuffer(vk_vma, x->dev, x->al); free(x); }
 static void shadows_now(void) { if (g_sh_sub != vk_sub_serial()) { g_nsh = 0; g_sh_sub = vk_sub_serial(); } }
@@ -189,6 +190,7 @@ static const shadow *shadow_of(uint64_t a, uint64_t n, int *overlap) {
     return NULL;
 }
 static const shadow *shadow_make(uint64_t a, uint64_t n) {
+    g_sh_bytes += n;
     VkBuffer hb; VkDeviceSize ho;
     if (!vk_buf(a, n, &hb, &ho)) return NULL;
     if (g_nsh == g_csh) { g_csh = g_csh ? g_csh * 2 : 32; g_sh = realloc(g_sh, (size_t)g_csh * sizeof *g_sh); }
@@ -483,6 +485,7 @@ static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, in
     uint64_t t0 = pal_now_ns();
     VkResult r = vkCreateGraphicsPipelines(vk_dev, VK_NULL_HANDLE, 1, &ci, NULL, &p);
     if (r != VK_SUCCESS) { VLOG("pipeline for %s + %s not created (%d)", vs->name, fs ? fs->name : "-", (int)r); p = VK_NULL_HANDLE; }
+    vk_ns_pipe += pal_now_ns() - t0;
     nvn_hm_put(&g_pipes, &k, p ? (void *)p : (void *)1);   /* 1 = failed: not tried again */
     if (++g_pipe_n <= 4 || g_pipe_n % 500 == 0) VLOG("%llu pipelines (last one %.1f ms)", (unsigned long long)g_pipe_n, (pal_now_ns() - t0) / 1e6);
     return p;
@@ -643,7 +646,9 @@ void vd_dispatch(const p_dispatch *d) {
     if (!p) {
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = cs->mod, .pName = "main"}, .layout = lay};
+        uint64_t t0 = pal_now_ns();
         VkResult r = vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &ci, NULL, &p);
+        vk_ns_pipe += pal_now_ns() - t0;
         if (r != VK_SUCCESS) { VLOG("compute pipeline for %s not created (%d)", cs->name, (int)r); p = (VkPipeline)1; }
         nvn_hm_put(&g_cpipes, &cs, (void *)p);
     }

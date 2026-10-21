@@ -404,6 +404,8 @@ static void tex_release(tex_t *t) { if (t->serial) vt_release_serial(t->serial);
 static void prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&vk_mu); vs_prog_release(p->serial); pthread_mutex_unlock(&vk_mu); }
 static void window_tex(uint64_t serial) { (void)serial; }
 
+uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex;
+static uint64_t g_sub_max;
 static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;
 static uint64_t submit(const uint64_t *handles, int n) {
     uint64_t t0 = pal_now_ns();
@@ -416,14 +418,17 @@ static uint64_t submit(const uint64_t *handles, int n) {
     atomic_store(&g_game_fence, f);
     vt_end_submission();
     pthread_mutex_unlock(&vk_mu);
-    atomic_fetch_add(&g_sub_ns, pal_now_ns() - t0); atomic_fetch_add(&g_sub_n, 1);
+    uint64_t dt = pal_now_ns() - t0; if (dt > g_sub_max) g_sub_max = dt;
+    atomic_fetch_add(&g_sub_ns, dt); atomic_fetch_add(&g_sub_n, 1);
     static uint64_t last; uint64_t now = pal_now_ns();
     if (!last) last = now;
     if (now - last >= 10000000000ull) {
         last = now;
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
-        VLOG("last 10 s: %llu submissions, replay %.0f ms in all; submit-to-done %.2f ms on average; game waited %.0f ms for the GPU",
-             (unsigned long long)sn, sns / 1e6, ln ? lns / 1e6 / ln : 0.0, w / 1e6);
+        extern uint64_t g_sh_bytes;
+        VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
+             (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
+        g_sh_bytes = 0; g_sub_max = vk_ns_xlate = vk_ns_pipe = vk_ns_tex = 0;
     }
     static int said; if (!said++) VLOG("first submission (%d command lists)", n);
     return f;

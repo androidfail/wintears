@@ -47,6 +47,7 @@ UCRT64 shell, from the repository folder:
 ```
 cmake -S . -B build -G Ninja && cmake --build build -j4
 python tools/build_xlate.py          # once, and after the translator changes: build/shader-service/wt_xlate.exe
+python tools/prepare_shaders.py D:/Games/TOTK/TOTK_win   # once: translates the game's shaders before play
 build/wintears.exe boot D:/Games/TOTK/TOTK_win
 ```
 
@@ -56,8 +57,9 @@ K / Space = B, I = X, U = Y, Q = L, E = R, Left Alt = ZL, Left Shift = ZR, Enter
 F G H T = d-pad (left, down, right, up), Z / C = left / right stick click, hold Left Ctrl to walk; F11 = fullscreen. A controller works too (Switch layout by position: east = A, south = B).
 
 The first start reads the whole 17 GB RomFS image once to check it (a minute or two); later starts skip that while the
-file is unchanged. Shaders are translated the first time they appear (short stutters), then cached in
-`%LOCALAPPDATA%\WinTears\totk\shader-cache`. Saves go to `%LOCALAPPDATA%\WinTears\totk`. `--no-window` runs without
+file is unchanged. `prepare_shaders.py` translates every shader the game files hold, in the bind states upstream's
+shared list knows, into `%LOCALAPPDATA%\WinTears\totk\shader-cache` (one translator per core; shaders already there are
+skipped). A shader it missed is translated the first time it appears (a 13-45 ms stutter), then cached too. Saves go to `%LOCALAPPDATA%\WinTears\totk`. `--no-window` runs without
 a window (nothing drawn); `--trace` logs every svc. Send the last 40 lines of the output when something stops: it has
 addresses and register values, nothing from the game.
 

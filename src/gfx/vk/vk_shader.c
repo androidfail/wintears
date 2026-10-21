@@ -279,6 +279,7 @@ static shader_key *key_get(const char *hex) {
     char *txt = (char *)read_all(path, &n);
     for (char *line = txt, *next; line && *line; line = next) {
         next = strchr(line, '\n'); if (next) *next++ = 0;
+        line[strcspn(line, "\r")] = 0;   /* a list written with Windows line ends */
         if (strlen(line) < 70 || strlen(line) >= 112) continue;
         k->names = realloc(k->names, (size_t)(k->nnames + 1) * sizeof *k->names);
         snprintf(k->names[k->nnames++], 112, "%s", line);
@@ -307,8 +308,10 @@ static vk_shader *translate(stage_t *t, int st, const answers *a) {
     uint64_t t0 = pal_now_ns();
     svc_write(rq.p);
     char reply[2048]; svc_line(reply, sizeof reply);
+    remove(code_path);   /* the translator has read it */
     free(rq.p); free(ans.p);
     if (!strstr(reply, "\"ok\": true")) { VLOG("shader %s (%s) not translated: %s", variant, stn, reply); return NULL; }
+    vk_ns_xlate += pal_now_ns() - t0;
     vk_shader *s = load_variant(variant, st, t->code + t->c1o, t->length - t->c1o);
     if (!s) { VLOG("shader %s: translation output unreadable", variant); return NULL; }
     shader_key *k = t->k;
