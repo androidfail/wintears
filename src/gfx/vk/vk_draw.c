@@ -503,6 +503,8 @@ static void dynamic_state(VkCommandBuffer c, int prim) {
     if (v.width <= 0) v.width = 1;
     if (v.height == 0) v.height = 1;
     v.minDepth = v.minDepth < 0 ? 0 : v.minDepth > 1 ? 1 : v.minDepth; v.maxDepth = v.maxDepth < 0 ? 0 : v.maxDepth > 1 ? 1 : v.maxDepth;
+    /* NVN (as Metal) puts NDC y = +1 at the top row; Vulkan puts it at the bottom: flip with a negative height */
+    v.y += v.height; v.height = -v.height;
     vkCmdSetViewportWithCount(c, 1, &v);
     VkRect2D sc = {{0, 0}, {S.pass_w, S.pass_h}};
     if (S.has_sc) {
@@ -513,8 +515,8 @@ static void dynamic_state(VkCommandBuffer c, int prim) {
     }
     vkCmdSetScissorWithCount(c, 1, &sc);
     vkCmdSetCullMode(c, S.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : S.poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : S.poly.cull == NVN_FACE_FRONT_AND_BACK ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE);
-    /* NVN upper-left window origin (GL clip control) keeps GL facing; Vulkan counts winding with y down: swapped */
-    vkCmdSetFrontFace(c, S.poly.front == NVN_FRONT_FACE_CW ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE);
+    /* the flipped viewport keeps GL / NVN facing */
+    vkCmdSetFrontFace(c, S.poly.front == NVN_FRONT_FACE_CW ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPrimitiveTopology(c, topo(prim));
     int has_d = S.pass_fmt.depth != VK_FORMAT_UNDEFINED, has_s = S.pass_fmt.stencil != VK_FORMAT_UNDEFINED;
     vkCmdSetDepthTestEnable(c, has_d && S.ds.dt);
