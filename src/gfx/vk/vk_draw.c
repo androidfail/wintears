@@ -223,7 +223,6 @@ static ub_upd *g_upd, *g_inf; static int g_nupd, g_cupd, g_ninf, g_cinf;   /* th
 static uint64_t g_upd_lo = UINT64_MAX, g_upd_hi, g_upd_seq;
 typedef struct { uint64_t lo, n, seq, sub; VkBuffer b; VkDeviceSize off; } ub_copy;
 static ub_copy g_ubc[64]; static unsigned g_ubc_next;
-uint64_t vk_n_ubflush;
 static int ub_hit(uint64_t lo, uint64_t hi) {
     if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return 0;
     for (int i = 0; i < g_nupd; i++) if (g_upd[i].lo < hi && lo < g_upd[i].hi) return 1;
@@ -381,8 +380,16 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             x->pBufferInfo = &bi[nb]; nb += (int)cnt;
         } else if (b->type == DT_UTB || b->type == DT_STB) {
             if (nv + (int)cnt > MAXI) { nw--; continue; }
-            VK_ONCE("buffer textures are bound as zeros for now");
-            for (uint32_t k = 0; k < cnt; k++) bv[nv + k] = g_dummy_texel;
+            VkBufferView v = g_dummy_texel;
+            uint64_t h = b->kind == RB_TEX && b->reg >= 0 && b->reg < 128 ? S.tex[st][b->reg]
+                       : b->kind == RB_IMG && b->reg >= 0 && b->reg < 32 ? S.img[st][b->reg] : 0;
+            slot_tex s;
+            if (h && slot_texture(h, &s) && s.t.d.target == NVN_TEXTURE_TARGET_BUFFER) {
+                VkBufferView real = vt_texel_view(&s.t);
+                if (real) v = real;
+                else VK_ONCE("%s texture in slot %d is not GPU-readable here (fmt %#x); bound as zeros", b->type == DT_UTB ? "utb" : "stb", (int)(h & 0xfffff), s.t.d.format);
+            } else if (h) { VK_ONCE("%s slot %d points at a non-buffer texture; bound as zeros", b->type == DT_UTB ? "utb" : "stb", (int)(h & 0xfffff)); }
+            for (uint32_t k = 0; k < cnt; k++) bv[nv + k] = v;
             x->pTexelBufferView = &bv[nv]; nv += (int)cnt;
         } else {
             if (ni + (int)cnt > MAXI) { nw--; continue; }
@@ -579,7 +586,6 @@ static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, in
 }
 
 /* ---------- draws ---------- */
-void vd_pass_begun(void) {}
 
 static VkCompareOp cmp(unsigned f) { return f >= 1 && f <= 8 ? (VkCompareOp)(f - 1) : VK_COMPARE_OP_ALWAYS; }
 static VkStencilOp sop(unsigned o) { return o >= 1 && o <= 8 ? (VkStencilOp)(o - 1) : VK_STENCIL_OP_KEEP; }

@@ -212,7 +212,7 @@ static void upload(vtex *e, const tex_t *t) {
 done:
     vk_barrier(c);
     e->uploaded = 1;
-    g_upload_ns += pal_now_ns() - t0; vk_ns_tex += pal_now_ns() - t0;
+    { uint64_t dt = pal_now_ns() - t0; g_upload_ns += dt; vk_ns_tex += dt; }
 }
 
 vtex *vt_get(const tex_t *t) {
@@ -318,7 +318,50 @@ static void drop_where(int (*pred)(const vtex *, const void *), const void *arg,
 }
 typedef struct { uintptr_t lo, hi; } range;
 static int in_range(const vtex *e, const void *arg) { const range *r = arg; return e->k.mem >= r->lo && e->k.mem < r->hi; }
-void vt_pool_gone(uintptr_t lo, uintptr_t hi) { range r = {lo, hi}; drop_where(in_range, &r, 1); }
+/* ---------- buffer textures (NVN_TEXTURE_TARGET_BUFFER) ---------- */
+/* Zero-copy, as upstream Metal: one VkBufferView directly over the pool bytes (nvn_mtl.m, target == 10): the GPU
+   reads the current pool content at shader execution time, so CPU writes land in the sampled texels without an
+   upload. Cached per (mem, size, format); dropped when the pool finalises (vt_pool_gone). */
+typedef struct { uint64_t mem; uint64_t size; VkFormat fmt; } bv_key;
+static nvn_hmap g_bviews = {.klen = sizeof(bv_key)};
+static void bv_gone_drop(void *arg) { VkBufferView v = *(VkBufferView *)arg; vkDestroyBufferView(vk_dev, v, NULL); free(arg); }
+void vt_pool_gone(uintptr_t lo, uintptr_t hi) { range r = {lo, hi}; drop_where(in_range, &r, 1);
+    bv_key gone[256]; int n;
+    do {
+        n = 0;
+        for (uint32_t i = 0; i < g_bviews.cap && n < 256; i++) { bv_key *k = (bv_key *)(g_bviews.keys + (size_t)i * g_bviews.klen);
+            if (g_bviews.vals[i] && k->mem >= lo && k->mem < hi) gone[n++] = *k; }
+        for (int i = 0; i < n; i++) { void *v = nvn_hm_del(&g_bviews, &gone[i]);
+            if (v) { VkBufferView *p = malloc(sizeof *p); if (p) { *p = (VkBufferView)(uintptr_t)v; vk_after(bv_gone_drop, p); }
+            else vkDestroyBufferView(vk_dev, (VkBufferView)(uintptr_t)v, NULL); } }   /* destroy once the GPU is done */
+    } while (n == 256);
+}
+VkBufferView vt_texel_view(const tex_t *t) {
+    if (t->d.target != NVN_TEXTURE_TARGET_BUFFER) return VK_NULL_HANDLE;
+    if (!t->mem || !t->d.width) { VK_ONCE("buffer texture has no pool storage"); return VK_NULL_HANDLE; }
+    int bw, bh;
+    int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    vk_fmt f;
+    if (!bpb || !vk_fmt_of(t->d.format, &f) || f.vk == VK_FORMAT_UNDEFINED) { VK_ONCE("buffer texture format %#x is not linear", (unsigned)t->d.format); return VK_NULL_HANDLE; }
+    if (vk_fmt_block_compressed(f.vk) || f.depth || f.stencil) { VK_ONCE("buffer texture format %#x cannot be a texel buffer", (unsigned)t->d.format); return VK_NULL_HANDLE; }
+    { VkFormatProperties fp;
+      vkGetPhysicalDeviceFormatProperties(vk_phys, f.vk, &fp);
+      if (!(fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT))) {
+          VK_ONCE("format %#x has no texel buffer usage on this GPU", (unsigned)t->d.format); return VK_NULL_HANDLE; } }
+    uint64_t size = (uint64_t)t->d.width * (uint64_t)bpb;
+    VkBuffer buf; VkDeviceSize off;
+    if (!vk_buf((uint64_t)(uintptr_t)t->mem, size, &buf, &off)) { VK_ONCE("buffer texture storage %#llx+%#llx is not in a registered pool", (unsigned long long)(uintptr_t)t->mem, (unsigned long long)size); return VK_NULL_HANDLE; }
+    if (off & 15) { VK_ONCE("buffer texture at pool offset %#llx is not 16-byte aligned", (unsigned long long)off); return VK_NULL_HANDLE; }
+    bv_key k = {(uint64_t)(uintptr_t)t->mem, size, f.vk};
+    VkBufferView v = (VkBufferView)(uintptr_t)nvn_hm_get(&g_bviews, &k);
+    if (v) return v;
+    VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buf, .format = f.vk, .offset = off, .range = size};
+    VkBufferView nv;
+    VkResult r = vkCreateBufferView(vk_dev, &ci, NULL, &nv);
+    if (r != VK_SUCCESS) { VK_ONCE("buffer view over pool bytes %#llx+%#llx (%u texels of %#x) failed (%d)", (unsigned long long)(uintptr_t)t->mem, (unsigned long long)size, t->d.width, t->d.format, (int)r); return VK_NULL_HANDLE; }
+    nvn_hm_put(&g_bviews, &k, (void *)(uintptr_t)nv);
+    return nv;
+}
 static int idle(const vtex *e, const void *arg) { return e->used_sub + 600 < *(const uint64_t *)arg; }
 void vt_end_submission(void) {
     uint64_t now = vk_sub_serial();

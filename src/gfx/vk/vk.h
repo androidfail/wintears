@@ -49,10 +49,10 @@ void vk_open(void);
 uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo *signal);
 VkCommandBuffer vk_cmd(void);   /* the replay's command buffer */
 VkCommandBuffer vk_pre(void);   /* runs before it in the same submission: uploads and image initialisation */
-extern uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_barrier;   /* time spent translating shaders, creating pipelines, uploading textures (render thread) */
-uint64_t vk_sub_serial(void);
+extern uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_ubflush, vk_n_barrier, g_sh_bytes;   /* logged every 10 s: time translating shaders, creating pipelines, uploading textures (render thread); counts per kind; bytes copied to video memory */
+uint64_t vk_sub_serial(void);   /* counts submissions: "once per submission" checks */
 uint64_t vk_open_fence(void);   /* the fence the submission being recorded will signal */
-uint64_t vk_gpu_done(void);     /* the last fence the GPU has finished */   /* counts submissions: "once per submission" checks */
+uint64_t vk_gpu_done(void);     /* the last fence the GPU has finished */
 /* Staging memory (host visible) for the open submission, freed when it completes. */
 void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off);
 /* fn(arg) on the completion thread once the open submission has completed (in submission order). */
@@ -101,6 +101,9 @@ int vt_slot_tex(int id, tex_t *t, view_t *v, int *has_v);   /* the slot's regist
 int vt_slot_samp(int id, samp_par *p);
 void vt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
 void vt_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);
+/* Buffer texture (NVN_TEXTURE_TARGET_BUFFER): a zero-copy VkBufferView over the pool bytes the GPU samples.
+   Call with vk_mu held; the view is cached per (mem,size,format) and dropped with the pool. 0 = unusable. */
+VkBufferView vt_texel_view(const tex_t *t);
 
 /* vk_exec.c ----------------------------------------------------------------------------------------------------- */
 void vx_run(const uint8_t *list);   /* replay one recording into the open submission */

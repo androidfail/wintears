@@ -148,7 +148,6 @@ static int begin_pass(void) {
     vk_n_pass++;
     vkCmdBeginRendering(vk_cmd(), &ri);
     g_pass = 1;
-    vd_pass_begun();
     return 1;
 }
 int vx_begin_pass(void) { return begin_pass(); }
