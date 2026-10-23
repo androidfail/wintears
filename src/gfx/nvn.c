@@ -1300,6 +1300,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+  {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     uint64_t period = present_period(o);
@@ -1319,4 +1320,6 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
             (unsigned long long)g_frame, 300e9 / (double)(now - t300 ? now - t300 : 1), g_ncopies, (double)g_copy_bytes / 1048576.0, g_pin_n);
         t300 = now;
     }
+  }
+    { void movie_host_tick(void); movie_host_tick(); }   /* a cutscene's next frame, when it is due: runs game code, so after the core is back */
 }

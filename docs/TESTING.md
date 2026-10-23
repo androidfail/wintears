@@ -51,6 +51,10 @@ python tools/prepare_shaders.py D:/Games/TOTK/TOTK_win   # once: translates the 
 build/wintears.exe boot D:/Games/TOTK/TOTK_win
 ```
 
+Cutscenes (VP9 video) are decoded with libvpx: `pacman -S mingw-w64-ucrt-x86_64-libvpx` before the first build (linked statically,
+nothing to ship; without it CMake warns and the game aborts at the first cutscene). `TOTK_MOVIE_PACE=0` hands frames over
+unpaced, `TOTK_MOVIE_HOST=0` leaves the movies to the SDK.
+
 `build_xlate.py` needs the .NET 10 SDK and the Visual Studio C++ build tools (both are on your PC). The game opens a
 window and draws with Vulkan. Keyboard (as on the Mac version): WASD left stick, arrow keys right stick, J = A,
 K / Space = B, I = X, U = Y, Q = L, E = R, Left Alt = ZL, Left Shift = ZR, Enter = Plus, Tab / Escape = Minus,

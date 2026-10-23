@@ -74,13 +74,24 @@ if(WINTEARS_JIT)
   add_library(host STATIC src/host/svc.c src/host/memory.c src/host/threads.c src/host/overrides.c
               src/host/services.c src/host/sha256.c src/host/romfs.c src/host/fs_host.c src/host/account.c
               src/host/gfx_bridge.c src/host/vi_stub.c src/host/input.c src/host/time.c src/host/fonts.c
-              src/host/applet.c src/host/audio_out.c src/host/codec.c
+              src/host/applet.c src/host/audio_out.c src/host/codec.c src/host/movie.c
               ${MNG_HOST_SOURCES} ${MNG_HOST_COPIES})
   set_source_files_properties(${MNG_HOST_SOURCES} ${MNG_HOST_COPIES} PROPERTIES
     COMPILE_OPTIONS "-include;${CMAKE_SOURCE_DIR}/src/host/upstream_compat.h;-Wno-unused-parameter")
   set_source_files_properties(${MNG_HOST_COPIES} PROPERTIES INCLUDE_DIRECTORIES ${CMAKE_SOURCE_DIR}/${MNG_RUNTIME})
   target_include_directories(host PUBLIC src)
   target_link_libraries(host PUBLIC loader bridge cpu_jit pal pthread bcrypt ole32 opus)
+  # libvpx (MSYS2 mingw-w64-ucrt-x86_64-libvpx, static): the cutscene decoder, src/host/movie.c. Without it the game
+  # still runs, and aborts at the first cutscene.
+  find_path(VPX_INCLUDE_DIR vpx/vpx_decoder.h)
+  find_library(VPX_LIBRARY NAMES libvpx.a vpx)
+  if(VPX_INCLUDE_DIR AND VPX_LIBRARY)
+    target_compile_definitions(host PRIVATE HAVE_LIBVPX)
+    target_include_directories(host PRIVATE ${VPX_INCLUDE_DIR})
+    target_link_libraries(host PUBLIC ${VPX_LIBRARY})
+  else()
+    message(WARNING "libvpx not found: cutscenes will abort the game (pacman -S mingw-w64-ucrt-x86_64-libvpx)")
+  endif()
   # Upstream services register themselves from constructors (audio_renderer.c: audren:u); nothing else refers to
   # their objects, so the archive would drop them.
   target_link_options(host INTERFACE "LINKER:-u,runtime_audio_register")

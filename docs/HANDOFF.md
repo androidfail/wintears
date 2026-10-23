@@ -116,6 +116,10 @@ Not an option: getting game files from anywhere but the user's own dump.
      passes, copies and dispatches, about 285 a frame; GENERAL layouts). Inline uniform updates (about 210 a frame) are
      renamed as upstream does (`vd_ub_update` in `vk_draw.c`; `TOTK_UB_RENAME=0` for A/B): passes no longer split at
      them, barriers per frame went from about 510 to 285.
+   - **Cutscenes** (2026-10-22): `src/host/movie.c`, the Windows port of upstream `movie_host.c`: one host VP9 decoder (libvpx)
+     replaces the SDK's movie::Decoder, which needs Tegra NVDEC. It covers all 28 cutscenes (same library, same codec).
+     Guest-visible data (input buffers, strings, result slots) comes from `host_guest_alloc`; `movie_host_tick` runs after
+     the present's core-away scope. Not yet confirmed to play a whole cutscene.
    - **NVN layer, left out of the port so far** (`src/gfx/nvn.c` header comment): CPU-visible physical memory pools
      (`src/gfx/nvn_vpool.c`: they would alias the game's private heap memory), the recording-copy marks in control memory (copies of control memory the game frees to
      its heap stay until it is re-added), the translation thread, the game's frame-step patches.

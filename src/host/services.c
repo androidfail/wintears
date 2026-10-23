@@ -167,6 +167,7 @@ const host_fn *host_service_override(const char *name) {
     if (!f) f = host_input_override(name);   /* upstream's order: input, fonts, codecs, movie, time, applet, swkbd, ... */
     if (!f) f = host_font_override(name);
     if (!f) f = host_codec_override(name);
+    if (!f) f = host_movie_override(name);
     if (!f) f = host_time_override(name);
     if (!f) f = host_applet_override(name);
     if (!f) f = host_account_override(name);
