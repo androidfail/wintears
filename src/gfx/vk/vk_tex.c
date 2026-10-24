@@ -351,7 +351,7 @@ VkBufferView vt_texel_view(const tex_t *t) {
     uint64_t size = (uint64_t)t->d.width * (uint64_t)bpb;
     VkBuffer buf; VkDeviceSize off;
     if (!vk_buf((uint64_t)(uintptr_t)t->mem, size, &buf, &off)) { VK_ONCE("buffer texture storage %#llx+%#llx is not in a registered pool", (unsigned long long)(uintptr_t)t->mem, (unsigned long long)size); return VK_NULL_HANDLE; }
-    if (off & 15) { VK_ONCE("buffer texture at pool offset %#llx is not 16-byte aligned", (unsigned long long)off); return VK_NULL_HANDLE; }
+    if (off & 3) { VK_ONCE("buffer texture (fmt %#x) at pool offset %#llx is not 4-byte aligned; bound as zeros", (unsigned)t->d.format, (unsigned long long)off); return VK_NULL_HANDLE; }
     bv_key k = {(uint64_t)(uintptr_t)t->mem, size, f.vk};
     VkBufferView v = (VkBufferView)(uintptr_t)nvn_hm_get(&g_bviews, &k);
     if (v) return v;

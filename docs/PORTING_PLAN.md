@@ -11,10 +11,15 @@ Upstream reference: MNG at commit `4fdda41562a1c783fb1aacd18891ad4f48b8c360` (20
 | Phase | State |
 |---|---|
 | 0. Repository and CI | done: submodules, CMake cross-build, CI (Linux + Wine, native Windows, Python tools) |
-| 1. Build pipeline | in progress: `tools/build_win.py` extracts and verifies 1.0.0 code and data. NSPs with unencrypted sections are supported (`tools/upstream_patches.py`). RomFS images re-packed by a converter are rebuilt in Nintendo's layout and accepted only on an exact 1.0.0 hash match (`tools/romfs_rebuild.py`, see `docs/HANDOFF.md`) |
+| 1. Build pipeline | done: `tools/build_win.py` extracts and verifies 1.0.0 code and data, including NSPs with unencrypted sections (`tools/upstream_patches.py`) and re-packed RomFS (`tools/romfs_rebuild.py`, kept only on an exact 1.0.0 hash match). Fonts, overlays, `TOTK_win/` and `--check --full` all pass |
 | 2. Platform layer | done for bring-up: `src/pal`, 56 checks |
-| 3A. CPU (JIT) | started: dynarmic builds for Windows, `src/cpu/jit` runs ARM64 code (39 checks); `src/bridge` calls host functions from guest code through generated thunks, 422 NVN thunks (17 checks); `src/loader` loads the original modules (43 checks) and `src/host` (Horizon host, ported from upstream) answers its svcs, IPC and overrides: the boot probe runs the SDK start-up and the game's `nnMain`. `src/gfx` (NVN layer, ported from upstream `hle_nvn.c`, null GPU backend, 37 checks) takes the game through its graphics start-up; with input, time, fonts, applet, audio renderer and Opus it runs its main loop at 30 fps with sound (probably the title screen); input scripts and the Vulkan backend next |
-| 4–9 | not started |
+| 3A. CPU (JIT) | done: `src/cpu/jit` (39 checks), `src/bridge` (422 NVN thunks, 17 checks), `src/loader` (43 checks), `src/host` (Horizon host: svcs, IPC, overrides, RomFS, audio) — the boot probe runs the SDK start-up, the game's `nnMain`, and its main loop |
+| 4. Frontend | mostly done: SDL3 window, keyboard + XInput/PlayStation/Switch Pro controllers, WASAPI audio, F11 fullscreen. Left: rumble, gyro, software keyboard, a controller layout file |
+| 5. Vulkan backend | done with leftovers: device, guest pools, textures, clears, copies, events/counters, present, and draws/dispatches via run-time shader translation (`wt_xlate.exe`) on Vulkan 1.3 dynamic state. Left: buffer textures, partial-mask clears, layered rendering (first layer only), 24-bit depth uploads, rendered-texture write-back (InvalidateMappedRange), occlusion queries (always visible), instance divisor, one 111 MiB unimportable pool, background translation, a performance pass |
+| 6. In-game correctness | in progress: playable at ~30 fps with sound, cutscenes play (`src/host/movie.c`, libvpx VP9), saves are handled. Open: a black skybox in some scenes. Left: MNG game patches (`game_patches.c`), guest sync tests, the `long`/`unsigned long` audit |
+| 7. Performance and polish | started: `tools/prepare_shaders.py` translates the shaders ahead of play; per-frame barriers cut by inlining uniform updates (~510→285). Left: FSR, `VK_EXT_graphics_pipeline_library`, the 60 FPS patch, the HUD overlay, the mods folder |
+| 8. Packaging and release | not started |
+| 9. Ahead-of-time translation (optional) | not started |
 
 ## Decisions
 
@@ -102,14 +107,16 @@ for hot functions that profiling shows are the bottleneck.
 ```
 wintears/
   upstream/            MNG, pinned git submodule (never edited)
-  externals/dynarmic   ARM64-to-x86 JIT, pinned git submodule
+  externals/           pinned: dynarmic, SDL3, volk, VMA, opus, astc-encoder, Vulkan-Headers
   src/
     pal/               platform layer (Windows; a POSIX shim for tests)
-    cpu/               cpu_jit/ (Track A, dynarmic) and cpu_native/ (Track B)
+    cpu/jit/           Track A, dynarmic A64→x86
     bridge/            generated guest↔host thunks + generator
-    vk/                Vulkan backend (replaces nvn_mtl.m)
-    tex/               texture decoders (ASTC, deswizzle; reuse MNG tex/ where possible)
+    loader/            maps the original NSO modules, relocations, linking
+    host/              Horizon host (services, fs, accounts, input, movie)
+    gfx/               NVN layer (`nvn_*.c`) + Vulkan backend (`vk/`) + texture decoders
     frontend/          SDL3 window, input, audio, text entry
+    app/               wintears.exe entry point and boot sequence
   tools/               build_app (Windows), shader seed, diagnostics
   tests/               game-free tests (run in CI)
   docs/                this plan, TESTING.md, design notes

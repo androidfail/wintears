@@ -173,6 +173,6 @@ Regenerated files (CI checks they are current):
 - PCs: Intel/AMD with an RTX 4070 and an RTX 3080; later target: a laptop with integrated AMD Radeon (see the
   plan's "Low-end budget"). Uses Ryujinx: game files are in Ryujinx's *Game Directories*, keys in
   `%APPDATA%\Ryujinx\system\prod.keys`, firmware in `%APPDATA%\Ryujinx\bis\system\Contents\registered`.
-- Owns TOTK 1.0.0 (as an NSP). Reads on a phone between other things: short messages, outcome first.
+- Owns TOTK 1.0.0 (as an NSP).
 - Never ask for, print, commit or upload keys, game files, saves or anything extracted from them.
 - Commit to `main`. Commit messages end with the session's attribution lines.
