@@ -109,8 +109,12 @@ Not an option: getting game files from anywhere but the user's own dump.
      read-only uniform / storage / vertex / index buffers into video memory was tried and gained nothing (NVIDIA caches
      system-memory reads). Stutters were shader translation (up to 2.8 s in a new area): `tools/prepare_shaders.py`
      now translates ahead of play; the 10 s log line splits replay time into translation, pipelines, textures.
-     Not done yet: buffer textures (bound as zeros), partial-mask clears,
-     layered rendering (first layer only), 24-bit depth uploads, writing rendered textures back to pool memory
+     Done 2026-10-24 (not yet seen in play): layered rendering (a pass covers the layers of its attachment views; the
+     vertex shader picks the layer; clears cover every layer), buffer textures (texel buffer support is read from the
+     format's buffer features, not its image features, which made every format fall back to zeros; views at offsets the
+     device cannot view in place are sampled from a copy), partial-mask clears (a colour clear with a channel mask and a
+     stencil clear with a write mask are drawn with a write mask: `vk_clear.c`, shaders from
+     `tools/build_clear_shaders.py`). Not done yet: 24-bit depth uploads, writing rendered textures back to pool memory
      (InvalidateMappedRange), occlusion queries (always "visible"), the instance divisor extension, physical pools
      the driver cannot import (one 111 MiB pool), background shader translation, performance (full barriers between
      passes, copies and dispatches, about 285 a frame; GENERAL layouts). Inline uniform updates (about 210 a frame) are

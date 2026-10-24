@@ -119,8 +119,12 @@ static int create_device(void) {
     volkLoadDevice(vk_dev);
     vkGetDeviceQueue(vk_dev, vk_qfam, 0, &vk_q);
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
-    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &hp};
+    VkPhysicalDeviceVulkan13Properties p13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, .pNext = &hp};
+    VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &p13};
     vkGetPhysicalDeviceProperties2(vk_phys, &p2);
+    vk_texel_align[0] = (uint32_t)p13.uniformTexelBufferOffsetAlignmentBytes; vk_texel_single[0] = p13.uniformTexelBufferOffsetSingleTexelAlignment;
+    vk_texel_align[1] = (uint32_t)p13.storageTexelBufferOffsetAlignmentBytes; vk_texel_single[1] = p13.storageTexelBufferOffsetSingleTexelAlignment;
+    for (int i = 0; i < 2; i++) if (!vk_texel_align[i]) vk_texel_align[i] = (uint32_t)vk_props.limits.minTexelBufferOffsetAlignment;
     g_host_align = hp.minImportedHostPointerAlignment;
     VLOG("device %s, driver %#x, imported memory alignment %llu, at most %u allocations, BC %s, ASTC %s",
          vk_props.deviceName, vk_props.driverVersion, (unsigned long long)g_host_align, vk_props.limits.maxMemoryAllocationCount,
@@ -407,6 +411,7 @@ static void tex_release(tex_t *t) { if (t->serial) vt_release_serial(t->serial);
 static void prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&vk_mu); vs_prog_release(p->serial); pthread_mutex_unlock(&vk_mu); }
 static void window_tex(uint64_t serial) { (void)serial; }
 
+uint32_t vk_texel_align[2] = {16, 16}, vk_texel_single[2];
 uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_ubflush, vk_n_barrier;
 static uint64_t g_sub_max;
 static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;

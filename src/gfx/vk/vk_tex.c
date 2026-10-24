@@ -336,22 +336,35 @@ void vt_pool_gone(uintptr_t lo, uintptr_t hi) { range r = {lo, hi}; drop_where(i
             else vkDestroyBufferView(vk_dev, (VkBufferView)(uintptr_t)v, NULL); } }   /* destroy once the GPU is done */
     } while (n == 256);
 }
-VkBufferView vt_texel_view(const tex_t *t) {
-    if (t->d.target != NVN_TEXTURE_TARGET_BUFFER) return VK_NULL_HANDLE;
-    if (!t->mem || !t->d.width) { VK_ONCE("buffer texture has no pool storage"); return VK_NULL_HANDLE; }
+/* What a buffer texture is as a texel buffer: format, bytes, the alignment a view of it must have; 0 when it cannot be one. */
+static int texel_info(const tex_t *t, vk_fmt *f, uint64_t *size, uint32_t *align) {
+    if (t->d.target != NVN_TEXTURE_TARGET_BUFFER) return 0;
+    if (!t->mem || !t->d.width) { VK_ONCE("buffer texture has no pool storage"); return 0; }
     int bw, bh;
     int bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    vk_fmt f;
-    if (!bpb || !vk_fmt_of(t->d.format, &f) || f.vk == VK_FORMAT_UNDEFINED) { VK_ONCE("buffer texture format %#x is not linear", (unsigned)t->d.format); return VK_NULL_HANDLE; }
-    if (vk_fmt_block_compressed(f.vk) || f.depth || f.stencil) { VK_ONCE("buffer texture format %#x cannot be a texel buffer", (unsigned)t->d.format); return VK_NULL_HANDLE; }
-    { VkFormatProperties fp;
-      vkGetPhysicalDeviceFormatProperties(vk_phys, f.vk, &fp);
-      if (!(fp.optimalTilingFeatures & (VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT))) {
-          VK_ONCE("format %#x has no texel buffer usage on this GPU", (unsigned)t->d.format); return VK_NULL_HANDLE; } }
-    uint64_t size = (uint64_t)t->d.width * (uint64_t)bpb;
+    if (!bpb || !vk_fmt_of(t->d.format, f) || f->vk == VK_FORMAT_UNDEFINED) { VK_ONCE("buffer texture format %#x is not linear", (unsigned)t->d.format); return 0; }
+    if (vk_fmt_block_compressed(f->vk) || f->depth || f->stencil) { VK_ONCE("buffer texture format %#x cannot be a texel buffer", (unsigned)t->d.format); return 0; }
+    VkFormatProperties fp;   /* texel buffer support is a buffer feature (not an image one) */
+    vkGetPhysicalDeviceFormatProperties(vk_phys, f->vk, &fp);
+    if (!(fp.bufferFeatures & (VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT | VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT))) {
+        VK_ONCE("format %#x has no texel buffer usage on this GPU", (unsigned)t->d.format); return 0; }
+    *size = (uint64_t)t->d.width * (uint64_t)bpb;
+    /* the offset of a view must be a multiple of the device's alignment; with single-texel alignment, of the texel's
+       own alignment if that is smaller (the largest power of two dividing its size: 12 bytes -> 4) */
+    uint32_t al = vk_texel_align[1] > vk_texel_align[0] ? vk_texel_align[1] : vk_texel_align[0], one = vk_texel_single[0] && vk_texel_single[1];
+    uint32_t own = (uint32_t)bpb & (uint32_t)-(int32_t)bpb;
+    *align = one && own < al ? own : al;
+    return 1;
+}
+/* GPU writes to the bytes before the view reads them: a logged uniform update there reaches memory first */
+void vd_ub_guard(uint64_t lo, uint64_t hi);
+VkBufferView vt_texel_view(const tex_t *t) {
+    vk_fmt f; uint64_t size; uint32_t al;
+    if (!texel_info(t, &f, &size, &al)) return VK_NULL_HANDLE;
     VkBuffer buf; VkDeviceSize off;
     if (!vk_buf((uint64_t)(uintptr_t)t->mem, size, &buf, &off)) { VK_ONCE("buffer texture storage %#llx+%#llx is not in a registered pool", (unsigned long long)(uintptr_t)t->mem, (unsigned long long)size); return VK_NULL_HANDLE; }
-    if (off & 3) { VK_ONCE("buffer texture (fmt %#x) at pool offset %#llx is not 4-byte aligned; bound as zeros", (unsigned)t->d.format, (unsigned long long)off); return VK_NULL_HANDLE; }
+    if (off % al) return VK_NULL_HANDLE;   /* vt_texel_view_copy */
+    vd_ub_guard((uint64_t)(uintptr_t)t->mem, (uint64_t)(uintptr_t)t->mem + size);
     bv_key k = {(uint64_t)(uintptr_t)t->mem, size, f.vk};
     VkBufferView v = (VkBufferView)(uintptr_t)nvn_hm_get(&g_bviews, &k);
     if (v) return v;
@@ -360,6 +373,23 @@ VkBufferView vt_texel_view(const tex_t *t) {
     VkResult r = vkCreateBufferView(vk_dev, &ci, NULL, &nv);
     if (r != VK_SUCCESS) { VK_ONCE("buffer view over pool bytes %#llx+%#llx (%u texels of %#x) failed (%d)", (unsigned long long)(uintptr_t)t->mem, (unsigned long long)size, t->d.width, t->d.format, (int)r); return VK_NULL_HANDLE; }
     nvn_hm_put(&g_bviews, &k, (void *)(uintptr_t)nv);
+    return nv;
+}
+/* A buffer texture at an offset the device cannot view in place: its bytes copied into this submission's staging memory
+   as they are now. For sampled (read only) use: writes through a storage texel buffer would be lost. */
+VkBufferView vt_texel_view_copy(const tex_t *t) {
+    vk_fmt f; uint64_t size; uint32_t al;
+    if (!texel_info(t, &f, &size, &al)) return VK_NULL_HANDLE;
+    vd_ub_guard((uint64_t)(uintptr_t)t->mem, (uint64_t)(uintptr_t)t->mem + size);
+    VkBuffer sb; VkDeviceSize so;
+    void *p = vk_stage(size, al, &sb, &so);
+    if (pal_guarded_copy(p, (const void *)(uintptr_t)t->mem, (size_t)size)) memset(p, 0, (size_t)size);
+    VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = sb, .format = f.vk, .offset = so, .range = size};
+    VkBufferView nv;
+    if (vkCreateBufferView(vk_dev, &ci, NULL, &nv) != VK_SUCCESS) { VK_ONCE("buffer view over a copy of %llu bytes (fmt %#x) failed", (unsigned long long)size, (unsigned)t->d.format); return VK_NULL_HANDLE; }
+    VkBufferView *keep = malloc(sizeof *keep);
+    if (keep) { *keep = nv; vk_after(bv_gone_drop, keep); }
+    VK_ONCE("buffer texture (fmt %#x) at an offset not %u-byte aligned for a view: sampled from a copy made at each bind", (unsigned)t->d.format, al);
     return nv;
 }
 static int idle(const vtex *e, const void *arg) { return e->used_sub + 600 < *(const uint64_t *)arg; }

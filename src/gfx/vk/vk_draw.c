@@ -386,6 +386,7 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             slot_tex s;
             if (h && slot_texture(h, &s) && s.t.d.target == NVN_TEXTURE_TARGET_BUFFER) {
                 VkBufferView real = vt_texel_view(&s.t);
+                if (!real && b->type == DT_UTB) real = vt_texel_view_copy(&s.t);
                 if (real) v = real;
                 else VK_ONCE("%s texture in slot %d is not GPU-readable here (fmt %#x); bound as zeros", b->type == DT_UTB ? "utb" : "stb", (int)(h & 0xfffff), s.t.d.format);
             } else if (h) { VK_ONCE("%s slot %d points at a non-buffer texture; bound as zeros", b->type == DT_UTB ? "utb" : "stb", (int)(h & 0xfffff)); }

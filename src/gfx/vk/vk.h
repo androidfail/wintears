@@ -36,6 +36,8 @@ extern VkQueue vk_q;
 extern uint32_t vk_qfam;
 extern VmaAllocator vk_vma;
 extern VkPhysicalDeviceProperties vk_props;
+/* texel buffer views (Vulkan 1.3 texelBufferAlignment): offset alignment in bytes, and whether a texel's own size is enough, for uniform [0] / storage [1] */
+extern uint32_t vk_texel_align[2], vk_texel_single[2];
 extern VkSurfaceKHR vk_surface;
 
 /* vk_dev.c ------------------------------------------------------------------------------------------------------ */
@@ -104,6 +106,7 @@ void vt_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 /* Buffer texture (NVN_TEXTURE_TARGET_BUFFER): a zero-copy VkBufferView over the pool bytes the GPU samples.
    Call with vk_mu held; the view is cached per (mem,size,format) and dropped with the pool. 0 = unusable. */
 VkBufferView vt_texel_view(const tex_t *t);
+VkBufferView vt_texel_view_copy(const tex_t *t);   /* sampled use only: a view of a copy of the bytes */
 
 /* vk_exec.c ----------------------------------------------------------------------------------------------------- */
 void vx_run(const uint8_t *list);   /* replay one recording into the open submission */

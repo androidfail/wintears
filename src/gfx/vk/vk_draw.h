@@ -26,6 +26,8 @@ typedef struct {
 } vx_state;
 extern vx_state S;
 
+int vx_clear_masked_color(int index, uint32_t mask, const uint32_t bits[4], VkRect2D rect, uint32_t layers);   /* vk_clear.c: 0 = not done */
+int vx_clear_masked_stencil(uint32_t wmask, uint32_t value, VkRect2D rect, uint32_t layers);
 int vx_begin_pass(void);                    /* vk_exec.c: open a pass on the current targets (0 = none) */
 void vd_state_op(uint32_t op, const void *a);
 void vd_draw(const p_draw *dw, const p_draw_idx *di);

@@ -12,6 +12,7 @@
 vx_state S;
 static int g_pass;                  /* a render pass is open */
 static VkRect2D g_area;             /* its render area */
+static uint32_t g_pass_layers = 1;  /* its layers: every attachment view covers at least this many (a layered target; the vertex shader picks the layer) */
 static uint64_t g_stat_skip[8];
 
 /* ---------- CPU-visible effects ---------- */
@@ -88,6 +89,13 @@ void vx_end_pass(void) {
 }
 
 /* The targets' images and views, prepared before the pass begins (uploads cannot happen inside one). */
+/* the layers an attachment view covers (as vt_view makes it): its count, else everything from its first layer on, never more than the image has */
+static uint32_t view_layers(const view_t *v, uint32_t total) {
+    uint32_t first = v && v->set_layers ? v->min_layer : 0;
+    if (first >= total) first = total - 1;
+    uint32_t n = v && v->set_layers && v->nlayers ? v->nlayers : total - first;
+    return n > total - first ? total - first : n;
+}
 static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uint32_t *w, uint32_t *h, uint32_t *layers) {
     *w = *h = UINT32_MAX; *layers = UINT32_MAX; int any = 0;
     for (int i = 0; i < 8; i++) {
@@ -97,7 +105,7 @@ static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uin
         if (!(col[i] = vt_get(S.rt.color[i]))) continue;
         if (!(cv[i] = vt_view(col[i], S.rt.color[i], v, VT_ATTACHMENT, VT_ANY_TYPE))) { col[i] = NULL; continue; }
         unsigned lv = v && v->set_levels ? v->base_level : 0; uint32_t a, b, c; vt_size(col[i], lv, &a, &b, &c);
-        uint32_t nl = v && v->set_layers && v->nlayers ? v->nlayers : vt_layers(col[i]);
+        uint32_t nl = view_layers(v, vt_layers(col[i]));
         *w = a < *w ? a : *w; *h = b < *h ? b : *h; *layers = nl < *layers ? nl : *layers;
         any = 1;
     }
@@ -106,12 +114,12 @@ static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uin
         const view_t *v = S.rt.has_dview ? &S.rt.dview : NULL;
         if ((*dv = vt_view(*dep, S.rt.depth, v, VT_ATTACHMENT, VT_ANY_TYPE))) {
             unsigned lv = v && v->set_levels ? v->base_level : 0; uint32_t a, b, c; vt_size(*dep, lv, &a, &b, &c);
-            uint32_t nl = v && v->set_layers && v->nlayers ? v->nlayers : vt_layers(*dep);
+            uint32_t nl = view_layers(v, vt_layers(*dep));
             *w = a < *w ? a : *w; *h = b < *h ? b : *h; *layers = nl < *layers ? nl : *layers;
             any = 1;
         } else *dep = NULL;
     }
-    if (*layers == UINT32_MAX || *layers > 1) *layers = 1;   /* shortcut: layered rendering draws into the first layer only */
+    if (*layers == UINT32_MAX) *layers = 1;
     return any;
 }
 
@@ -133,7 +141,7 @@ static int begin_pass(void) {
         da.imageView = dv; da.imageLayout = VK_IMAGE_LAYOUT_GENERAL; da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     }
     sa = da;
-    g_area = (VkRect2D){{0, 0}, {w, h}};
+    g_area = (VkRect2D){{0, 0}, {w, h}}; g_pass_layers = layers;
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = g_area, .layerCount = layers,
                           .colorAttachmentCount = (uint32_t)n, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
@@ -170,25 +178,31 @@ static void clear_color(const p_clear_color *c) {
     if (c->index < 0 || c->index >= S.rt.n || !S.rt.color[c->index] || !(c->mask & 0xf)) return;
     if (!begin_pass()) return;
     if (S.pass_fmt.color[c->index] == VK_FORMAT_UNDEFINED) return;
-    if ((c->mask & 0xf) != 0xf) { g_stat_skip[0]++; VK_ONCE("colour clear with channel mask %#x: done as a full clear for now", c->mask); }
+    if ((c->mask & 0xf) != 0xf) {   /* only some channels: drawn with a write mask */
+        uint32_t bits[4]; memcpy(bits, c->rgba, 16);
+        if (vx_clear_masked_color(c->index, c->mask & 0xf, bits, clear_rect(), g_pass_layers)) { g_pass_clears++; return; }
+        g_stat_skip[0]++; VK_ONCE("colour clear with channel mask %#x: the masked draw failed, done as a full clear", c->mask);
+    }
     g_pass_clears++;
     VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index};
     memcpy(ca.clearValue.color.float32, c->rgba, 16);   /* integer targets: NVN passes the integer bits the same way */
-    VkClearRect r = {clear_rect(), 0, 1};
+    VkClearRect r = {clear_rect(), 0, g_pass_layers};   /* a clear covers every layer of a layered target */
     if (r.rect.extent.width && r.rect.extent.height) vkCmdClearAttachments(vk_cmd(), 1, &ca, 1, &r);
 }
 static void clear_ds(const p_clear_ds *c) {
     if (S.render_disabled || !S.rt.depth) return;
     if (!begin_pass()) return;
     VkImageAspectFlags asp = 0;
+    uint32_t smask = c->stencil_mask & 0xff;
     if (c->depth_mask && S.pass_fmt.depth != VK_FORMAT_UNDEFINED) asp |= VK_IMAGE_ASPECT_DEPTH_BIT;
-    if ((c->stencil_mask & 0xff) && S.pass_fmt.stencil != VK_FORMAT_UNDEFINED) {
-        asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
-        if ((c->stencil_mask & 0xff) != 0xff) VK_ONCE("stencil clear with write mask %#x: done as a full clear for now", c->stencil_mask);
+    if (smask && S.pass_fmt.stencil != VK_FORMAT_UNDEFINED) {
+        if (smask == 0xff) asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        else if (vx_clear_masked_stencil(smask, (uint32_t)c->stencil, clear_rect(), g_pass_layers)) smask = 0;   /* some bits: drawn with a write mask */
+        else { asp |= VK_IMAGE_ASPECT_STENCIL_BIT; VK_ONCE("stencil clear with write mask %#x: the masked draw failed, done as a full clear", c->stencil_mask); }
     }
     if (!asp) return;
     VkClearAttachment ca = {asp, 0, {.depthStencil = {c->depth, (uint32_t)c->stencil}}};
-    VkClearRect r = {clear_rect(), 0, 1};
+    VkClearRect r = {clear_rect(), 0, g_pass_layers};   /* a clear covers every layer of a layered target */
     if (r.rect.extent.width && r.rect.extent.height) vkCmdClearAttachments(vk_cmd(), 1, &ca, 1, &r);
 }
 
