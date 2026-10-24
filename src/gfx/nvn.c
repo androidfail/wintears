@@ -213,7 +213,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
     if ((o->flags & (NVN_MEMORY_POOL_FLAGS_PHYSICAL | NVN_MEMORY_POOL_FLAGS_VIRTUAL)) && !totk_vpool_init(o)) { o->magic = 0; return 0; }   /* nvn_vpool.c */
     int gpu_visible = !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS);
-    if (o->mem && gpu_visible) gpu_pool_add(o->mem, o->size);
+    if (o->mem && gpu_visible && !(o->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) gpu_pool_add(o->mem, o->size);   /* a virtual pool's mapped pages are added as they are mapped (nvn_vpool.c) */
     if (!o->mem) LOG("nvnMemoryPoolInitialize: pool without storage, flags=%#x size=%#llx", o->flags, (unsigned long long)o->size);
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, (unsigned long long)o->size, o->flags);
     if (poollog_env()) LOG("[pool] %p mem=%p..%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, (void *)(o->mem + o->size), (unsigned long long)o->size, o->flags);
@@ -221,7 +221,7 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
 }
 NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
     pool_t *o = (pool_t *)p;
-    if (o->mem && !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS)) gpu_pool_del(o->mem);
+    if (o->mem && !(o->flags & (NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS | NVN_MEMORY_POOL_FLAGS_VIRTUAL))) gpu_pool_del(o->mem);
     totk_vpool_fini(o); o->magic = 0;
 }
 NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }

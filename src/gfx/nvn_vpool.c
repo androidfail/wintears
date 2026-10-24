@@ -43,6 +43,29 @@ static vstate *state_new(void) {   /* g_map_mu held */
     die("vpool: more than %d physical / virtual pools", MAX_POOLS);
 }
 
+/* What the GPU backend sees of a virtual pool: its mapped pages, as runs of consecutive pages, each registered as a pool
+   of its own. The whole reserved range cannot be imported as host memory (the GPU refuses a range with unmapped pages
+   in it: probed on an RTX 4070, a reserved range of 64 KiB section views imports when every page is mapped and fails
+   with a hole); a run of mapped pages is one import. A mapping request changes the runs around it: those touching
+   its pages or next to them are dropped and made again, the others are left as they are. */
+typedef struct { uint64_t first, count; } vrun;   /* in pages */
+static int runs_of(const vstate *s, vrun **out) {   /* g_map_mu held; the caller frees *out */
+    uint64_t pages = s->span / TOTK_VPOOL_PAGE; vrun *r = NULL; int cap = 0, k = 0;
+    for (uint64_t p = 0; p < pages;) {
+        if (!s->page_src[p]) { p++; continue; }
+        uint64_t q = p; while (q < pages && s->page_src[q]) q++;
+        if (k == cap) { cap = cap ? cap * 2 : 16; r = realloc(r, (size_t)cap * sizeof *r); if (!r) die("vpool: run list"); }
+        r[k++] = (vrun){p, q - p}; p = q;
+    }
+    *out = r; return k;
+}
+static int near_request(const vrun *u, const totk_mapping_request *r, int count) {   /* overlaps a request's pages or touches them */
+    for (int i = 0; i < count; i++) {
+        uint64_t lo = (uint64_t)r[i].virtual_offset / TOTK_VPOOL_PAGE, hi = lo + r[i].size / TOTK_VPOOL_PAGE;
+        if (u->first <= hi && u->first + u->count >= lo) return 1;
+    }
+    return 0;
+}
 int totk_vpool_init(pool_t *o) {
     int phys = (o->flags & F_PHYSICAL) != 0, virt = (o->flags & F_VIRTUAL) != 0;
     o->game_mem = o->mem; o->host = NULL; o->span = 0;
@@ -83,6 +106,9 @@ int totk_vpool_fini(pool_t *o) {
         pal_unmap_view((uintptr_t)s->host);
         pal_section_destroy(s->section);   /* views in virtual pools keep the memory alive */
     } else {
+        vrun *runs; int nr = runs_of(s, &runs);
+        for (int i = 0; i < nr; i++) gpu_pool_del(s->host + runs[i].first * TOTK_VPOOL_PAGE);
+        free(runs);
         for (uint64_t p = 0; p < s->span / TOTK_VPOOL_PAGE; p++)
             if (s->page_src[p]) pal_unmap_view((uintptr_t)(s->host + p * TOTK_VPOOL_PAGE));
         free(s->page_src);
@@ -138,10 +164,14 @@ int totk_vpool_map(pool_t *v, int count, const totk_mapping_request *r) {
     pthread_mutex_lock(&g_map_mu);
     vstate *s = state_of(v->host);
     if (!s || !s->page_src) die("vpool: virtual pool %p has no host range", (void *)v->mem);
-    gpu_pool_del(v->mem);   /* the backend's view of the old pages */
+    vrun *old, *now; int nold = runs_of(s, &old), nnow;
+    for (int i = 0; i < nold; i++) if (near_request(&old[i], r, count)) gpu_pool_del(v->mem + old[i].first * TOTK_VPOOL_PAGE);   /* the backend's view of the old pages */
+    free(old);
     int ok = 1;
     for (int i = 0; ok && i < count; i++) ok = apply_request(s, &r[i]);
-    gpu_pool_add(v->mem, v->size);
+    nnow = runs_of(s, &now);
+    for (int i = 0; i < nnow; i++) if (near_request(&now[i], r, count)) gpu_pool_add(v->mem + now[i].first * TOTK_VPOOL_PAGE, now[i].count * TOTK_VPOOL_PAGE);
+    free(now);
     pthread_mutex_unlock(&g_map_mu);
     if (!ok) die("vpool: mapping failed after validation; virtual pool %p is inconsistent", (void *)v);
     return 1;

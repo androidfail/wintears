@@ -131,7 +131,7 @@ Not an option: getting game files from anywhere but the user's own dump.
      600 idle submissions); passes use the attachment view's format (an sRGB view of a linear image rendered with the
      image's format); BC textures can be rendered into through a one-texel-per-block view (BC4 as RGBA16UI);
      texture clears of an sRGB / linear twin convert the value. The log prints the first layouts that alias one memory
-     range (`storage ... beside an existing ...`). Not done yet: pools the driver cannot import (one 111 MiB pool), background shader translation (the translation depends on state known only at the draw, so it cannot start earlier), performance (full barriers between
+     range (`storage ... beside an existing ...`). Virtual pools: the GPU cannot import a reserved range with unmapped pages (probed on the RTX 4070 with a scratch program: 64 KiB section views import when every page is mapped, a single hole makes it fail with out of host memory), so the backend gets a virtual pool as its runs of mapped pages, re-made around each MapVirtual request (`nvn_vpool.c`). Before that every buffer, uniform block and texel in a virtual pool read as zeros on the GPU, which may be the black skybox / messy shaders cause. Not done yet: any other pool the driver cannot import (the log says why), background shader translation (the translation depends on state known only at the draw, so it cannot start earlier), performance (full barriers between
      passes, copies and dispatches, about 285 a frame; GENERAL layouts). Inline uniform updates (about 210 a frame) are
      renamed as upstream does (`vd_ub_update` in `vk_draw.c`; `TOTK_UB_RENAME=0` for A/B): passes no longer split at
      them, barriers per frame went from about 510 to 285.
