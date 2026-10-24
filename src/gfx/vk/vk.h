@@ -101,6 +101,8 @@ void vt_set_pool_n(int n);
 VkSampler vt_sampler(const samp_par *p);
 int vt_slot_tex(int id, tex_t *t, view_t *v, int *has_v);   /* the slot's registered texture (a copy); 0 = empty */
 int vt_slot_samp(int id, samp_par *p);
+void vt_note_rendered(const tex_t *t);   /* a pass renders into t: a CPU read of its pool memory must see it (vt_pool_invalidate) */
+void vt_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n);
 void vt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img);
 void vt_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);
 /* Buffer texture (NVN_TEXTURE_TARGET_BUFFER): a zero-copy VkBufferView over the pool bytes the GPU samples.

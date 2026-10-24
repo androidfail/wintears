@@ -401,8 +401,7 @@ static int init(void) {
 }
 
 static void pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
-    (void)p; (void)off; (void)n;   /* imported memory is coherent; what the GPU rendered into textures stays in the images */
-    VK_ONCE("the CPU reads pool memory the GPU wrote (InvalidateMappedRange): rendered textures are not written back yet");
+    vt_pool_invalidate(p, off, n);   /* imported memory is coherent for buffers; rendered textures are in images and are written back */
 }
 static void set_tex_pool_n(int n) { vt_set_pool_n(n); }
 static void reg_tex(int id, const tex_t *t, const view_t *v) { vt_reg_tex(id, t, v); }

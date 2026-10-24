@@ -167,11 +167,6 @@ static void expand_rgb(uint8_t *dst, const uint8_t *src, size_t texels, unsigned
 }
 
 static void upload(vtex *e, const tex_t *t) {
-    if (e->f.convert == 1) {
-        VK_ONCE("texture format %#x needs a conversion not written yet (24-bit depth): left blank", t->d.format);
-        e->uploaded = 1; e->stamp = nvn_dirty_now(); nvn_dirty_protect(t->mem, (size_t)t->L.size);
-        return;
-    }
     uint64_t t0 = pal_now_ns();
     g_uploads++; g_upload_bytes += t->L.size; if (e->uploaded) g_reuploads++;
     if (!nvn_dirty_tracked(t->mem, (size_t)t->L.size)) g_untracked++;
@@ -199,6 +194,16 @@ static void upload(vtex *e, const tex_t *t) {
                         VK_ONCE("ASTC %dx%d texture %ux%u did not decode: left blank", bw, bh, w, h);
                         memset(dst + (size_t)z * w * h * 4, 0, (size_t)w * h * 4);
                     }
+            } else if (e->f.convert == 1) {   /* 24-bit depth in the low bits of each 32-bit texel, stencil in the high byte: depth as float */
+                const uint32_t *src = (const uint32_t *)lin; float *df = (float *)dst;
+                for (size_t i = 0; i < n / 4; i++) df[i] = (float)(src[i] & 0xffffffu) * (1.0f / 16777215.0f);
+                if (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {   /* the stencil bytes are their own plane of the image */
+                    VkBuffer sb2; VkDeviceSize so2;
+                    uint8_t *sp = vk_stage(n / 4, 16, &sb2, &so2);
+                    for (size_t i = 0; i < n / 4; i++) sp[i] = (uint8_t)(src[i] >> 24);
+                    VkBufferImageCopy rs = {.bufferOffset = so2, .imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, lv, ly, 1}, .imageExtent = {w, h, d}};
+                    vkCmdCopyBufferToImage(c, sb2, e->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rs);
+                }
             } else if (e->f.convert == 2) {
                 int is_int = (t->d.format >= 0x1B && t->d.format <= 0x1C) || (t->d.format >= 0x20 && t->d.format <= 0x21) || (t->d.format >= 0x23 && t->d.format <= 0x24);
                 expand_rgb(dst, lin, (size_t)w * h * d, (unsigned)bpb / 3, is_int);
@@ -526,6 +531,70 @@ void vt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNco
     pthread_mutex_unlock(&vk_mu);
     vk_wait_done(f);   /* the staging memory stays until the completion thread moves past f, after this returns */
     for (int z = 0; z < nimg; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + (size_t)z * img + y * row, st + ((size_t)z * hb + y) * wb, wb);
+}
+
+/* ---------- write-back of rendered textures ----------
+   A texture in CPU-visible pool memory that the GPU rendered into lives in its image; the memory still holds what the
+   CPU or an upload put there. When the CPU invalidates a range of that memory (nvnMemoryPoolInvalidateMappedRange: it is
+   about to read what the GPU wrote), the rendering is read back and swizzled into the pool, unless the CPU wrote the
+   memory since the render (its bytes are newer). Of several textures over the same memory the newest wins. */
+typedef struct { tex_t t; uint64_t stamp; } wb_ent;
+static nvn_hmap g_wb = {.klen = 8};   /* by serial; vk_mu */
+static uint64_t g_wb_done, g_wb_skipped;
+void vt_note_rendered(const tex_t *t) {
+    if (!t || !t->serial || !tex_mirrored(t) || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return;
+    uint64_t k = t->serial;
+    wb_ent *e = nvn_hm_get(&g_wb, &k);
+    if (e && nvn_dirty_tracked(t->mem, (size_t)t->L.size) && !nvn_dirty_since(t->mem, (size_t)t->L.size, e->stamp)) { e->stamp = nvn_dirty_now(); return; }   /* untouched since: still protected */
+    if (!e) { e = malloc(sizeof *e); if (!e) return; nvn_hm_put(&g_wb, &k, e); }
+    e->t = *t; e->stamp = nvn_dirty_now();
+    nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* after the stamp: a CPU write from here on is seen */
+}
+static int wb_back(const tex_t *t) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    vk_fmt f; VkImageType type; uint32_t w, h, d, layers;
+    if (!bpb || bw != 1 || bh != 1 || !vk_fmt_of(t->d.format, &f) || f.convert || f.depth || f.stencil || t->d.samples > 1) return 0;
+    shape(t, &type, &w, &h, &d, &layers);
+    unsigned levels = t->d.levels ? t->d.levels : 1;
+    for (unsigned lv = 0; lv < levels; lv++) {
+        uint32_t lw = mip(w, lv), lh = type == VK_IMAGE_TYPE_1D ? 1 : mip(h, lv), ld = type == VK_IMAGE_TYPE_3D ? mip(d, lv) : 1;
+        size_t pitch = (size_t)lw * bpb, n = pitch * lh * ld;
+        uint8_t *lin = malloc(n);
+        if (!lin) return 0;
+        for (unsigned ly = 0; ly < layers; ly++) {
+            NVNcopyRegion r = {.width = (int)lw, .height = (int)lh, .depth = (int)ld};
+            vt_read_texels(t, lv, ly, &r, lin, pitch, pitch * lh);
+            if (nvn_swizzle(&t->d, lv, ly, lin, pitch, t->mem)) { free(lin); return 0; }
+        }
+        free(lin);
+    }
+    return 1;
+}
+void vt_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
+    if (!p || !p->mem) return;
+    const uint8_t *a = (const uint8_t *)p->mem + off, *z = a + n;
+    wb_ent *list[64]; int nl = 0;
+    pthread_mutex_lock(&vk_mu);
+    for (uint32_t i = 0; i < g_wb.cap && nl < 64; i++) {
+        wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
+        if (!e || (const uint8_t *)e->t.mem >= z || (const uint8_t *)e->t.mem + e->t.L.size <= a) continue;
+        uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   /* deletion shifts entries: rescan */
+    }
+    pthread_mutex_unlock(&vk_mu);
+    int fresh[64];
+    for (int i = 0; i < nl; i++) fresh[i] = !nvn_dirty_tracked(list[i]->t.mem, (size_t)list[i]->t.L.size) || !nvn_dirty_since(list[i]->t.mem, (size_t)list[i]->t.L.size, list[i]->stamp);
+    for (int i = 0; i < nl; i++) for (int j = 0; j < nl; j++)
+        if (i != j && fresh[i] && fresh[j] && list[j]->t.mem == list[i]->t.mem && list[j]->stamp > list[i]->stamp) { fresh[i] = 0; break; }   /* superseded */
+    for (int i = 0; i < nl; i++) {
+        const tex_t *t = &list[i]->t;
+        if (!fresh[i]) { g_wb_skipped++; free(list[i]); continue; }
+        void *tok = nvn_dirty_gpu_write_begin(t->mem, (size_t)t->L.size);   /* the GPU's bytes are not a CPU write */
+        int ok = wb_back(t);
+        nvn_dirty_gpu_write_end(tok);
+        if (ok) { if (++g_wb_done <= 4) VLOG("write-back: rendered texture %ux%u format %#x written to pool memory (%llu so far, %llu skipped: the CPU wrote since)", t->d.width, t->d.height, t->d.format, (unsigned long long)g_wb_done, (unsigned long long)g_wb_skipped); }
+        else VK_ONCE("write-back of texture %ux%u format %#x target %d failed: pool memory keeps its old bytes", t->d.width, t->d.height, t->d.format, t->d.target);
+        free(list[i]);
+    }
 }
 
 void vt_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {

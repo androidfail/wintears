@@ -22,11 +22,40 @@ static void do_event(void *arg) {
     if (e->mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += e->value; else *e->val = e->value;
     free(e);
 }
-typedef struct { uint64_t type, addr; } ctr_act;
+/* Samples passed (occlusion queries). NVN: a counter on the queue; ResetCounter zeroes it, every draw after adds to it,
+   ReportCounter writes the value at that point. Here every pass opened while counting has one occlusion query (a slot of
+   a ring); a reset starts a new list of slots (g_oq_start), a report ends the open pass and takes the list [from, to);
+   when the submission has completed the slots are summed. TOTK_OCCLUSION=0: every query says "visible" (diagnosis). */
+enum { OQ_N = 16384 };
+static VkQueryPool g_oq; static uint64_t g_oq_n, g_oq_start; static int g_oq_on, g_oq_open, g_oq_env = -1;
+static int oq_enabled(void) {
+    if (g_oq_env < 0) { const char *e = pal_getenv("TOTK_OCCLUSION"); g_oq_env = !(e && *e == '0'); }
+    return g_oq_env;
+}
+static int oq_make(void) {
+    if (g_oq) return 1;
+    VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION, .queryCount = OQ_N};
+    if (vkCreateQueryPool(vk_dev, &qi, NULL, &g_oq) != VK_SUCCESS) { g_oq = VK_NULL_HANDLE; g_oq_env = 0; VLOG("occlusion queries: no query pool, every query says visible"); return 0; }
+    return 1;
+}
+typedef struct { uint64_t type, addr, from, to; int real; } ctr_act;
+static uint64_t oq_sum(uint64_t from, uint64_t to) {
+    uint64_t n = to - from, sum = 0;
+    if (n > OQ_N) { from = to - OQ_N; n = OQ_N; }
+    uint64_t *r = malloc(n * sizeof *r);
+    for (uint64_t done = 0; r && done < n;) {   /* the ring wraps: at most two runs */
+        uint32_t s = (uint32_t)((from + done) % OQ_N); uint64_t k = n - done < OQ_N - s ? n - done : OQ_N - s;
+        if (vkGetQueryPoolResults(vk_dev, g_oq, s, (uint32_t)k, k * 8, r + done, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) break;
+        done += k;
+    }
+    for (uint64_t i = 0; r && i < n; i++) sum += r[i];
+    free(r);
+    return sum;
+}
 static void do_counter(void *arg) {
     ctr_act *c = arg;
-    /* NVNcounterData = {counter, timestamp}. Occlusion queries say "visible" until they are counted on the GPU. */
-    uint64_t rec[2] = {c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1u << 20 : 0, vk_ticks()};
+    /* NVNcounterData = {counter, timestamp}. Without counting on the GPU (never reset, or TOTK_OCCLUSION=0): "visible". */
+    uint64_t rec[2] = {c->real ? oq_sum(c->from, c->to) : c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1u << 20 : 0, vk_ticks()};
     dm_guest_write_prepare((void *)(uintptr_t)c->addr, sizeof rec);
     memcpy((void *)(uintptr_t)c->addr, rec, sizeof rec);
     free(c);
@@ -76,6 +105,7 @@ void vx_end_pass(void) {
     if (!g_pass) return;
     if (plog()) VLOG("[pass] %ux%u colors %d (%d %d) depth %d: %d draws, %d clears", S.pass_w, S.pass_h, S.pass_fmt.ncolor, (int)S.pass_fmt.color[0], (int)S.pass_fmt.color[1],
                      (int)S.pass_fmt.depth, g_pass_draws, g_pass_clears);
+    if (g_oq_open) { vkCmdEndQuery(vk_cmd(), g_oq, (uint32_t)((g_oq_n - 1) % OQ_N)); g_oq_open = 0; }
     vkCmdEndRendering(vk_cmd());
     if (g_pass_q != UINT32_MAX) {
         vkCmdWriteTimestamp2(vk_cmd(), VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_qp, g_pass_q + 1);
@@ -103,6 +133,7 @@ static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uin
         if (i >= S.rt.n || !S.rt.color[i]) continue;
         const view_t *v = S.rt.has_cview[i] ? &S.rt.cview[i] : NULL;
         if (!(col[i] = vt_get(S.rt.color[i]))) continue;
+        vt_note_rendered(S.rt.color[i]);
         if (!(cv[i] = vt_view(col[i], S.rt.color[i], v, VT_ATTACHMENT, VT_ANY_TYPE))) { col[i] = NULL; continue; }
         unsigned lv = v && v->set_levels ? v->base_level : 0; uint32_t a, b, c; vt_size(col[i], lv, &a, &b, &c);
         uint32_t nl = view_layers(v, vt_layers(col[i]));
@@ -155,6 +186,11 @@ static int begin_pass(void) {
     if (vk_passlog_on) g_pass_q = ptime_begin();
     vk_n_pass++;
     vkCmdBeginRendering(vk_cmd(), &ri);
+    if (g_oq_on) {   /* counting samples: this pass has its own query */
+        uint32_t q = (uint32_t)(g_oq_n++ % OQ_N);
+        vkResetQueryPool(vk_dev, g_oq, q, 1);
+        vkCmdBeginQuery(vk_cmd(), g_oq, q, 0); g_oq_open = 1;
+    }
     g_pass = 1;
     return 1;
 }
@@ -380,8 +416,19 @@ void vx_run(const uint8_t *p) {
             ev_act *e = malloc(sizeof *e); memcpy(&e->val, a, 8); memcpy(&e->mode, a + 8, 4); memcpy(&e->value, a + 12, 4);
             vk_after(do_event, e); break;
         }
-        case OP_REPORT_COUNTER: { ctr_act *c = malloc(sizeof *c); memcpy(&c->type, a, 8); memcpy(&c->addr, a + 8, 8); vk_after(do_counter, c); break; }
-        case OP_RESET_COUNTER: break;
+        case OP_REPORT_COUNTER: {
+            ctr_act *c = calloc(1, sizeof *c); memcpy(&c->type, a, 8); memcpy(&c->addr, a + 8, 8);
+            if (g_oq_on && c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { vx_end_pass(); c->real = 1; c->from = g_oq_start; c->to = g_oq_n; }   /* later draws do not count */
+            vk_after(do_counter, c); break;
+        }
+        case OP_RESET_COUNTER: {
+            uint64_t t; memcpy(&t, a, 8);
+            if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_enabled() && oq_make()) {
+                vx_end_pass();   /* draws before the reset are not part of the new count; the next pass starts with its own query */
+                g_oq_on = 1; g_oq_start = g_oq_n;
+            }
+            break;
+        }
         case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); copy_b2b(s, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, a + 16, n); break; }
         case OP_SET_RT: vx_end_pass(); memcpy(&S.rt, a, sizeof S.rt); S.has_rt = 1; break;

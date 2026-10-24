@@ -114,9 +114,14 @@ Not an option: getting game files from anywhere but the user's own dump.
      format's buffer features, not its image features, which made every format fall back to zeros; views at offsets the
      device cannot view in place are sampled from a copy), partial-mask clears (a colour clear with a channel mask and a
      stencil clear with a write mask are drawn with a write mask: `vk_clear.c`, shaders from
-     `tools/build_clear_shaders.py`). Not done yet: 24-bit depth uploads, writing rendered textures back to pool memory
-     (InvalidateMappedRange), occlusion queries (always "visible"), the instance divisor extension, physical pools
-     the driver cannot import (one 111 MiB pool), background shader translation, performance (full barriers between
+     `tools/build_clear_shaders.py`). Also done 2026-10-24 (not seen in play): depth to colour / other-depth texture
+     copies go through a buffer (Vulkan allows neither copy nor blit there); 24-bit depth uploads are converted to
+     float (`upload` in `vk_tex.c`); rendered textures in CPU-visible pools are written back on InvalidateMappedRange
+     (`vt_note_rendered` / `vt_pool_invalidate`; skipped when the CPU wrote the memory since the render); samples-passed
+     counters are real occlusion queries, one per pass while counting (`vk_exec.c`; `TOTK_OCCLUSION=0` makes every
+     query "visible" again). The game culls objects whose query reports 0 and scales effects by it, so a wrongly
+     missing object or glare is the first thing to try with that switch. Not done yet: the instance divisor extension,
+     physical pools the driver cannot import (one 111 MiB pool), background shader translation, performance (full barriers between
      passes, copies and dispatches, about 285 a frame; GENERAL layouts). Inline uniform updates (about 210 a frame) are
      renamed as upstream does (`vd_ub_update` in `vk_draw.c`; `TOTK_UB_RENAME=0` for A/B): passes no longer split at
      them, barriers per frame went from about 510 to 285.
