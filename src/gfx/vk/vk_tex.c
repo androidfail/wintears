@@ -55,6 +55,13 @@ static int tex_mirrored(const tex_t *t) {   /* upstream nvn_mtl.m tex_mirrored *
     return 1;
 }
 
+/* NVN compression (upstream nvn_mtl.m stor_compressed): a compressible texture in a compressible pool keeps its bytes when
+   it is cleared, the clear only sets the compression state, so a descriptor reading the same memory in another format does
+   not see the clear. One shared image would: a clear of an RGBA8 target to white turns the R32F linear depth that used to
+   live there into NaN, and the lighting and fog with it (upstream's frame-wide flashes). Such textures share an image only
+   with the same format or its sRGB / linear twin. TOTK_COMPRESSED_ALIAS=1 shares across formats (A/B). */
+static int stor_compressed(const tex_t *t) { return (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE); }
+static int compressed_alias_on(void) { static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_COMPRESSED_ALIAS"); on = e && atoi(e); } return on; }
 static int key_of(const tex_t *t, const vk_fmt *f, stor_key *k) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!t->mem || !t->L.size || !bpb) return 0;
@@ -63,7 +70,11 @@ static int key_of(const tex_t *t, const vk_fmt *f, stor_key *k) {
     k->w = t->d.width ? t->d.width : 1; k->h = t->d.height ? t->d.height : 1; k->d = t->d.depth ? t->d.depth : 1;
     k->levels = t->d.levels ? t->d.levels : 1; k->target = (uint32_t)t->d.target; k->samples = t->d.samples > 1 ? (uint32_t)t->d.samples : 1;
     /* format class: uncompressed colour by texel size, everything else by format */
-    k->cls = bw == 1 && bh == 1 && !f->depth && !f->stencil && !f->convert ? 0x1000u + (uint32_t)bpb : (uint32_t)t->d.format;
+    int plain = bw == 1 && bh == 1 && !f->depth && !f->stencil && !f->convert;
+    if (plain && stor_compressed(t) && !compressed_alias_on()) {   /* the format, with the sRGB twin counted as the same */
+        VkFormat v = f->vk == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : f->vk == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : f->vk;
+        k->cls = 0x2000u + (uint32_t)v;
+    } else k->cls = plain ? 0x1000u + (uint32_t)bpb : (uint32_t)t->d.format;
     return 1;
 }
 
@@ -141,6 +152,13 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
         free(e); return NULL;
     }
     e->mirrored = tex_mirrored(t);
+    { static int near;   /* diagnostic: another layout already lives at this memory (the first 12): on hardware both descriptors read the same bytes */
+      for (uint32_t i = 0; near < 12 && i < g_by_stor.cap; i++) {
+          const vtex *o = g_by_stor.vals[i];
+          if (o && o->k.mem == k->mem && o->k.size == k->size) { near++;
+              VLOG("storage %p (%llu bytes): %ux%ux%u lv%u target %u samples %u class %#x (NVN format %#x, flags %#x) beside an existing %ux%ux%u lv%u target %u samples %u class %#x",
+                   (void *)(uintptr_t)k->mem, (unsigned long long)k->size, k->w, k->h, k->d, k->levels, k->target, k->samples, k->cls, t->d.format, t->d.flags,
+                   o->k.w, o->k.h, o->k.d, o->k.levels, o->k.target, o->k.samples, o->k.cls); break; } } }
     init_layout(e);
     g_images++; g_image_bytes += t->L.size;
     nvn_hm_put(&g_by_stor, k, e);
