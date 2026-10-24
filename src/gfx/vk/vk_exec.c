@@ -289,6 +289,11 @@ static void copy_t2b(const p_copy_b2t *c) {   /* the T2B record: tex is the sour
     vkCmdCopyImageToBuffer(vk_cmd(), vt_image(e), VK_IMAGE_LAYOUT_GENERAL, db, 1, &r);
     vk_barrier(vk_cmd());
 }
+/* bytes of one texel as a buffer copy sees it (the depth aspect of a depth image: 2 for D16, else 4); *block = texels per block row */
+static int texel_bytes(const vtex *e, const tex_t *t, int *block, int *bh) {
+    if (vt_depth(e)) { *block = *bh = 1; return vt_vkformat(e) == VK_FORMAT_D16_UNORM ? 2 : 4; }
+    return nvn_fmt_bpb(t->d.format, block, bh);
+}
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = c->src ? vt_get(c->src) : NULL, *d = c->dst ? vt_get(c->dst) : NULL;
     if (plog()) VLOG("[pass] copy %ux%u fmt %#x -> %ux%u fmt %#x (%s %s)", c->src ? c->src->d.width : 0, c->src ? c->src->d.height : 0, c->src ? c->src->d.format : 0,
@@ -299,6 +304,26 @@ static void copy_t2t(const p_copy_t2t *c) {
     region(d, &c->dr, view_level(&c->dv, c->has_dv), view_layer(&c->dv, c->has_dv), &ds, &dof, &dx);
     vx_end_pass();
     int same = sx.width == dx.width && sx.height == dx.height && sx.depth == dx.depth && !(c->flags & (NVN_COPY_FLAGS_MIRROR_X_BIT | NVN_COPY_FLAGS_MIRROR_Y_BIT | NVN_COPY_FLAGS_MIRROR_Z_BIT));
+    /* depth <-> colour (the game copies depth into an R32F texture) or two different depth formats: Vulkan allows neither a
+       copy nor a blit there, so the depth aspect goes through a buffer (same texel size on both sides, bit for bit) */
+    if (same && (vt_depth(s) || vt_depth(d)) && vt_vkformat(s) != vt_vkformat(d)) {
+        int bw, bh, bd, bs = texel_bytes(s, c->src, &bw, &bh), bt = texel_bytes(d, c->dst, &bd, &bh);
+        if (bs && bs == bt && bw == 1 && bd == 1) {
+            uint32_t layers = ss.layerCount < ds.layerCount ? ss.layerCount : ds.layerCount;
+            ss.layerCount = ds.layerCount = layers;
+            VkBuffer sb; VkDeviceSize so2;
+            vk_stage((VkDeviceSize)sx.width * sx.height * sx.depth * layers * (unsigned)bs, 16, &sb, &so2);
+            VkBufferImageCopy out = {.bufferOffset = so2, .imageSubresource = ss, .imageOffset = so, .imageExtent = sx};
+            VkBufferImageCopy in = {.bufferOffset = so2, .imageSubresource = ds, .imageOffset = dof, .imageExtent = dx};
+            vkCmdCopyImageToBuffer(vk_cmd(), vt_image(s), VK_IMAGE_LAYOUT_GENERAL, sb, 1, &out);
+            vk_barrier(vk_cmd());
+            vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &in);
+            vk_barrier(vk_cmd());
+            vt_written(d);
+            return;
+        }
+        VK_ONCE("copy between formats %#x and %#x (depth involved, texel sizes %d / %d): not possible, left to the blit", c->src->d.format, c->dst->d.format, bs, bt);
+    }
     if (same && (vt_vkformat(s) == vt_vkformat(d) || (!vt_depth(s) && !vt_depth(d) && !vk_fmt_block_compressed(vt_vkformat(s)) && !vk_fmt_block_compressed(vt_vkformat(d))))) {
         if (ds.layerCount != ss.layerCount) ds.layerCount = ss.layerCount = ss.layerCount < ds.layerCount ? ss.layerCount : ds.layerCount;
         VkImageCopy r = {ss, so, ds, dof, sx};
