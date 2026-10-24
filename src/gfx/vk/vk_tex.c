@@ -9,8 +9,9 @@
    buffer) take their bytes from pool memory: uploaded at first use, and again at the first use in a submission after
    the dirty tracker saw a write to their pages. A texture the GPU writes is owned by the GPU from then on.
 
-   shortcut: images unused for 600 submissions are dropped, GPU-rendered content too (upstream keeps them while a
-   texture object holds them); upgrade with per-serial references if a long-lived render target loses its content. */
+   Images unused for 600 submissions are dropped, except those whose content cannot be made again (rendered or copied
+   into by the GPU) while a texture object still refers to them (upstream: while a serial holds the storage). Dropping
+   those left a menu background, or a sky rendered once, blank when it was used again. */
 #include "gfx/vk/vk.h"
 #include "nvn_deswizzle.h"
 #include "nvn_dirty.h"
@@ -30,6 +31,7 @@ struct vtex {
     view_ent *views; int nviews, cviews;
 };
 static nvn_hmap g_by_stor = {.klen = sizeof(stor_key)};
+static nvn_hmap g_ser = {.klen = 8};   /* texture object (serial) -> the stor_key of the image it last used (vk_mu) */
 
 static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
 static int fmt_depth(int f) { return f >= 0x31 && f <= 0x36; }
@@ -247,6 +249,9 @@ vtex *vt_get(const tex_t *t) {
     if (!e && !(e = create(t, &f, &k))) return NULL;
     uint64_t sub = vk_sub_serial();
     e->used_sub = sub;
+    { stor_key *held = nvn_hm_get(&g_ser, &t->serial);
+      if (!held) { held = malloc(sizeof *held); if (held) { *held = e->k; nvn_hm_put(&g_ser, &t->serial, held); } }
+      else if (memcmp(held, &e->k, sizeof *held)) *held = e->k; }
     if (e->mirrored && !e->owned && e->checked_sub != sub) {
         e->checked_sub = sub;
         if (!e->uploaded || nvn_dirty_since(t->mem, (size_t)t->L.size, e->stamp)) upload(e, t);
@@ -325,7 +330,11 @@ VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int mode, VkImageV
 }
 
 /* ---------- lifetime ---------- */
-void vt_release_serial(uint64_t serial) { (void)serial; }
+void vt_release_serial(uint64_t serial) {   /* the texture object is finalised: its image may go when idle */
+    pthread_mutex_lock(&vk_mu);
+    free(nvn_hm_del(&g_ser, &serial));
+    pthread_mutex_unlock(&vk_mu);
+}
 
 static void drop_where(int (*pred)(const vtex *, const void *), const void *arg, int deferred) {
     vtex *gone[256]; int n;
@@ -415,7 +424,13 @@ VkBufferView vt_texel_view_copy(const tex_t *t) {
     VK_ONCE("buffer texture (fmt %#x) at an offset not %u-byte aligned for a view: sampled from a copy made at each bind", (unsigned)t->d.format, al);
     return nv;
 }
-static int idle(const vtex *e, const void *arg) { return e->used_sub + 600 < *(const uint64_t *)arg; }
+typedef struct { uint64_t now; nvn_hmap held; } idle_arg;   /* held: the keys of the images texture objects still refer to */
+static int idle(const vtex *e, const void *arg) {
+    const idle_arg *a = arg;
+    if (e->used_sub + 600 >= a->now) return 0;
+    if (e->mirrored && !e->owned) return 1;   /* its bytes are in pool memory: uploaded again when needed */
+    return !nvn_hm_get(&a->held, &e->k);
+}
 void vt_end_submission(void) {
     uint64_t now = vk_sub_serial();
     static uint64_t last_log;
@@ -429,7 +444,10 @@ void vt_end_submission(void) {
         g_uploads = g_reuploads = g_untracked = g_upload_bytes = g_upload_ns = 0;
     }
     if (now % 64) return;
-    drop_where(idle, &now, 0);   /* unused for 600 submissions: no submission in flight uses them */
+    idle_arg a = {now, {.klen = sizeof(stor_key)}};
+    for (uint32_t i = 0; i < g_ser.cap; i++) if (g_ser.vals[i]) nvn_hm_put(&a.held, g_ser.vals[i], (void *)1);
+    drop_where(idle, &a, 0);   /* unused for 600 submissions: no submission in flight uses them */
+    free(a.held.keys); free(a.held.vals);
 }
 
 /* ---------- texture / sampler pool slots ---------- */
