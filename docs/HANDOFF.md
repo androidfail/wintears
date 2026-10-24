@@ -123,7 +123,15 @@ Not an option: getting game files from anywhere but the user's own dump.
      missing object or glare is the first thing to try with that switch. Also done (not seen in play): instance divisors above 1
      (VK_EXT_vertex_attribute_divisor, enabled when the GPU has it), a pipeline cache kept in `<profile>/pipeline-cache.bin`
      (`vk_draw.c`), and a log line saying why a pool could not be imported (`vk_winmem.c` describes the memory; a no-access
-     placeholder page in a virtual pool is the first suspect). Not done yet: pools the driver cannot import (one 111 MiB pool), background shader translation (the translation depends on state known only at the draw, so it cannot start earlier), performance (full barriers between
+     placeholder page in a virtual pool is the first suspect). Texture / image fixes found by comparing with upstream's notes (2026-10-24, not seen in play; the
+     first three are the best candidates for the sky island haze, the black-void scenes and the blue menus): compressible
+     textures share an image only with their own format (`stor_compressed`: a white clear of an RGBA8 target no longer
+     turns the R32F linear depth that lived there into NaN; `TOTK_COMPRESSED_ALIAS=1` for A/B); images the GPU wrote stay
+     while a texture object or a texture-pool descriptor still names them (they were dropped, and came back blank, after
+     600 idle submissions); passes use the attachment view's format (an sRGB view of a linear image rendered with the
+     image's format); BC textures can be rendered into through a one-texel-per-block view (BC4 as RGBA16UI);
+     texture clears of an sRGB / linear twin convert the value. The log prints the first layouts that alias one memory
+     range (`storage ... beside an existing ...`). Not done yet: pools the driver cannot import (one 111 MiB pool), background shader translation (the translation depends on state known only at the draw, so it cannot start earlier), performance (full barriers between
      passes, copies and dispatches, about 285 a frame; GENERAL layouts). Inline uniform updates (about 210 a frame) are
      renamed as upstream does (`vd_ub_update` in `vk_draw.c`; `TOTK_UB_RENAME=0` for A/B): passes no longer split at
      them, barriers per frame went from about 510 to 285.
@@ -137,7 +145,7 @@ Not an option: getting game files from anywhere but the user's own dump.
    - **Host tests**: guest programs (`tests/guest`) that exercise the sync svcs (mutex hand-off, condition variable
      order, address arbiter, events, WaitSynchronization timeouts) on several threads.
    - **Frontend** still to do: rumble, gyro, the software keyboard, a controller layout file.
-   - `long` is 32-bit on Windows: audit reused code (~540 plain `long`/`unsigned long` uses) as files are ported.
+   - `long` is 32-bit on Windows: audited 2026-10-24 over `src/` and the upstream files that are compiled (`ipc.c`, audio, `nvn_tex.c`, `nvn_deswizzle.c`): the only uses left are `strtol` results, `timespec` and error codes, none holds a guest value.
 
 ## Building and testing
 
