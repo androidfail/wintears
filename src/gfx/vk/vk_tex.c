@@ -435,6 +435,7 @@ VkBufferView vt_texel_view_copy(const tex_t *t) {
     VK_ONCE("buffer texture (fmt %#x) at an offset not %u-byte aligned for a view: sampled from a copy made at each bind", (unsigned)t->d.format, al);
     return nv;
 }
+static void held_by_slots(nvn_hmap *held);   /* below: the images the texture pool's descriptors name */
 typedef struct { uint64_t now; nvn_hmap held; } idle_arg;   /* held: the keys of the images texture objects still refer to */
 static int idle(const vtex *e, const void *arg) {
     const idle_arg *a = arg;
@@ -457,6 +458,7 @@ void vt_end_submission(void) {
     if (now % 64) return;
     idle_arg a = {now, {.klen = sizeof(stor_key)}};
     for (uint32_t i = 0; i < g_ser.cap; i++) if (g_ser.vals[i]) nvn_hm_put(&a.held, g_ser.vals[i], (void *)1);
+    held_by_slots(&a.held);   /* a descriptor can outlive the texture object it was made from */
     drop_where(idle, &a, 0);   /* unused for 600 submissions: no submission in flight uses them */
     free(a.held.keys); free(a.held.vals);
 }
@@ -464,6 +466,12 @@ void vt_end_submission(void) {
 /* ---------- texture / sampler pool slots ---------- */
 typedef struct { tex_t t; view_t v; uint8_t has_v, ok; } treg;
 static treg *g_treg; static int g_ntreg;
+static void held_by_slots(nvn_hmap *held) {
+    for (int i = 0; i < g_ntreg; i++) {
+        vk_fmt f; stor_key k;
+        if (g_treg[i].ok && g_treg[i].t.serial && vk_fmt_of(g_treg[i].t.d.format, &f) && key_of(&g_treg[i].t, &f, &k)) nvn_hm_put(held, &k, (void *)1);
+    }
+}
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static int g_nsreg;
 static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
 static nvn_hmap g_samplers = {.klen = sizeof(samp_par)};
