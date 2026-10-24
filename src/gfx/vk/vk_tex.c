@@ -142,6 +142,7 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     if (!f->depth && !f->stencil) fl |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     if (e->type == VK_IMAGE_TYPE_2D && e->layers >= 6 && e->w == e->h && k->samples == 1) fl |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (e->type == VK_IMAGE_TYPE_3D) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
+    if (vk_fmt_block_compressed(e->fmt) && !f->depth && !f->stencil) fl |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;   /* rendering into blocks through a one-texel-per-block view */
     e->flags = fl;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = fl, .imageType = e->type, .format = e->fmt,
         .extent = {e->w, e->h, e->d}, .mipLevels = e->levels, .arrayLayers = e->layers, .samples = (VkSampleCountFlagBits)k->samples,
@@ -276,18 +277,28 @@ static VkComponentSwizzle sel(unsigned s, const VkComponentSwizzle fmt[4]) {
 }
 
 uint32_t vt_samples(const vtex *e) { return e->k.samples; }
+VkFormat vt_last_vfmt;
+int vt_block_view(const vtex *e, const tex_t *t, const view_t *v, int *bw, int *bh) {
+    if (!vk_fmt_block_compressed(e->fmt)) return 0;
+    int format = v && v->set_format ? v->format : t->d.format;
+    vk_fmt f; int b2, b3, cb = nvn_fmt_bpb(t->d.format, bw, bh), vb = nvn_fmt_bpb(format, &b2, &b3);
+    if (!vk_fmt_of(format, &f) || vk_fmt_block_compressed(f.vk) || f.depth || f.stencil || f.convert) return 0;
+    return cb && vb == cb && b2 == 1 && b3 == 1 && (*bw > 1 || *bh > 1);
+}
 VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int mode, VkImageViewType want) {
     int attachment = mode == VT_ATTACHMENT;
     view_key k; memset(&k, 0, sizeof k);
     int format = v && v->set_format ? v->format : t->d.format, target = v && v->set_target ? v->target : t->d.target;
     vk_fmt f;
-    if (!vk_fmt_of(format, &f) || (f.vk != e->fmt && (e->f.depth || e->f.stencil || e->f.convert || f.convert || vk_fmt_block_compressed(e->fmt)))) f = e->f;
-    k.f = f.vk;
+    int bw0, bh0, blockview = vt_block_view(e, t, v, &bw0, &bh0);
+    if (!vk_fmt_of(format, &f) || (f.vk != e->fmt && (e->f.depth || e->f.stencil || e->f.convert || f.convert || (vk_fmt_block_compressed(e->fmt) && !blockview)))) f = e->f;
+    k.f = f.vk; vt_last_vfmt = f.vk;
     k.base_level = v && v->set_levels ? v->base_level : 0;
     k.levels = attachment ? 1 : v && v->set_levels && v->nlevels ? v->nlevels : e->levels - k.base_level;
     k.base_layer = v && v->set_layers ? v->min_layer : 0;
     k.layers = v && v->set_layers && v->nlayers ? v->nlayers : e->layers - k.base_layer;
-    if (mode == VT_STORAGE) k.levels = 1;
+    if (mode == VT_STORAGE || blockview) k.levels = 1;
+    if (blockview) k.layers = 1;   /* a view of blocks as texels covers one level and one layer */
     if (k.base_level >= e->levels) k.base_level = e->levels - 1;
     if (k.base_level + k.levels > e->levels) k.levels = e->levels - k.base_level;
     if (k.base_layer >= e->layers) k.base_layer = e->layers - 1;

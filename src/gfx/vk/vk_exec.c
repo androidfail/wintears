@@ -6,6 +6,8 @@
    first. What the CPU sees of the GPU (event values, counter reports) happens on the completion thread once the
    submission is done, in recording order. The state (targets, bindings) carries over between submissions, as on the
    GPU's one queue. */
+#include <math.h>
+
 #include "gfx/vk/vk.h"
 #include "vk_draw.h"
 
@@ -126,7 +128,7 @@ static uint32_t view_layers(const view_t *v, uint32_t total) {
     uint32_t n = v && v->set_layers && v->nlayers ? v->nlayers : total - first;
     return n > total - first ? total - first : n;
 }
-static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uint32_t *w, uint32_t *h, uint32_t *layers) {
+static int targets(vtex **col, VkImageView *cv, VkFormat *cf, vtex **dep, VkImageView *dv, uint32_t *w, uint32_t *h, uint32_t *layers) {
     *w = *h = UINT32_MAX; *layers = UINT32_MAX; int any = 0;
     for (int i = 0; i < 8; i++) {
         col[i] = NULL; cv[i] = VK_NULL_HANDLE;
@@ -135,7 +137,9 @@ static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uin
         if (!(col[i] = vt_get(S.rt.color[i]))) continue;
         vt_note_rendered(S.rt.color[i]);
         if (!(cv[i] = vt_view(col[i], S.rt.color[i], v, VT_ATTACHMENT, VT_ANY_TYPE))) { col[i] = NULL; continue; }
+        cf[i] = vt_last_vfmt;
         unsigned lv = v && v->set_levels ? v->base_level : 0; uint32_t a, b, c; vt_size(col[i], lv, &a, &b, &c);
+        { int bw, bh; if (vt_block_view(col[i], S.rt.color[i], v, &bw, &bh)) { a = (a + (uint32_t)bw - 1) / (uint32_t)bw; b = (b + (uint32_t)bh - 1) / (uint32_t)bh; } }
         uint32_t nl = view_layers(v, vt_layers(col[i]));
         *w = a < *w ? a : *w; *h = b < *h ? b : *h; *layers = nl < *layers ? nl : *layers;
         any = 1;
@@ -157,8 +161,8 @@ static int targets(vtex **col, VkImageView *cv, vtex **dep, VkImageView *dv, uin
 /* Open a pass on the current targets; 0 when there is nothing to render into. */
 static int begin_pass(void) {
     if (g_pass) return 1;
-    vtex *col[8], *dep; VkImageView cv[8], dv; uint32_t w, h, layers;
-    if (!S.has_rt || !targets(col, cv, &dep, &dv, &w, &h, &layers)) return 0;
+    vtex *col[8], *dep; VkImageView cv[8], dv; VkFormat cf[8] = {0}; uint32_t w, h, layers;
+    if (!S.has_rt || !targets(col, cv, cf, &dep, &dv, &w, &h, &layers)) return 0;
     VkRenderingAttachmentInfo ca[8], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sa;
     int n = S.rt.n < 8 ? S.rt.n : 8;
     for (int i = 0; i < n; i++) {
@@ -177,7 +181,7 @@ static int begin_pass(void) {
                           .colorAttachmentCount = (uint32_t)n, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
     S.pass_fmt.ncolor = n;
-    for (int i = 0; i < 8; i++) S.pass_fmt.color[i] = i < n && col[i] ? vt_vkformat(col[i]) : VK_FORMAT_UNDEFINED;
+    for (int i = 0; i < 8; i++) S.pass_fmt.color[i] = i < n && col[i] ? cf[i] : VK_FORMAT_UNDEFINED;
     S.pass_fmt.depth = has_d ? vt_vkformat(dep) : VK_FORMAT_UNDEFINED;
     S.pass_fmt.stencil = has_s ? vt_vkformat(dep) : VK_FORMAT_UNDEFINED;
     S.pass_w = w; S.pass_h = h; S.pass_samples = 1;
@@ -377,6 +381,9 @@ static void copy_t2t(const p_copy_t2t *c) {
     vk_barrier(vk_cmd());
     vt_written(d);
 }
+static int is_srgb(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB; }
+static float srgb_enc(float x) { x = x < 0 ? 0 : x > 1 ? 1 : x; return x <= 0.0031308f ? x * 12.92f : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f; }
+static float srgb_dec(float x) { x = x < 0 ? 0 : x > 1 ? 1 : x; return x <= 0.04045f ? x / 12.92f : powf((x + 0.055f) / 1.055f, 2.4f); }
 static void clear_tex(const p_clear_tex *c) {
     vtex *e = c->tex ? vt_get(c->tex) : NULL;
     if (!e || vt_depth(e) || vk_fmt_block_compressed(vt_vkformat(e))) return;
@@ -388,6 +395,9 @@ static void clear_tex(const p_clear_tex *c) {
     if (o.x || o.y || x.width < w || x.height < h) VK_ONCE("partial texture clear (%ux%u of %ux%u): the whole level is cleared for now", x.width, x.height, w, h);
     vx_end_pass();
     VkClearColorValue v; memcpy(&v, c->c.u, 16);
+    { vk_fmt tf;   /* an sRGB texture object over an image made as its linear twin (or the reverse): the clear is of the object's format, the image clears raw */
+      if (vk_fmt_of(c->tex->d.format, &tf) && is_srgb(tf.vk) != is_srgb(vt_vkformat(e)) && (is_srgb(tf.vk) || is_srgb(vt_vkformat(e))))
+          for (int i = 0; i < 3; i++) v.float32[i] = is_srgb(tf.vk) ? srgb_enc(v.float32[i]) : srgb_dec(v.float32[i]); }
     VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, sub.baseArrayLayer, sub.layerCount};
     vkCmdClearColorImage(vk_cmd(), vt_image(e), VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
     vk_barrier(vk_cmd());

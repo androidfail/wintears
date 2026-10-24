@@ -92,6 +92,10 @@ uint32_t vt_layers(const vtex *e);
 enum { VT_SAMPLED, VT_ATTACHMENT, VT_STORAGE };
 #define VT_ANY_TYPE VK_IMAGE_VIEW_TYPE_MAX_ENUM
 VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int mode, VkImageViewType want);
+extern VkFormat vt_last_vfmt;   /* the format of the view vt_view returned last (a pass renders in the view's format, not the image's) */
+/* A view of a block-compressed image whose texel is one block (BC4 as RGBA16UI: the game renders into BC textures this way):
+   1 and the block size in texels in *bw / *bh; its extent is the image's in blocks. */
+int vt_block_view(const vtex *e, const tex_t *t, const view_t *v, int *bw, int *bh);
 uint32_t vt_samples(const vtex *e);
 void vt_release_serial(uint64_t serial);
 void vt_pool_gone(uintptr_t lo, uintptr_t hi);   /* images over a finalised pool */
