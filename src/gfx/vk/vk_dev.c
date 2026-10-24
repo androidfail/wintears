@@ -106,14 +106,25 @@ static int create_device(void) {
     VkPhysicalDeviceVulkan13Features f13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features f12 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &f13};
     VkPhysicalDeviceVulkan11Features f11 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &f12};
+    /* instance divisors above 1 (an extension on a 1.3 device): enabled when the GPU has it */
+    uint32_t nex = 0; vkEnumerateDeviceExtensionProperties(vk_phys, NULL, &nex, NULL);
+    VkExtensionProperties *ex = malloc((nex ? nex : 1) * sizeof *ex); vkEnumerateDeviceExtensionProperties(vk_phys, NULL, &nex, ex);
+    int has_div = has_ext(ex, nex, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+    free(ex);
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dvf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+    if (has_div) f13.pNext = &dvf;
     VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
     vkGetPhysicalDeviceFeatures2(vk_phys, &f);
+    vk_divisor = has_div && dvf.vertexAttributeInstanceRateDivisor;
+    const char *dev_ext[NDEV_EXT + 1]; memcpy(dev_ext, DEV_EXT, sizeof DEV_EXT);
+    uint32_t ndev_ext = NDEV_EXT;
+    if (vk_divisor) dev_ext[ndev_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     f.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE;
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) { VLOG("the GPU lacks dynamic rendering / synchronization2 / timeline semaphores"); return -1; }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = vk_qfam, .queueCount = 1, .pQueuePriorities = &prio};
     VkDeviceCreateInfo ci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qi,
-                             .enabledExtensionCount = NDEV_EXT, .ppEnabledExtensionNames = DEV_EXT};
+                             .enabledExtensionCount = ndev_ext, .ppEnabledExtensionNames = dev_ext};
     VkResult r = vkCreateDevice(vk_phys, &ci, NULL, &vk_dev);
     if (r != VK_SUCCESS) { VLOG("vkCreateDevice failed (%d)", (int)r); return -1; }
     volkLoadDevice(vk_dev);
@@ -145,17 +156,24 @@ static pidx g_imports;               /* sorted by address, key = import_t * */
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_pool_n, g_import_n;
 
+void vk_describe_range(uintptr_t lo, uintptr_t hi, char *out, size_t cap);   /* vk_winmem.c */
+static import_t *import_fail(uintptr_t lo, uintptr_t hi, const char *step, int r) {   /* why a range cannot be imported, for the first few */
+    static int n; char what[200];
+    if (n++ < 4) { vk_describe_range(lo, hi, what, sizeof what); VLOG("import of %p..%p (%.1f MiB) failed at %s (%d): %s", (void *)lo, (void *)hi, (hi - lo) / 1048576.0, step, r, what); }
+    return NULL;
+}
 static import_t *import_range(uintptr_t lo, uintptr_t hi) {
     VkMemoryHostPointerPropertiesEXT hp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-    if (vkGetMemoryHostPointerPropertiesEXT(vk_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)lo, &hp) != VK_SUCCESS || !hp.memoryTypeBits)
-        return NULL;
+    VkResult hr = vkGetMemoryHostPointerPropertiesEXT(vk_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)lo, &hp);
+    if (hr != VK_SUCCESS || !hp.memoryTypeBits) return import_fail(lo, hi, "host pointer properties", (int)hr);
     VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = hi - lo, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                  VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
     VkBuffer buf;
-    if (vkCreateBuffer(vk_dev, &bi, NULL, &buf) != VK_SUCCESS) return NULL;
+    VkResult br = vkCreateBuffer(vk_dev, &bi, NULL, &buf);
+    if (br != VK_SUCCESS) return import_fail(lo, hi, "buffer", (int)br);
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(vk_dev, buf, &req);
     VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(vk_phys, &mp);
     uint32_t type = UINT32_MAX, bits = hp.memoryTypeBits & req.memoryTypeBits;
@@ -166,8 +184,10 @@ static import_t *import_range(uintptr_t lo, uintptr_t hi) {
                                            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = (void *)lo};
     VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = hi - lo, .memoryTypeIndex = type};
     VkDeviceMemory mem;
-    if (type == UINT32_MAX || vkAllocateMemory(vk_dev, &mi, NULL, &mem) != VK_SUCCESS) { vkDestroyBuffer(vk_dev, buf, NULL); return NULL; }
-    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) { vkFreeMemory(vk_dev, mem, NULL); vkDestroyBuffer(vk_dev, buf, NULL); return NULL; }
+    VkResult ar = type == UINT32_MAX ? VK_ERROR_FEATURE_NOT_PRESENT : vkAllocateMemory(vk_dev, &mi, NULL, &mem);
+    if (ar != VK_SUCCESS) { vkDestroyBuffer(vk_dev, buf, NULL); return import_fail(lo, hi, type == UINT32_MAX ? "memory type" : "allocate", (int)ar); }
+    VkResult bind = vkBindBufferMemory(vk_dev, buf, mem, 0);
+    if (bind != VK_SUCCESS) { vkFreeMemory(vk_dev, mem, NULL); vkDestroyBuffer(vk_dev, buf, NULL); return import_fail(lo, hi, "bind", (int)bind); }
     import_t *im_ = calloc(1, sizeof *im_);
     *im_ = (import_t){lo, hi, mem, buf, 0};
     pidx_ent e = {lo, hi, lo, im_, 0, im_, 0};
@@ -411,6 +431,7 @@ static void prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock
 static void window_tex(uint64_t serial) { (void)serial; }
 
 uint32_t vk_texel_align[2] = {16, 16}, vk_texel_single[2];
+int vk_divisor;
 uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_ubflush, vk_n_barrier;
 static uint64_t g_sub_max;
 static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;
@@ -434,6 +455,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
+        vd_pcache_save();
         g_sh_bytes = 0; g_sub_max = vk_ns_xlate = vk_ns_pipe = vk_ns_tex = vk_n_pass = vk_n_ubo = vk_n_ubflush = vk_n_barrier = 0;
     }
     static int said; if (!said++) VLOG("first submission (%d command lists)", n);

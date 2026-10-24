@@ -38,6 +38,8 @@ extern VmaAllocator vk_vma;
 extern VkPhysicalDeviceProperties vk_props;
 /* texel buffer views (Vulkan 1.3 texelBufferAlignment): offset alignment in bytes, and whether a texel's own size is enough, for uniform [0] / storage [1] */
 extern uint32_t vk_texel_align[2], vk_texel_single[2];
+extern VkPipelineCache vk_pcache;   /* vk_draw.c: kept in the profile between runs */
+extern int vk_divisor;   /* VK_EXT_vertex_attribute_divisor is enabled: instance divisors above 1 */
 extern VkSurfaceKHR vk_surface;
 
 /* vk_dev.c ------------------------------------------------------------------------------------------------------ */

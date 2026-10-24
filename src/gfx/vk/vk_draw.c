@@ -459,7 +459,7 @@ typedef struct {
 } gp_key;
 static nvn_hmap g_pipes = {.klen = sizeof(gp_key)};
 static nvn_hmap g_cpipes = {.klen = sizeof(void *)};
-static uint64_t g_pipe_n;
+static uint64_t g_pipe_n, g_cpipe_n;
 
 static VkBlendFactor bfac(unsigned f) {
     switch (f) {
@@ -578,7 +578,7 @@ static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, in
         .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cbs, .pDynamicState = &dy, .layout = lay};
     uint64_t t0 = pal_now_ns();
-    VkResult r = vkCreateGraphicsPipelines(vk_dev, VK_NULL_HANDLE, 1, &ci, NULL, &p);
+    VkResult r = vkCreateGraphicsPipelines(vk_dev, vk_pcache, 1, &ci, NULL, &p);
     if (r != VK_SUCCESS) { VLOG("pipeline for %s + %s not created (%d)", vs->name, fs ? fs->name : "-", (int)r); p = VK_NULL_HANDLE; }
     vk_ns_pipe += pal_now_ns() - t0;
     nvn_hm_put(&g_pipes, &k, p ? (void *)p : (void *)1);   /* 1 = failed: not tried again */
@@ -748,7 +748,7 @@ void vd_dispatch(const p_dispatch *d) {
         VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = cs->mod, .pName = "main"}, .layout = lay};
         uint64_t t0 = pal_now_ns();
-        VkResult r = vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &ci, NULL, &p);
+        VkResult r = vkCreateComputePipelines(vk_dev, vk_pcache, 1, &ci, NULL, &p); g_cpipe_n++;
         vk_ns_pipe += pal_now_ns() - t0;
         if (r != VK_SUCCESS) { VLOG("compute pipeline for %s not created (%d)", cs->name, (int)r); p = (VkPipeline)1; }
         nvn_hm_put(&g_cpipes, &cs, (void *)p);
@@ -761,10 +761,45 @@ void vd_dispatch(const p_dispatch *d) {
     vk_barrier(c);
 }
 
+/* ---------- pipeline cache ----------
+   Kept in <profile>/pipeline-cache.bin between runs (the driver ignores data from another driver version or GPU), so a
+   pipeline made in an earlier run costs a lookup. Saved from the 10 s log tick when new pipelines were made, at most once a minute. */
+VkPipelineCache vk_pcache;
+static char g_pc_path[1100]; static uint64_t g_pc_seen, g_pc_last;
+static void pcache_init(void) {
+    snprintf(g_pc_path, sizeof g_pc_path, "%s/pipeline-cache.bin", host_profile_dir());
+    void *data = NULL; int64_t size = 0;
+    pal_file *f = pal_file_open(g_pc_path, PAL_FILE_READ);
+    if (f) {
+        size = pal_file_size(f); data = size > 0 ? malloc((size_t)size) : NULL;
+        if (data && pal_file_pread(f, data, (size_t)size, 0) != size) { free(data); data = NULL; size = 0; }
+        pal_file_close(f);
+    }
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = data ? (size_t)size : 0, .pInitialData = data};
+    if (vkCreatePipelineCache(vk_dev, &ci, NULL, &vk_pcache) != VK_SUCCESS) { vk_pcache = VK_NULL_HANDLE; VLOG("pipeline cache not created"); }
+    else if (data) VLOG("pipeline cache: %.1f MiB read", size / 1048576.0);
+    free(data);
+}
+void vd_pcache_save(void) {
+    uint64_t made = g_pipe_n + g_cpipe_n, now = pal_now_ns();
+    if (!vk_pcache || made == g_pc_seen || now - g_pc_last < 60000000000ull) return;
+    g_pc_last = now; g_pc_seen = made;
+    size_t n = 0;
+    if (vkGetPipelineCacheData(vk_dev, vk_pcache, &n, NULL) != VK_SUCCESS || !n) return;
+    void *data = malloc(n);
+    if (data && vkGetPipelineCacheData(vk_dev, vk_pcache, &n, data) == VK_SUCCESS) {
+        char tmp[1110]; snprintf(tmp, sizeof tmp, "%s.tmp", g_pc_path);
+        pal_file *f = pal_file_open(tmp, PAL_FILE_WRITE | PAL_FILE_CREATE | PAL_FILE_TRUNCATE);
+        int ok = f && pal_file_pwrite(f, data, n, 0) == (int64_t)n;
+        if (f) pal_file_close(f);
+        if (ok && pal_rename_replace(tmp, g_pc_path)) VLOG("pipeline cache: could not replace %s", g_pc_path);
+    }
+    free(data);
+}
+
 void vd_init(void) {
+    pcache_init();
     VkPhysicalDeviceFeatures f; vkGetPhysicalDeviceFeatures(vk_phys, &f);
     g_logic_op = f.logicOp;
-    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dv = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
-    (void)dv;
-    g_divisor = 0;   /* shortcut: the divisor extension is not enabled on the device yet; divisors above 1 step every instance */
+    g_divisor = vk_divisor;
 }

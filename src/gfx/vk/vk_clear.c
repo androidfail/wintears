@@ -74,7 +74,7 @@ static VkPipeline pipeline_for(int kind, int index, uint32_t mask) {
         .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
         .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy, .layout = g_lay};
     VkPipeline p = VK_NULL_HANDLE;
-    if (vkCreateGraphicsPipelines(vk_dev, VK_NULL_HANDLE, 1, &ci, NULL, &p) != VK_SUCCESS) { p = VK_NULL_HANDLE; VK_ONCE("masked clear pipeline (kind %d) not created", kind); }
+    if (vkCreateGraphicsPipelines(vk_dev, vk_pcache, 1, &ci, NULL, &p) != VK_SUCCESS) { p = VK_NULL_HANDLE; VK_ONCE("masked clear pipeline (kind %d) not created", kind); }
     if (g_ne < 64) { want.p = p; g_e[g_ne++] = want; }
     return p;
 }

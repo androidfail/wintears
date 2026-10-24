@@ -125,7 +125,7 @@ if(WINTEARS_JIT)
   # Vulkan: headers, volk (loads vulkan-1.dll at run time), Vulkan Memory Allocator
   set(TEX_DIR upstream/games/totk/third_party/d2r_gfx/gfx/tex)
   add_library(gfx OBJECT src/gfx/nvn.c src/gfx/nvn_ext.c src/gfx/nvn_vpool.c src/gfx/nvn_null.c src/gfx/nvn_gpu.c src/gfx/nvn_dirty.c
-              src/gfx/vk/vk_dev.c src/gfx/vk/vk_fmt.c src/gfx/vk/vk_tex.c src/gfx/vk/vk_exec.c src/gfx/vk/vk_clear.c src/gfx/vk/vk_draw.c src/gfx/vk/vk_shader.c src/gfx/vk/vk_shot.c src/gfx/vk/vk_astc.cpp
+              src/gfx/vk/vk_dev.c src/gfx/vk/vk_fmt.c src/gfx/vk/vk_tex.c src/gfx/vk/vk_exec.c src/gfx/vk/vk_clear.c src/gfx/vk/vk_winmem.c src/gfx/vk/vk_draw.c src/gfx/vk/vk_shader.c src/gfx/vk/vk_shot.c src/gfx/vk/vk_astc.cpp
               src/gfx/vk/vk_present.c src/gfx/vk/vk_mem.cpp externals/volk/volk.c src/frontend/frontend.c
               ${NVN_DIR}/nvn_tex.c ${TEX_DIR}/nvn_deswizzle.c ${CMAKE_BINARY_DIR}/nvn_names.c)
   target_include_directories(gfx PUBLIC src ${NVN_DIR} ${NVN_DIR}/include ${TEX_DIR}

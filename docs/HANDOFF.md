@@ -120,8 +120,10 @@ Not an option: getting game files from anywhere but the user's own dump.
      (`vt_note_rendered` / `vt_pool_invalidate`; skipped when the CPU wrote the memory since the render; the GPU wait must happen before the dirty-tracker pages are opened, else the completion thread and the game thread wait for each other; `TOTK_WRITEBACK=0` turns it off); samples-passed
      counters are real occlusion queries, one per pass while counting (`vk_exec.c`; `TOTK_OCCLUSION=0` makes every
      query "visible" again). The game culls objects whose query reports 0 and scales effects by it, so a wrongly
-     missing object or glare is the first thing to try with that switch. Not done yet: the instance divisor extension,
-     physical pools the driver cannot import (one 111 MiB pool), background shader translation, performance (full barriers between
+     missing object or glare is the first thing to try with that switch. Also done (not seen in play): instance divisors above 1
+     (VK_EXT_vertex_attribute_divisor, enabled when the GPU has it), a pipeline cache kept in `<profile>/pipeline-cache.bin`
+     (`vk_draw.c`), and a log line saying why a pool could not be imported (`vk_winmem.c` describes the memory; a no-access
+     placeholder page in a virtual pool is the first suspect). Not done yet: pools the driver cannot import (one 111 MiB pool), background shader translation (the translation depends on state known only at the draw, so it cannot start earlier), performance (full barriers between
      passes, copies and dispatches, about 285 a frame; GENERAL layouts). Inline uniform updates (about 210 a frame) are
      renamed as upstream does (`vd_ub_update` in `vk_draw.c`; `TOTK_UB_RENAME=0` for A/B): passes no longer split at
      them, barriers per frame went from about 510 to 285.
