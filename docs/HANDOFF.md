@@ -117,7 +117,7 @@ Not an option: getting game files from anywhere but the user's own dump.
      `tools/build_clear_shaders.py`). Also done 2026-10-24 (not seen in play): depth to colour / other-depth texture
      copies go through a buffer (Vulkan allows neither copy nor blit there); 24-bit depth uploads are converted to
      float (`upload` in `vk_tex.c`); rendered textures in CPU-visible pools are written back on InvalidateMappedRange
-     (`vt_note_rendered` / `vt_pool_invalidate`; skipped when the CPU wrote the memory since the render); samples-passed
+     (`vt_note_rendered` / `vt_pool_invalidate`; skipped when the CPU wrote the memory since the render; the GPU wait must happen before the dirty-tracker pages are opened, else the completion thread and the game thread wait for each other; `TOTK_WRITEBACK=0` turns it off); samples-passed
      counters are real occlusion queries, one per pass while counting (`vk_exec.c`; `TOTK_OCCLUSION=0` makes every
      query "visible" again). The game culls objects whose query reports 0 and scales effects by it, so a wrongly
      missing object or glare is the first thing to try with that switch. Not done yet: the instance divisor extension,

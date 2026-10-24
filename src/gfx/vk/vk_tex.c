@@ -542,7 +542,9 @@ typedef struct { tex_t t; uint64_t stamp; } wb_ent;
 static nvn_hmap g_wb = {.klen = 8};   /* by serial; vk_mu */
 static uint64_t g_wb_done, g_wb_skipped;
 void vt_note_rendered(const tex_t *t) {
-    if (!t || !t->serial || !tex_mirrored(t) || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return;
+    static int off = -1;   /* TOTK_WRITEBACK=0: no write-back (A/B) */
+    if (off < 0) { const char *e = pal_getenv("TOTK_WRITEBACK"); off = e && *e == '0'; }
+    if (off || !t || !t->serial || !tex_mirrored(t) || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return;
     uint64_t k = t->serial;
     wb_ent *e = nvn_hm_get(&g_wb, &k);
     if (e && nvn_dirty_tracked(t->mem, (size_t)t->L.size) && !nvn_dirty_since(t->mem, (size_t)t->L.size, e->stamp)) { e->stamp = nvn_dirty_now(); return; }   /* untouched since: still protected */
@@ -550,7 +552,7 @@ void vt_note_rendered(const tex_t *t) {
     e->t = *t; e->stamp = nvn_dirty_now();
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* after the stamp: a CPU write from here on is seen */
 }
-static int wb_back(const tex_t *t) {
+static int wb_back(const tex_t *t, uint8_t *storage) {   /* the rendering, swizzled into `storage` (a copy of the texture's memory) */
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     vk_fmt f; VkImageType type; uint32_t w, h, d, layers;
     if (!bpb || bw != 1 || bh != 1 || !vk_fmt_of(t->d.format, &f) || f.convert || f.depth || f.stencil || t->d.samples > 1) return 0;
@@ -564,7 +566,7 @@ static int wb_back(const tex_t *t) {
         for (unsigned ly = 0; ly < layers; ly++) {
             NVNcopyRegion r = {.width = (int)lw, .height = (int)lh, .depth = (int)ld};
             vt_read_texels(t, lv, ly, &r, lin, pitch, pitch * lh);
-            if (nvn_swizzle(&t->d, lv, ly, lin, pitch, t->mem)) { free(lin); return 0; }
+            if (nvn_swizzle(&t->d, lv, ly, lin, pitch, storage)) { free(lin); return 0; }
         }
         free(lin);
     }
@@ -588,9 +590,21 @@ void vt_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     for (int i = 0; i < nl; i++) {
         const tex_t *t = &list[i]->t;
         if (!fresh[i]) { g_wb_skipped++; free(list[i]); continue; }
-        void *tok = nvn_dirty_gpu_write_begin(t->mem, (size_t)t->L.size);   /* the GPU's bytes are not a CPU write */
-        int ok = wb_back(t);
-        nvn_dirty_gpu_write_end(tok);
+        /* The GPU wait happens before the pages are opened: while they are busy to the dirty tracker, the completion thread
+           (events and counters it writes into pool memory) would wait for them, and this thread for the completion thread. */
+        size_t size = (size_t)t->L.size;
+        uint8_t *tmp = malloc(size);
+        int ok = 0;
+        if (tmp) {
+            memcpy(tmp, t->mem, size);
+            if (wb_back(t, tmp)) {
+                void *tok = nvn_dirty_gpu_write_begin(t->mem, size);   /* the GPU's bytes are not a CPU write */
+                memcpy(t->mem, tmp, size);
+                nvn_dirty_gpu_write_end(tok);
+                ok = 1;
+            }
+            free(tmp);
+        }
         if (ok) { if (++g_wb_done <= 4) VLOG("write-back: rendered texture %ux%u format %#x written to pool memory (%llu so far, %llu skipped: the CPU wrote since)", t->d.width, t->d.height, t->d.format, (unsigned long long)g_wb_done, (unsigned long long)g_wb_skipped); }
         else VK_ONCE("write-back of texture %ux%u format %#x target %d failed: pool memory keeps its old bytes", t->d.width, t->d.height, t->d.format, t->d.target);
         free(list[i]);
