@@ -682,6 +682,7 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
         if (di) vd_ub_guard(di->ibuf, di->ibuf + (uint64_t)di->count * 4);
     }
     /* the descriptor sets first: they may upload textures (into this submission's upload buffer, before the pass) */
+    { void vx_target_log_check(void); vx_target_log_check(); }
     VkDescriptorSet s0 = stage_set(vs, 0), s1 = fs ? stage_set(fs, 1) : VK_NULL_HANDLE;
     if (!vx_begin_pass()) { g_skipped[2]++; return; }
     int prim = dw ? dw->prim : di->prim;

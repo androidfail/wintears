@@ -66,6 +66,7 @@ static void do_counter(void *arg) {
 
 /* ---------- TOTK_PASSLOG=<present>: one line per pass and copy of the submissions between that present and the next */
 static int g_plog = -1, g_plogs[8], g_nplog; int vk_passlog_on;   /* TOTK_PASSLOG=<present>[,<present>...] (up to 8) */
+static int g_tgt_log;   /* this pass is logged for its target (the menu's blue 480x270 RGB10A2 background; diagnostics) */
 uint64_t vk_present_count(void);
 /* F9 in the window: the next frame is logged as TOTK_PASSLOG would, and saved as <profile>/logs/capture-<n>.png */
 _Atomic uint64_t vk_capture_at;
@@ -83,6 +84,7 @@ static int plog(void) {
     uint64_t cap = atomic_load(&vk_capture_at);
     vk_passlog_on = cap && vk_present_count() == cap;
     for (int i = 0; i < g_nplog; i++) if (vk_present_count() == (uint64_t)g_plogs[i]) vk_passlog_on = 1;
+    if (g_tgt_log) vk_passlog_on = 1;
     return vk_passlog_on;
 }
 static int g_pass_draws, g_pass_clears;
@@ -190,6 +192,7 @@ void vx_end_pass(void) {
     g_pass_draws = g_pass_clears = 0;
     vk_barrier(vk_cmd());
     g_pass = 0;
+    if (g_tgt_log) { g_tgt_log = 0; plog(); }
 }
 
 /* The targets' images and views, prepared before the pass begins (uploads cannot happen inside one). */
@@ -230,6 +233,17 @@ static int targets(vtex **col, VkImageView *cv, VkFormat *cf, vtex **dep, VkImag
     return any;
 }
 
+/* Before a pass opens (and before a draw builds its descriptor sets): the first passes into a 480x270 RGB10A2 target
+   are logged whole, inputs and their writers included (the menus' blue background; diagnostics). */
+void vx_target_log_check(void) {
+    static int seen;
+    if (g_pass || vk_passlog_on || seen >= 12 || !S.has_rt || S.rt.n < 1 || !S.rt.color[0]) return;
+    const tex_t *t = S.rt.color[0];
+    if (t->d.width != 480 || t->d.height != 270 || t->d.format != 0x3d) return;
+    seen++; g_tgt_log = vk_passlog_on = 1;
+    VLOG("[pass] target log %d of 12: pass into 480x270 NVN format 0x3d at %p (present %llu)", seen, (void *)t->mem, (unsigned long long)vk_present_count());
+}
+
 /* Open a pass on the current targets; 0 when there is nothing to render into. */
 static int begin_pass(void) {
     if (g_pass) return 1;
@@ -259,6 +273,7 @@ static int begin_pass(void) {
     S.pass_w = w; S.pass_h = h; S.pass_samples = 1;
     for (int i = 0; i < n; i++) if (col[i]) { S.pass_samples = vt_samples(col[i]); break; }
     if (dep && S.pass_samples == 1) S.pass_samples = vt_samples(dep);
+    vx_target_log_check();
     if (vk_passlog_on) g_pass_q = ptime_begin();
     g_pc0.ok = 0;
     if (vk_passlog_on && n > 0 && col[0]) {   /* what target 0 ends up holding is logged when the pass ends */
