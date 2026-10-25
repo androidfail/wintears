@@ -156,6 +156,7 @@ static void log_to_file(void) {
     if (pal_tee_stdio(last) == 0) LOG("this run's log: %s", last);
     LOG("timing: a 100 us sleep takes %.0f us, a 1 ms sleep %.0f us%s", pal_sleep_probe(100000) / 1e3, pal_sleep_probe(1000000) / 1e3, pal_under_wine() ? " (Wine / Proton)" : "");
     { char b[4000]; pal_diag_boot(b, sizeof b); LOG("environment: %s", b); }
+    { int alloc_self_check(void); if (!alloc_self_check()) LOG("operator new: per-thread cache self-check FAILED"); }
 }
 
 int main(int argc, char **argv) {
