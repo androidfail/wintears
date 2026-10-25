@@ -27,6 +27,7 @@ struct vtex {
     VkImage img; VmaAllocation al; VkFormat fmt; vk_fmt f; VkImageAspectFlags aspect; VkImageCreateFlags flags;
     uint32_t w, h, d, layers, levels; VkImageType type;
     int mirrored, owned, uploaded;
+    char writer[128];   /* what last wrote it (diagnostics: the pass log prints it for sampled textures) */
     uint64_t stamp, checked_sub, used_sub;
     view_ent *views; int nviews, cviews;
 };
@@ -44,7 +45,13 @@ uint32_t vt_layers(const vtex *e) { return e->layers; }
 void vt_size(const vtex *e, unsigned level, uint32_t *w, uint32_t *h, uint32_t *d) {
     *w = mip(e->w, level); *h = e->type == VK_IMAGE_TYPE_1D ? 1 : mip(e->h, level); *d = e->type == VK_IMAGE_TYPE_3D ? mip(e->d, level) : 1;
 }
-void vt_written(vtex *e) { if (e) e->owned = 1; }
+char vt_writer[96];
+void vt_written(vtex *e) {
+    if (!e) return;
+    e->owned = 1;
+    snprintf(e->writer, sizeof e->writer, "%s (submission %llu)", vt_writer[0] ? vt_writer : "?", (unsigned long long)vk_sub_serial());
+}
+const char *vt_writer_of(const vtex *e) { return e && e->writer[0] ? e->writer : "nothing since it was made (zero) or an upload"; }
 
 static int tex_mirrored(const tex_t *t) {   /* upstream nvn_mtl.m tex_mirrored */
     if (!t || !t->mem) return 0;
@@ -192,6 +199,7 @@ static void upload(vtex *e, const tex_t *t) {
     g_uploads++; g_upload_bytes += t->L.size; if (e->uploaded) g_reuploads++;
     if (!nvn_dirty_tracked(t->mem, (size_t)t->L.size)) g_untracked++;
     e->stamp = nvn_dirty_now();
+    snprintf(e->writer, sizeof e->writer, "upload from pool memory (submission %llu)", (unsigned long long)vk_sub_serial());
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* before copying: a write from here on is seen at the next check */
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     VkCommandBuffer c = vk_pre();

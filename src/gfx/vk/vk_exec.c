@@ -240,11 +240,11 @@ static int begin_pass(void) {
     for (int i = 0; i < n; i++) {
         ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = cv[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                                             .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-        if (col[i]) vt_written(col[i]);
+        if (col[i]) { snprintf(vt_writer, sizeof vt_writer, "render pass %ux%u, target %d NVN format %#x", w, h, i, S.rt.color[i]->d.format); vt_written(col[i]); }
     }
     int has_d = dep && (vt_aspect(dep) & VK_IMAGE_ASPECT_DEPTH_BIT), has_s = dep && (vt_aspect(dep) & VK_IMAGE_ASPECT_STENCIL_BIT);
     if (dep) {
-        vt_written(dep);
+        snprintf(vt_writer, sizeof vt_writer, "render pass %ux%u (depth)", w, h); vt_written(dep);
         da.imageView = dv; da.imageLayout = VK_IMAGE_LAYOUT_GENERAL; da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     }
     sa = da;
@@ -391,7 +391,7 @@ static void copy_b2t(const p_copy_b2t *c) {
     VkBufferImageCopy r = {.bufferOffset = so, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
     vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     vk_barrier(vk_cmd());
-    vt_written(e);
+    snprintf(vt_writer, sizeof vt_writer, "buffer-to-texture copy from %#llx", (unsigned long long)c->src); vt_written(e);
 }
 static void copy_t2b(const p_copy_b2t *c) {   /* the T2B record: tex is the source, src the destination address */
     vtex *e = c->tex ? vt_get(c->tex) : NULL;
@@ -485,7 +485,7 @@ static void copy_t2t(const p_copy_t2t *c) {
             vk_barrier(vk_cmd());
             vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &in);
             vk_barrier(vk_cmd());
-            vt_written(d);
+            snprintf(vt_writer, sizeof vt_writer, "depth copy from NVN format %#x", c->src->d.format); vt_written(d);
             return;
         }
         VK_ONCE("copy between formats %#x and %#x (depth involved, texel sizes %d / %d): not possible, left to the blit", c->src->d.format, c->dst->d.format, bs, bt);
@@ -533,6 +533,7 @@ static void copy_t2t(const p_copy_t2t *c) {
         } else vkCmdBlitImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r, filt);
     }
     vk_barrier(vk_cmd());
+    snprintf(vt_writer, sizeof vt_writer, "texture copy from %ux%u NVN format %#x (%s)", c->src->d.width, c->src->d.height, c->src->d.format, same && !convert ? "bit for bit" : "converted / scaled");
     vt_written(d);
 }
 static void clear_tex(const p_clear_tex *c) {
@@ -556,14 +557,14 @@ static void clear_tex(const p_clear_tex *c) {
             vkCmdCopyImage(vk_cmd(), ti, VK_IMAGE_LAYOUT_GENERAL, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
         }
         vk_barrier(vk_cmd());
-        vt_written(e);
+        snprintf(vt_writer, sizeof vt_writer, "texture clear (own format) to %08x %08x %08x %08x", v.uint32[0], v.uint32[1], v.uint32[2], v.uint32[3]); vt_written(e);
         return;
     }
     if (o.x || o.y || x.width < w || x.height < h) VK_ONCE("partial texture clear (%ux%u of %ux%u): the whole level is cleared for now", x.width, x.height, w, h);
     VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, sub.baseArrayLayer, sub.layerCount};
     vkCmdClearColorImage(vk_cmd(), vt_image(e), VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
     vk_barrier(vk_cmd());
-    vt_written(e);
+    snprintf(vt_writer, sizeof vt_writer, "texture clear to %08x %08x %08x %08x", v.uint32[0], v.uint32[1], v.uint32[2], v.uint32[3]); vt_written(e);
 }
 
 /* TOTK: SetRenderEnableConditional, mode 0 = render if the two counters at addr / addr + 16 are equal. The counters

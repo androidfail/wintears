@@ -405,7 +405,7 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                     VkImageView v = e ? vt_view(e, &s.t, s.has_v ? &s.v : NULL, VT_SAMPLED, (VkImageViewType)b->view) : VK_NULL_HANDLE;
                     if (v) d.imageView = v;
                     extern int vk_passlog_on;
-                    if (vk_passlog_on) { VLOG("[pass]     tex %ux%ux%u levels %u fmt %#x target %d flags %#x", s.t.d.width, s.t.d.height, s.t.d.depth, s.t.d.levels, s.t.d.format, s.t.d.target, s.t.d.flags);
+                    if (vk_passlog_on) { VLOG("[pass]     tex %ux%ux%u levels %u fmt %#x target %d flags %#x at %p, last written by %s", s.t.d.width, s.t.d.height, s.t.d.depth, s.t.d.levels, s.t.d.format, s.t.d.target, s.t.d.flags, (void *)s.t.mem, vt_writer_of(e));
                         if (e) { uint32_t w, h, d; vt_size(e, 0, &w, &h, &d); vx_note_sampled(vt_image(e), vt_vkformat(e), w, h); } }
                 }
                 int sid = (int)((b->sreg >= 0 && b->sreg < 128 ? S.samp[st][b->sreg] : h) >> 20) & 0xfff;
@@ -418,7 +418,7 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                 if (slot_texture(S.img[st][b->reg], &s)) {
                     vtex *e = vt_get(&s.t);
                     VkImageView v = e ? vt_view(e, &s.t, s.has_v ? &s.v : NULL, VT_STORAGE, (VkImageViewType)b->view) : VK_NULL_HANDLE;
-                    if (v) { d.imageView = v; vt_written(e); }
+                    if (v) { d.imageView = v; snprintf(vt_writer, sizeof vt_writer, "image store, NVN format %#x", s.t.d.format); vt_written(e); }
                 }
             }
             extern int vk_passlog_on;
