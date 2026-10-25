@@ -36,7 +36,9 @@ struct vtex {
         struct { uint64_t mem; uint32_t w, h, fmt; } in[8];
     } prov;
     uint64_t stamp, checked_sub, used_sub;
-    uint64_t hash, hashed_sub; int hot;   /* hot: changed since its first upload, so checked whole every submission */   /* content check (no write protection, the Steam Deck): what was uploaded, and when last compared */
+    /* content check (no write protection, the Steam Deck): whole and sampled hashes of what was uploaded, when each was
+       last compared; hot = changed since its first upload */
+    uint64_t hash, shash, hashed_sub, sampled_sub; int hot;
     view_ent *views; int nviews, cviews;
 };
 static nvn_hmap g_by_stor = {.klen = sizeof(stor_key)};
@@ -385,30 +387,51 @@ void vt_copy_linear(vtex *e, const tex_t *t, uint32_t level, uint32_t layer0, ui
     free(lin);
 }
 
-/* Content check, used when pages are not write-protected (Wine / Proton; nvn_dirty.c). Textures up to 1 MiB (font
-   atlases, UI) are hashed whole at each submission that uses them; larger ones are sampled (64 bytes of every 4 KiB:
-   a texture the game loads or rewrites changes everywhere) and at most every 8th submission.
-   shortcut: a partial CPU rewrite of a large texture that misses every sampled line is not seen; upgrade to Linux
-   soft-dirty bits (/proc/self/pagemap) if that shows up. */
+/* Content check, used when pages are not write-protected (Wine / Proton; nvn_dirty.c). Hashing every used texture
+   whole at every submission cost the Steam Deck about 25 ms a frame (replay 27 ms per submission against 2.3 on the
+   PC), so the whole hash is kept for the textures where partial rewrites happen and are small: up to 64 KiB, and
+   rewritten ("hot") ones up to 1 MiB (font atlases, UI). Other textures up to 1 MiB are sampled (64 bytes of every
+   4 KiB) at each submission and hashed whole every 16th; larger ones are sampled every 8th submission, or at each
+   one once hot.
+   shortcut: a partial CPU rewrite that misses every sampled line is seen up to 16 submissions late (up to 1 MiB) or
+   not at all (larger); upgrade to Linux soft-dirty bits (/proc/self/pagemap) if that shows up. */
 int nvn_dirty_protecting(void);
-static uint64_t content_hash(const uint8_t *p, uint64_t n, int whole) {
-    uint64_t h = 0x9E3779B97F4A7C15ull ^ n, v;
-    if (whole || n <= (1u << 20)) {
-        uint64_t i = 0;
-        for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 29; }
-        for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
-        return h;
+static uint64_t hash_whole(const uint8_t *p, uint64_t n) {   /* four independent lanes: about four times the speed of one */
+    const uint64_t K = 0xff51afd7ed558ccdull;
+    uint64_t h0 = 0x9E3779B97F4A7C15ull ^ n, h1 = h0 + 1, h2 = h0 + 2, h3 = h0 + 3, v0, v1, v2, v3, i = 0;
+    for (; i + 32 <= n; i += 32) {
+        memcpy(&v0, p + i, 8); memcpy(&v1, p + i + 8, 8); memcpy(&v2, p + i + 16, 8); memcpy(&v3, p + i + 24, 8);
+        h0 = (h0 ^ v0) * K; h0 ^= h0 >> 29; h1 = (h1 ^ v1) * K; h1 ^= h1 >> 29;
+        h2 = (h2 ^ v2) * K; h2 ^= h2 >> 29; h3 = (h3 ^ v3) * K; h3 ^= h3 >> 29;
     }
+    for (; i < n; i++) h0 = (h0 ^ p[i]) * 0x100000001b3ull;
+    return ((h0 * K ^ h1) * K ^ h2) * K ^ h3;
+}
+static uint64_t hash_sampled(const uint8_t *p, uint64_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n, v;
     for (uint64_t at = 0; at + 64 <= n; at += 4096)
         for (int k = 0; k < 64; k += 8) { memcpy(&v, p + at + k, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 29; }
     return h;
 }
+static void content_note(vtex *e, const tex_t *t, uint64_t sub) {   /* at upload */
+    uint64_t n = t->L.size;
+    e->hash = n <= (1u << 20) ? hash_whole(t->mem, n) : 0;
+    e->shash = hash_sampled(t->mem, n);
+    e->hashed_sub = e->sampled_sub = sub;
+}
 static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
-    if (!e->hot && t->L.size > (1u << 20) && e->hashed_sub && sub - e->hashed_sub < 8) return 0;
-    e->hashed_sub = sub;
-    if (content_hash(t->mem, t->L.size, e->hot) == e->hash) return 0;
-    e->hot = 1;   /* a texture the game rewrites (font atlases, UI): from now on compared whole */
-    return 1;
+    const uint8_t *p = t->mem; uint64_t n = t->L.size; int changed;
+    if (n <= (64u << 10) || (e->hot && n <= (1u << 20))) changed = hash_whole(p, n) != e->hash;
+    else if (n > (1u << 20)) {
+        if (!e->hot && sub - e->sampled_sub < 8) return 0;
+        e->sampled_sub = sub;
+        changed = hash_sampled(p, n) != e->shash;
+    } else {
+        changed = hash_sampled(p, n) != e->shash;
+        if (!changed && sub - e->hashed_sub >= 16) { e->hashed_sub = sub; changed = hash_whole(p, n) != e->hash; }
+    }
+    if (changed) e->hot = 1;   /* a texture the game rewrites: from now on compared more closely */
+    return changed;
 }
 static void upload(vtex *e, const tex_t *t) {
     uint64_t t0 = pal_now_ns();
@@ -417,7 +440,7 @@ static void upload(vtex *e, const tex_t *t) {
     e->stamp = nvn_dirty_now();
     snprintf(e->writer, sizeof e->writer, "upload from pool memory (submission %llu)", (unsigned long long)vk_sub_serial());
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* before copying: a write from here on is seen at the next check */
-    if (!nvn_dirty_protecting()) { e->hash = content_hash(t->mem, t->L.size, e->hot); e->hashed_sub = vk_sub_serial(); }
+    if (!nvn_dirty_protecting()) content_note(e, t, vk_sub_serial());
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     VkCommandBuffer c = vk_pre();
     for (unsigned lv = 0; lv < e->levels; lv++) {
@@ -813,17 +836,22 @@ void vt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNco
    about to read what the GPU wrote), the rendering is read back and swizzled into the pool, unless the CPU wrote the
    memory since the render (its bytes are newer). Of several textures over the same memory the newest wins. */
 typedef struct { tex_t t; uint64_t stamp; } wb_ent;
-static nvn_hmap g_wb = {.klen = 8};   /* by serial; vk_mu */
+int runtime_core_away(void);
+void runtime_core_back(int *away);
+static nvn_hmap g_wb = {.klen = 8};   /* by serial; g_wb_mu (inside vk_mu where both are held) */
+static pthread_mutex_t g_wb_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_wb_done, g_wb_skipped;
 void vt_note_rendered(const tex_t *t) {
     static int off = -1;   /* TOTK_WRITEBACK=0: no write-back (A/B) */
     if (off < 0) { const char *e = pal_getenv("TOTK_WRITEBACK"); off = e && *e == '0'; }
     if (off || !t || !t->serial || !tex_mirrored(t) || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return;
     uint64_t k = t->serial;
+    pthread_mutex_lock(&g_wb_mu);
     wb_ent *e = nvn_hm_get(&g_wb, &k);
-    if (e && nvn_dirty_tracked(t->mem, (size_t)t->L.size) && !nvn_dirty_since(t->mem, (size_t)t->L.size, e->stamp)) { e->stamp = nvn_dirty_now(); return; }   /* untouched since: still protected */
-    if (!e) { e = malloc(sizeof *e); if (!e) return; nvn_hm_put(&g_wb, &k, e); }
+    if (e && nvn_dirty_tracked(t->mem, (size_t)t->L.size) && !nvn_dirty_since(t->mem, (size_t)t->L.size, e->stamp)) { e->stamp = nvn_dirty_now(); pthread_mutex_unlock(&g_wb_mu); return; }   /* untouched since: still protected */
+    if (!e) { e = malloc(sizeof *e); if (!e) { pthread_mutex_unlock(&g_wb_mu); return; } nvn_hm_put(&g_wb, &k, e); }
     e->t = *t; e->stamp = nvn_dirty_now();
+    pthread_mutex_unlock(&g_wb_mu);
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* after the stamp: a CPU write from here on is seen */
 }
 static int wb_back(const tex_t *t, uint8_t *storage) {   /* the rendering, swizzled into `storage` (a copy of the texture's memory) */
@@ -850,13 +878,16 @@ void vt_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     if (!p || !p->mem) return;
     const uint8_t *a = (const uint8_t *)p->mem + off, *z = a + n;
     wb_ent *list[64]; int nl = 0;
-    pthread_mutex_lock(&vk_mu);
+    pthread_mutex_lock(&g_wb_mu);
     for (uint32_t i = 0; i < g_wb.cap && nl < 64; i++) {
         wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
         if (!e || (const uint8_t *)e->t.mem >= z || (const uint8_t *)e->t.mem + e->t.L.size <= a) continue;
         uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   /* deletion shifts entries: rescan */
     }
-    pthread_mutex_unlock(&vk_mu);
+    pthread_mutex_unlock(&g_wb_mu);
+    if (!nl) return;
+    /* read-backs wait for the replay lock and the GPU: the guest thread gives its core up meanwhile */
+    __attribute__((cleanup(runtime_core_back))) int away = runtime_core_away();
     int fresh[64];
     for (int i = 0; i < nl; i++) fresh[i] = !nvn_dirty_tracked(list[i]->t.mem, (size_t)list[i]->t.L.size) || !nvn_dirty_since(list[i]->t.mem, (size_t)list[i]->t.L.size, list[i]->stamp);
     for (int i = 0; i < nl; i++) for (int j = 0; j < nl; j++)
