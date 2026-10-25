@@ -28,6 +28,11 @@ struct vtex {
     uint32_t w, h, d, layers, levels; VkImageType type;
     int mirrored, owned, uploaded;
     char writer[128];   /* what last wrote it (diagnostics: the pass log prints it for sampled textures) */
+    struct {   /* the write's inputs, so F9 can follow a sampled texture back to its sources (diagnostics) */
+        uint64_t present; int ndraws, nsh, nin;
+        char sh[4][40];
+        struct { uint64_t mem; uint32_t w, h, fmt; } in[8];
+    } prov;
     uint64_t stamp, checked_sub, used_sub;
     view_ent *views; int nviews, cviews;
 };
@@ -50,8 +55,61 @@ void vt_written(vtex *e) {
     if (!e) return;
     e->owned = 1;
     snprintf(e->writer, sizeof e->writer, "%s (submission %llu)", vt_writer[0] ? vt_writer : "?", (unsigned long long)vk_sub_serial());
+    memset(&e->prov, 0, sizeof e->prov);
+    uint64_t vk_present_count(void); e->prov.present = vk_present_count();
 }
 const char *vt_writer_of(const vtex *e) { return e && e->writer[0] ? e->writer : "nothing since it was made (zero) or an upload"; }
+
+/* ---- provenance (diagnostics): what each write read, followed back from a sampled texture when F9 logs a frame ---- */
+static struct { uint64_t mem; uint32_t w, h, fmt; } g_pin[8]; static int g_npin;
+void vt_prov_reset(void) { g_npin = 0; }
+void vt_prov_input(const tex_t *t) {   /* a texture the coming draw samples */
+    if (!t || !t->mem) return;
+    for (int i = 0; i < g_npin; i++) if (g_pin[i].mem == (uint64_t)(uintptr_t)t->mem && g_pin[i].fmt == (uint32_t)t->d.format) return;
+    if (g_npin < 8) g_pin[g_npin++] = (typeof(g_pin[0])){(uint64_t)(uintptr_t)t->mem, t->d.width, t->d.height, (uint32_t)t->d.format};
+}
+static void prov_add(vtex *e, uint64_t mem, uint32_t w, uint32_t h, uint32_t fmt) {
+    for (int i = 0; i < e->prov.nin; i++) if (e->prov.in[i].mem == mem && e->prov.in[i].fmt == fmt) return;
+    if (e->prov.nin < 8) e->prov.in[e->prov.nin++] = (typeof(e->prov.in[0])){mem, w, h, fmt};
+}
+void vt_prov_copy(vtex *e, const tex_t *src) { if (e && src) prov_add(e, (uint64_t)(uintptr_t)src->mem, src->d.width, src->d.height, (uint32_t)src->d.format); }
+void vt_prov_draw(vtex *e, const char *vs, const char *fs) {   /* a draw into e (a target of the open pass) read the pending inputs */
+    if (!e) return;
+    e->prov.ndraws++;
+    char nm[40]; snprintf(nm, sizeof nm, "%.18s+%.18s", vs ? vs : "-", fs ? fs : "-");
+    int have = 0; for (int i = 0; i < e->prov.nsh; i++) if (!strcmp(e->prov.sh[i], nm)) have = 1;
+    if (!have && e->prov.nsh < 4) snprintf(e->prov.sh[e->prov.nsh++], sizeof e->prov.sh[0], "%s", nm);
+    for (int i = 0; i < g_npin; i++) prov_add(e, g_pin[i].mem, g_pin[i].w, g_pin[i].h, g_pin[i].fmt);
+}
+/* Print e's chain of writes back to its sources (depth-first, each image once per call). */
+void vx_note_sampled(VkImage img, VkFormat fmt, uint32_t w, uint32_t h);
+static void prov_walk(const vtex *e, int depth, const vtex **seen, int *nseen) {
+    for (int i = 0; i < *nseen; i++) if (seen[i] == e) { VLOG("[chain] %*s(image %p again, see above)", depth * 2, "", (void *)e); return; }
+    if (*nseen < 64) seen[(*nseen)++] = e;
+    VLOG("[chain] %*simage %p: storage %#llx %ux%u class %#x VK %d; last written by %s at present %llu; %d draws, %d inputs",
+         depth * 2, "", (void *)e, (unsigned long long)e->k.mem, e->w, e->h, e->k.cls, (int)e->fmt, vt_writer_of(e), (unsigned long long)e->prov.present, e->prov.ndraws, e->prov.nin);
+    for (int i = 0; i < e->prov.nsh; i++) VLOG("[chain] %*s  shaders %s", depth * 2, "", e->prov.sh[i]);
+    if (!vk_fmt_block_compressed(e->fmt) && !e->f.depth && !e->f.stencil) vx_note_sampled(e->img, e->fmt, e->w, e->h);   /* its contents now, logged after the pass */
+    if (depth >= 10) return;
+    for (int i = 0; i < e->prov.nin; i++) {
+        VLOG("[chain] %*s  input %d: %#llx %ux%u NVN format %#x", depth * 2, "", i, (unsigned long long)e->prov.in[i].mem, e->prov.in[i].w, e->prov.in[i].h, e->prov.in[i].fmt);
+        int found = 0;
+        for (uint32_t j = 0; j < g_by_stor.cap; j++) {   /* every image over that memory (any format class) */
+            const vtex *o = g_by_stor.vals[j];
+            if (o && o->k.mem == e->prov.in[i].mem && o->w == e->prov.in[i].w && o->h == e->prov.in[i].h) { found = 1; prov_walk(o, depth + 1, seen, nseen); }
+        }
+        if (!found) VLOG("[chain] %*s    (no image over it now)", depth * 2, "");
+    }
+}
+void vt_prov_dump(const vtex *e) {
+    static const vtex *done[256]; static int ndone; static uint64_t at;
+    uint64_t vk_present_count(void);
+    if (at != vk_present_count()) { at = vk_present_count(); ndone = 0; }
+    for (int i = 0; i < ndone; i++) if (done[i] == e) return;   /* each sampled image once per logged frame */
+    if (ndone < 256) done[ndone++] = e;
+    const vtex *seen[64]; int nseen = 0;
+    prov_walk(e, 0, seen, &nseen);
+}
 
 static int tex_mirrored(const tex_t *t) {   /* upstream nvn_mtl.m tex_mirrored */
     if (!t || !t->mem) return 0;

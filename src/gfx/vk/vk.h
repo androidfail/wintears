@@ -95,6 +95,12 @@ VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int mode, VkImageV
 extern VkFormat vt_last_vfmt;
 extern char vt_writer[96];   /* set before vt_written: what is writing (diagnostics) */
 const char *vt_writer_of(const vtex *e);   /* the format of the view vt_view returned last (a pass renders in the view's format, not the image's) */
+/* provenance (diagnostics): the inputs of each write, printed back to their sources for textures an F9 frame samples */
+void vt_prov_reset(void);
+void vt_prov_input(const tex_t *t);
+void vt_prov_draw(vtex *e, const char *vs, const char *fs);
+void vt_prov_copy(vtex *e, const tex_t *src);
+void vt_prov_dump(const vtex *e);
 /* A view of a block-compressed image whose texel is one block (BC4 as RGBA16UI: the game renders into BC textures this way):
    1 and the block size in texels in *bw / *bh; its extent is the image's in blocks. */
 int vt_block_view(const vtex *e, const tex_t *t, const view_t *v, int *bw, int *bh);

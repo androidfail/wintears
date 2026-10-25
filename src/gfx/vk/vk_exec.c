@@ -66,7 +66,9 @@ static void do_counter(void *arg) {
 
 /* ---------- TOTK_PASSLOG=<present>: one line per pass and copy of the submissions between that present and the next */
 static int g_plog = -1, g_plogs[8], g_nplog; int vk_passlog_on;   /* TOTK_PASSLOG=<present>[,<present>...] (up to 8) */
-static int g_tgt_log;   /* this pass is logged for its target (the menu's blue 480x270 RGB10A2 background; diagnostics) */
+static int g_tgt_log;
+static vtex *g_pass_col[8];   /* the open pass's colour targets (provenance) */
+void vx_prov_draw(const char *vs, const char *fs) { for (int i = 0; i < 8; i++) if (g_pass_col[i]) vt_prov_draw(g_pass_col[i], vs, fs); }   /* this pass is logged for its target (the menu's blue 480x270 RGB10A2 background; diagnostics) */
 uint64_t vk_present_count(void);
 /* F9 in the window: the next frame is logged as TOTK_PASSLOG would, and saved as <profile>/logs/capture-<n>.png */
 _Atomic uint64_t vk_capture_at;
@@ -161,11 +163,11 @@ static void sample_image(VkImage img, VkFormat fmt, uint32_t lv, uint32_t layer,
     vk_after(pout_log, o);   /* staging memory lives until the submission is done */
 }
 /* textures the logged pass sampled: their contents are logged after it (the pass only read them) */
-static struct { VkImage img; VkFormat fmt; uint32_t w, h; } g_samp[32]; static int g_nsamp;
+static struct { VkImage img; VkFormat fmt; uint32_t w, h; } g_samp[96]; static int g_nsamp;
 void vx_note_sampled(VkImage img, VkFormat fmt, uint32_t w, uint32_t h) {
     if (!vk_passlog_on) return;
     for (int i = 0; i < g_nsamp; i++) if (g_samp[i].img == img) return;
-    if (g_nsamp < 32) g_samp[g_nsamp++] = (typeof(g_samp[0])){img, fmt, w, h};
+    if (g_nsamp < 96) g_samp[g_nsamp++] = (typeof(g_samp[0])){img, fmt, w, h};
 }
 static void pass_output_sample(void) {   /* after vkCmdEndRendering */
     for (int i = 0; i < g_nsamp; i++) if (!vk_fmt_block_compressed(g_samp[i].fmt)) sample_image(g_samp[i].img, g_samp[i].fmt, 0, 0, g_samp[i].w, g_samp[i].h, "sampled");
@@ -191,7 +193,7 @@ void vx_end_pass(void) {
     }
     g_pass_draws = g_pass_clears = 0;
     vk_barrier(vk_cmd());
-    g_pass = 0;
+    g_pass = 0; memset(g_pass_col, 0, sizeof g_pass_col);
     if (g_tgt_log) { g_tgt_log = 0; plog(); }
 }
 
@@ -267,6 +269,7 @@ static int begin_pass(void) {
                           .colorAttachmentCount = (uint32_t)n, .pColorAttachments = ca,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
     S.pass_fmt.ncolor = n;
+    for (int i = 0; i < 8; i++) g_pass_col[i] = i < n ? col[i] : NULL;
     for (int i = 0; i < 8; i++) S.pass_fmt.color[i] = i < n && col[i] ? cf[i] : VK_FORMAT_UNDEFINED;
     S.pass_fmt.depth = has_d ? vt_vkformat(dep) : VK_FORMAT_UNDEFINED;
     S.pass_fmt.stencil = has_s ? vt_vkformat(dep) : VK_FORMAT_UNDEFINED;
@@ -500,7 +503,7 @@ static void copy_t2t(const p_copy_t2t *c) {
             vk_barrier(vk_cmd());
             vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &in);
             vk_barrier(vk_cmd());
-            snprintf(vt_writer, sizeof vt_writer, "depth copy from NVN format %#x", c->src->d.format); vt_written(d);
+            snprintf(vt_writer, sizeof vt_writer, "depth copy from NVN format %#x", c->src->d.format); vt_written(d); vt_prov_copy(d, c->src);
             return;
         }
         VK_ONCE("copy between formats %#x and %#x (depth involved, texel sizes %d / %d): not possible, left to the blit", c->src->d.format, c->dst->d.format, bs, bt);
@@ -549,7 +552,7 @@ static void copy_t2t(const p_copy_t2t *c) {
     }
     vk_barrier(vk_cmd());
     snprintf(vt_writer, sizeof vt_writer, "texture copy from %ux%u NVN format %#x (%s)", c->src->d.width, c->src->d.height, c->src->d.format, same && !convert ? "bit for bit" : "converted / scaled");
-    vt_written(d);
+    vt_written(d); vt_prov_copy(d, c->src);
 }
 static void clear_tex(const p_clear_tex *c) {
     vtex *e = c->tex ? vt_get(c->tex) : NULL;

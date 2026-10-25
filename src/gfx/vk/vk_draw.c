@@ -404,9 +404,10 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                     vtex *e = vt_get(&s.t);
                     VkImageView v = e ? vt_view(e, &s.t, s.has_v ? &s.v : NULL, VT_SAMPLED, (VkImageViewType)b->view) : VK_NULL_HANDLE;
                     if (v) d.imageView = v;
+                    vt_prov_input(&s.t);
                     extern int vk_passlog_on;
                     if (vk_passlog_on) { VLOG("[pass]     tex %ux%ux%u levels %u fmt %#x target %d flags %#x at %p, last written by %s", s.t.d.width, s.t.d.height, s.t.d.depth, s.t.d.levels, s.t.d.format, s.t.d.target, s.t.d.flags, (void *)s.t.mem, vt_writer_of(e));
-                        if (e) { uint32_t w, h, d; vt_size(e, 0, &w, &h, &d); vx_note_sampled(vt_image(e), vt_vkformat(e), w, h); } }
+                        if (e) { uint32_t w, h, d; vt_size(e, 0, &w, &h, &d); vx_note_sampled(vt_image(e), vt_vkformat(e), w, h); vt_prov_dump(e); } }
                 }
                 int sid = (int)((b->sreg >= 0 && b->sreg < 128 ? S.samp[st][b->sreg] : h) >> 20) & 0xfff;
                 samp_par sp; if (sid && vt_slot_samp(sid, &sp)) d.sampler = vt_sampler(&sp);
@@ -683,8 +684,10 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     }
     /* the descriptor sets first: they may upload textures (into this submission's upload buffer, before the pass) */
     { void vx_target_log_check(void); vx_target_log_check(); }
+    vt_prov_reset();
     VkDescriptorSet s0 = stage_set(vs, 0), s1 = fs ? stage_set(fs, 1) : VK_NULL_HANDLE;
     if (!vx_begin_pass()) { g_skipped[2]++; return; }
+    { void vx_prov_draw(const char *vs, const char *fs); vx_prov_draw(vs->name, fs ? fs->name : NULL); }
     int prim = dw ? dw->prim : di->prim;
     VkPipelineLayout lay = layout_of(vs->dsl, fs ? fs->dsl : VK_NULL_HANDLE);
     VkPipeline p = graphics_pipeline(vs, fs, prim, lay);
