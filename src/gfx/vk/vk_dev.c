@@ -172,9 +172,14 @@ void vk_describe_range(uintptr_t lo, uintptr_t hi, char *out, size_t cap);   /* 
 static struct { uintptr_t lo, hi; } g_imp_log[64]; static int g_nimp_log;   /* the first imports (diagnostics) */
 /* Before the first submission: what each imported range is made of now. Linux GPU drivers check every page of an
    imported range at each submission; a page that is inaccessible or not committed fails it (the Steam Deck). */
+void vk_list_regions(uintptr_t lo, uintptr_t hi, int max, void (*line)(const char *));
+int vk_under_wine(void);
+static void region_line(const char *t) { VLOG("%s", t); }
 static void imports_describe(void) {
+    VLOG("running under Wine / Proton: %s", vk_under_wine() ? "yes" : "no");
     for (int i = 0; i < g_nimp_log; i++) { char what[200]; vk_describe_range(g_imp_log[i].lo, g_imp_log[i].hi, what, sizeof what);
-        VLOG("before the first submission, imported %p..%p (%.1f MiB): %s", (void *)g_imp_log[i].lo, (void *)g_imp_log[i].hi, (g_imp_log[i].hi - g_imp_log[i].lo) / 1048576.0, what); }
+        VLOG("before the first submission, imported %p..%p (%.1f MiB): %s", (void *)g_imp_log[i].lo, (void *)g_imp_log[i].hi, (g_imp_log[i].hi - g_imp_log[i].lo) / 1048576.0, what);
+        if (i < 4) vk_list_regions(g_imp_log[i].lo, g_imp_log[i].hi, 12, region_line); }
 }
 static import_t *import_fail(uintptr_t lo, uintptr_t hi, const char *step, int r) {   /* why a range cannot be imported, for the first few */
     static int n; char what[200];
@@ -225,7 +230,10 @@ static void pool_add(const void *mem, uint64_t size) {
     import_t *im = e ? e->buf : NULL;
     if (!im) {
         uint64_t hb, hs; host_heap_range(&hb, &hs);
-        if (a >= hb && b <= hb + hs) im = import_range((uintptr_t)hb, (uintptr_t)(hb + hs));
+        /* TOTK_IMPORT_HEAP=0: each pool is imported on its own instead of the whole heap at once (diagnosis: Linux GPU
+           drivers want an imported range inside one memory mapping; protection changes split the heap's) */
+        static int whole = -1; if (whole < 0) { const char *e = pal_getenv("TOTK_IMPORT_HEAP"); whole = !(e && *e == '0'); if (!whole) VLOG("pools in the heap are imported one by one (TOTK_IMPORT_HEAP=0)"); }
+        if (whole && a >= hb && b <= hb + hs) im = import_range((uintptr_t)hb, (uintptr_t)(hb + hs));
         if (!im) im = import_range(lo, hi);
         if (!im) VK_ONCE("memory pool %p+%#llx cannot be imported: the GPU does not see it (first case)", mem, (unsigned long long)size);
     }
