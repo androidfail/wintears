@@ -104,6 +104,18 @@ static void prov_walk(const vtex *e, int depth, const vtex **seen, int *nseen) {
         }
         if (!found) VLOG("[chain] %*s    (no image over it now)", depth * 2, "");
     }
+    if (!e->prov.ndraws && !e->prov.nin) {   /* only cleared: what else lives in its memory (another texture object may draw there) */
+        int n = 0;
+        for (uint32_t j = 0; j < g_by_stor.cap && n < 16; j++) {
+            const vtex *o = g_by_stor.vals[j];
+            if (!o || o == e || o->k.mem >= e->k.mem + e->k.size || e->k.mem >= o->k.mem + o->k.size) continue;
+            n++;
+            VLOG("[chain] %*s  overlaps image %p: storage %#llx (%llu bytes) %ux%u levels %u class %#x VK %d; last written by %s at present %llu; %d draws, %d inputs",
+                 depth * 2, "", (void *)o, (unsigned long long)o->k.mem, (unsigned long long)o->k.size, o->w, o->h, o->levels, o->k.cls, (int)o->fmt, vt_writer_of(o), (unsigned long long)o->prov.present, o->prov.ndraws, o->prov.nin);
+            for (int i = 0; i < o->prov.nsh; i++) VLOG("[chain] %*s    shaders %s", depth * 2, "", o->prov.sh[i]);
+        }
+        if (!n) VLOG("[chain] %*s  (nothing else lives in its memory)", depth * 2, "");
+    }
 }
 void vt_prov_dump(const vtex *e) {
     static const vtex *done[256]; static int ndone; static uint64_t at;

@@ -67,6 +67,7 @@ static void do_counter(void *arg) {
 /* ---------- TOTK_PASSLOG=<present>: one line per pass and copy of the submissions between that present and the next */
 static int g_plog = -1, g_plogs[8], g_nplog; int vk_passlog_on;   /* TOTK_PASSLOG=<present>[,<present>...] (up to 8) */
 static int g_tgt_log;
+static uint64_t g_frames_log_to;   /* whole frames logged up to this present (the menus' snapshot frame) */
 static vtex *g_pass_col[8];   /* the open pass's colour targets (provenance) */
 void vx_prov_draw(const char *vs, const char *fs) { for (int i = 0; i < 8; i++) if (g_pass_col[i]) vt_prov_draw(g_pass_col[i], vs, fs); }   /* this pass is logged for its target (the menu's blue 480x270 RGB10A2 background; diagnostics) */
 uint64_t vk_present_count(void);
@@ -88,6 +89,7 @@ static int plog(void) {
     vk_passlog_on = cap && vk_present_count() == cap;
     for (int i = 0; i < g_nplog; i++) if (vk_present_count() == (uint64_t)g_plogs[i]) vk_passlog_on = 1;
     if (g_tgt_log) vk_passlog_on = 1;
+    if (g_frames_log_to && vk_present_count() <= g_frames_log_to) vk_passlog_on = 1;
     return vk_passlog_on;
 }
 static int g_pass_draws, g_pass_clears;
@@ -239,12 +241,12 @@ static int targets(vtex **col, VkImageView *cv, VkFormat *cf, vtex **dep, VkImag
 /* Before a pass opens (and before a draw builds its descriptor sets): the first passes into a 480x270 RGB10A2 target
    are logged whole, inputs and their writers included (the menus' blue background; diagnostics). */
 void vx_target_log_check(void) {
-    static int seen;
-    if (g_pass || vk_passlog_on || seen >= 12 || !S.has_rt || S.rt.n < 1 || !S.rt.color[0]) return;
+    static int seen;   /* the menus' scene snapshot: 1920x1080 RGB10A2 in a virtual pool; the rest of its frame and the next are logged whole */
+    if (g_pass || vk_passlog_on || seen >= 2 || !S.has_rt || S.rt.n < 1 || !S.rt.color[0]) return;
     const tex_t *t = S.rt.color[0];
-    if (t->d.width != 480 || t->d.height != 270 || t->d.format != 0x3d) return;
-    seen++; g_tgt_log = vk_passlog_on = 1;
-    VLOG("[pass] target log %d of 12: pass into 480x270 NVN format 0x3d at %p (present %llu)", seen, (void *)t->mem, (unsigned long long)vk_present_count());
+    if (t->d.width != 1920 || t->d.height != 1080 || t->d.format != 0x3d || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return;
+    seen++; g_frames_log_to = vk_present_count() + 1; vk_passlog_on = 1;
+    VLOG("[pass] snapshot log %d of 2: pass into 1920x1080 NVN format 0x3d at %p (present %llu); this frame and the next are logged whole", seen, (void *)t->mem, (unsigned long long)vk_present_count());
 }
 
 /* Open a pass on the current targets; 0 when there is nothing to render into. */
