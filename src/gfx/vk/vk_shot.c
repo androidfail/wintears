@@ -1,5 +1,7 @@
 /* TOTK_SHOT=<frame>:<path.png>[,<frame>:<path.png>...]: the game's swapchain texture at those presents, saved as
    PNG (RGBA8, stored deflate blocks: no compression library). For checking the picture without looking at the screen. */
+#include <stdatomic.h>
+
 #include "gfx/vk/vk.h"
 
 static uint32_t crc_tab[256];
@@ -40,8 +42,15 @@ int vk_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h, 
 }
 
 /* the path to save present n to, or NULL */
+extern _Atomic uint64_t vk_capture_at;
 const char *vk_shot_path(uint64_t n) {
     static char list[2048]; static int init;
+    uint64_t cap = atomic_load(&vk_capture_at);
+    if (cap && n == cap + 1) {   /* the F9 frame */
+        static char cp[1200]; char dir[1100]; snprintf(dir, sizeof dir, "%s/logs", host_profile_dir()); pal_mkdirs(dir);
+        snprintf(cp, sizeof cp, "%s/capture-%llu.png", dir, (unsigned long long)n);
+        return cp;
+    }
     if (!init) { init = 1; const char *e = pal_getenv("TOTK_SHOT"); snprintf(list, sizeof list, "%s", e ? e : ""); }
     static char out[1024];
     for (const char *p = list; *p;) {

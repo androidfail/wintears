@@ -7,6 +7,7 @@
    submission is done, in recording order. The state (targets, bindings) carries over between submissions, as on the
    GPU's one queue. */
 #include <math.h>
+#include <stdatomic.h>
 
 #include "gfx/vk/vk.h"
 #include "vk_draw.h"
@@ -66,13 +67,20 @@ static void do_counter(void *arg) {
 /* ---------- TOTK_PASSLOG=<present>: one line per pass and copy of the submissions between that present and the next */
 static int g_plog = -1, g_plogs[8], g_nplog; int vk_passlog_on;   /* TOTK_PASSLOG=<present>[,<present>...] (up to 8) */
 uint64_t vk_present_count(void);
+/* F9 in the window: the next frame is logged as TOTK_PASSLOG would, and saved as <profile>/logs/capture-<n>.png */
+_Atomic uint64_t vk_capture_at;
+void vk_capture_request(void) {
+    uint64_t n = vk_present_count() + 1;
+    atomic_store(&vk_capture_at, n);
+    VLOG("[capture] F9: logging the passes of the frame after present %llu", (unsigned long long)n);
+}
 static int plog(void) {
     if (g_plog < 0) {
         const char *e = pal_getenv("TOTK_PASSLOG");
         for (char *q; e && *e && g_nplog < 8; e = *q == ',' ? q + 1 : q) { g_plogs[g_nplog] = (int)strtol(e, &q, 10); if (q == e) break; g_nplog++; }
         g_plog = g_nplog > 0;
     }
-    vk_passlog_on = 0;
+    vk_passlog_on = vk_present_count() == atomic_load(&vk_capture_at);
     for (int i = 0; i < g_nplog; i++) if (vk_present_count() == (uint64_t)g_plogs[i]) vk_passlog_on = 1;
     return vk_passlog_on;
 }

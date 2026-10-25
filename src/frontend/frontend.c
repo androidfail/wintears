@@ -114,6 +114,7 @@ void fe_run(void) {
             case SDL_EVENT_KEY_DOWN:
                 if (!e.key.repeat && e.key.scancode == SDL_SCANCODE_F11)
                     SDL_SetWindowFullscreen(g_win, !(SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN));
+                if (!e.key.repeat && e.key.scancode == SDL_SCANCODE_F9) { void vk_capture_request(void); vk_capture_request(); }   /* log + save the next frame */
                 break;
             case SDL_EVENT_WINDOW_FOCUS_LOST: host_input_clear(); break;   /* no key stays held while another window has focus */
             default: break;
