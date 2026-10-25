@@ -169,6 +169,13 @@ static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_pool_n, g_import_n;
 
 void vk_describe_range(uintptr_t lo, uintptr_t hi, char *out, size_t cap);   /* vk_winmem.c */
+static struct { uintptr_t lo, hi; } g_imp_log[64]; static int g_nimp_log;   /* the first imports (diagnostics) */
+/* Before the first submission: what each imported range is made of now. Linux GPU drivers check every page of an
+   imported range at each submission; a page that is inaccessible or not committed fails it (the Steam Deck). */
+static void imports_describe(void) {
+    for (int i = 0; i < g_nimp_log; i++) { char what[200]; vk_describe_range(g_imp_log[i].lo, g_imp_log[i].hi, what, sizeof what);
+        VLOG("before the first submission, imported %p..%p (%.1f MiB): %s", (void *)g_imp_log[i].lo, (void *)g_imp_log[i].hi, (g_imp_log[i].hi - g_imp_log[i].lo) / 1048576.0, what); }
+}
 static import_t *import_fail(uintptr_t lo, uintptr_t hi, const char *step, int r) {   /* why a range cannot be imported, for the first few */
     static int n; char what[200];
     if (n++ < 4) { vk_describe_range(lo, hi, what, sizeof what); VLOG("import of %p..%p (%.1f MiB) failed at %s (%d): %s", (void *)lo, (void *)hi, (hi - lo) / 1048576.0, step, r, what); }
@@ -202,6 +209,8 @@ static import_t *import_range(uintptr_t lo, uintptr_t hi) {
     if (bind != VK_SUCCESS) { vkFreeMemory(vk_dev, mem, NULL); vkDestroyBuffer(vk_dev, buf, NULL); return import_fail(lo, hi, "bind", (int)bind); }
     import_t *im_ = calloc(1, sizeof *im_);
     *im_ = (import_t){lo, hi, mem, buf, 0};
+    if (g_nimp_log < 64) g_imp_log[g_nimp_log++] = (typeof(g_imp_log[0])){lo, hi};
+    { static int n; if (n++ < 24) VLOG("imported %p..%p (%.1f MiB) for the GPU", (void *)lo, (void *)hi, (hi - lo) / 1048576.0); }
     pidx_ent e = {lo, hi, lo, im_, 0, im_, 0};
     if (!pidx_insert(&g_imports, &e)) die("Vulkan: pool table");
     g_import_n++;
@@ -396,7 +405,9 @@ uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo
     if (signal) sig[1] = *signal;
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = wait,
                         .commandBufferInfoCount = 2, .pCommandBufferInfos = cb, .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig};
+    if (!g_fence) { pthread_mutex_lock(&g_pool_mu); imports_describe(); pthread_mutex_unlock(&g_pool_mu); }
     VkResult r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
+    { static int n; if (n++ < 3) VLOG("submission %llu: %s", (unsigned long long)(g_fence + 1), r == VK_SUCCESS ? "accepted" : "refused"); }
     if (r != VK_SUCCESS) die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
     s->fence = ++g_fence; s->next = NULL; s->t_submit = pal_now_ns();
     g_cur = NULL;
