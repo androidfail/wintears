@@ -124,6 +124,14 @@ static int create_device(void) {
     { const char *e = pal_getenv("TOTK_VK_ROBUST"); int rob = e && *e == '1';
       if (!rob) { f.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE; }
       VLOG("bounds checks: %s (TOTK_VK_ROBUST)", rob ? "on" : "off"); }
+    /* Off although the GPU has them, as nothing here uses them: with buffer device addresses or update-after-bind
+       descriptors RADV puts every allocation in every submission, and the kernel then checks each imported range at
+       each submission (the Steam Deck's imports are one per pool: replay was 22 ms per submission against 2 on the PC). */
+    f12.bufferDeviceAddress = f12.bufferDeviceAddressCaptureReplay = f12.bufferDeviceAddressMultiDevice = VK_FALSE;
+    f12.descriptorBindingUniformBufferUpdateAfterBind = f12.descriptorBindingSampledImageUpdateAfterBind = VK_FALSE;
+    f12.descriptorBindingStorageImageUpdateAfterBind = f12.descriptorBindingStorageBufferUpdateAfterBind = VK_FALSE;
+    f12.descriptorBindingUniformTexelBufferUpdateAfterBind = f12.descriptorBindingStorageTexelBufferUpdateAfterBind = VK_FALSE;
+    f13.descriptorBindingInlineUniformBlockUpdateAfterBind = VK_FALSE;
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) { VLOG("the GPU lacks dynamic rendering / synchronization2 / timeline semaphores"); return -1; }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = vk_qfam, .queueCount = 1, .pQueuePriorities = &prio};
@@ -277,12 +285,53 @@ static void pool_del(const void *mem) {
     }
 }
 
+/* GPU-only stand-in for a physical pool the driver cannot import. TOTK's physical pools are CPU_NO_ACCESS page-file
+   sections that virtual pools map views of; Linux GPU drivers import only private memory, so on the Steam Deck the
+   virtual pool (the menus' render targets and buffers) failed to import and its buffers were bound as zeros. As the CPU
+   never touches a CPU_NO_ACCESS pool, device memory of the same size, addressed by physical offset, is the same memory
+   to the GPU: virtual addresses are translated page by page (totk_vpool_physical), so aliases still meet.
+   shortcut: a stand-in lives as long as the process (pools are few and long-lived); free it at pool finalize if
+   physical pools ever come and go. */
+uint64_t totk_vpool_physical(const void *mem, uint64_t size);
+int totk_vpool_phys_pool(uint64_t phys, uint64_t *lo, uint64_t *span);
+static import_t *standin_make(uintptr_t lo, uintptr_t hi) {   /* g_pool_mu held */
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = hi - lo, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                 VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
+    VkBuffer buf;
+    if (vkCreateBuffer(vk_dev, &bi, NULL, &buf) != VK_SUCCESS) return NULL;
+    VkMemoryRequirements req; vkGetBufferMemoryRequirements(vk_dev, buf, &req);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(vk_phys, &mp);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((req.memoryTypeBits >> i & 1) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+    VkMemoryAllocateInfo mi = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = type};
+    VkDeviceMemory mem;
+    if (type == UINT32_MAX || vkAllocateMemory(vk_dev, &mi, NULL, &mem) != VK_SUCCESS) { vkDestroyBuffer(vk_dev, buf, NULL); return NULL; }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) { vkFreeMemory(vk_dev, mem, NULL); vkDestroyBuffer(vk_dev, buf, NULL); return NULL; }
+    import_t *im = calloc(1, sizeof *im);
+    *im = (import_t){lo, hi, mem, buf, 1};
+    pidx_ent e = {lo, hi, lo, im, 0, im, 0};
+    if (!pidx_insert(&g_imports, &e)) die("Vulkan: pool table");
+    VLOG("physical pool %p..%p (%.1f MiB) is not importable: the GPU uses device memory in its place (CPU_NO_ACCESS)", (void *)lo, (void *)hi, (hi - lo) / 1048576.0);
+    return im;
+}
 int vk_buf(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     pthread_mutex_lock(&g_pool_mu);
     const pidx_ent *e = pidx_find(&g_imports, (uintptr_t)addr, len ? len : 1);
     if (e) { *buf = ((import_t *)e->buf)->buf; *off = addr - e->lo; }
     pthread_mutex_unlock(&g_pool_mu);
-    return e != NULL;
+    if (e) return 1;
+    /* not imported: a virtual pool's pages, through their physical pool (its stand-in when that is not importable) */
+    uint64_t ph = totk_vpool_physical((const void *)(uintptr_t)addr, len ? len : 1), plo, pspan;
+    if (!ph || !totk_vpool_phys_pool(ph, &plo, &pspan)) return 0;
+    pthread_mutex_lock(&g_pool_mu);
+    e = pidx_find(&g_imports, (uintptr_t)ph, len ? len : 1);
+    import_t *im = e ? e->buf : standin_make((uintptr_t)plo, (uintptr_t)(plo + pspan));
+    if (im) { *buf = im->buf; *off = ph - im->lo; }
+    pthread_mutex_unlock(&g_pool_mu);
+    return im != NULL;
 }
 
 /* ---------- submissions ---------- */
@@ -422,7 +471,9 @@ uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = wait,
                         .commandBufferInfoCount = 2, .pCommandBufferInfos = cb, .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig};
     if (!g_fence) { pthread_mutex_lock(&g_pool_mu); imports_describe(); pthread_mutex_unlock(&g_pool_mu); }
+    uint64_t tq = pal_now_ns();
     VkResult r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
+    { extern _Atomic uint64_t vk_ns_qsubmit; atomic_fetch_add(&vk_ns_qsubmit, pal_now_ns() - tq); }
     { static int n; if (n++ < 3) VLOG("submission %llu: %s", (unsigned long long)(g_fence + 1), r == VK_SUCCESS ? "accepted" : "refused"); }
     if (r != VK_SUCCESS) die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
     s->fence = ++g_fence; s->next = NULL; s->t_submit = pal_now_ns();
@@ -521,6 +572,7 @@ void vk_log_memory(void) {
          res / 1048576.0, com / 1048576.0, hs / 1048576.0, (img[0] + img[1] + img[2]) / 1048576.0, img[0] / 1048576.0, img[1] / 1048576.0, img[2] / 1048576.0, img[3] / 1048576.0,
          atomic_load(&g_chunk_bytes) / 1048576.0, heaps);
 }
+_Atomic uint64_t vk_ns_qsubmit;   /* time in vkQueueSubmit2 (the 10-second line) */
 static uint64_t submit(const uint64_t *handles, int n) {
     uint64_t t0 = pal_now_ns();
     {   /* the sampler profiles this thread while it replays (threads.c, the [replay] line) */
@@ -545,7 +597,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
     if (now - last >= 10000000000ull) {
         last = now;
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
-        { extern uint64_t vk_ns_hash; VLOG("texture content checks (no write protection): %.0f ms of the replay", vk_ns_hash / 1e6); vk_ns_hash = 0; }
+        { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6); vk_ns_hash = 0; }
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
         vk_log_memory();

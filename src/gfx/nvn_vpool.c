@@ -185,6 +185,19 @@ uint64_t totk_vpool_physical(const void *mem, uint64_t size) {
     return r;
 }
 
+/* The physical pool whose own mapping holds address phys (as totk_vpool_physical returns): its range. 0 if none. */
+int totk_vpool_phys_pool(uint64_t phys, uint64_t *lo, uint64_t *span) {
+    int found = 0;
+    pthread_mutex_lock(&g_pt_mu);
+    for (int i = 0; i < MAX_POOLS && !found; i++) {
+        vstate *s = &g_pools[i];
+        if (!s->host || !s->section || phys < (uint64_t)(uintptr_t)s->host || phys >= (uint64_t)(uintptr_t)s->host + s->span) continue;
+        *lo = (uint64_t)(uintptr_t)s->host; *span = s->span; found = 1;
+    }
+    pthread_mutex_unlock(&g_pt_mu);
+    return found;
+}
+
 int totk_vpool_map(pool_t *v, int count, const totk_mapping_request *r) {
     if (!v || v->magic != POOL_MAGIC || !(v->flags & F_VIRTUAL) || !v->mem) { LOG("vpool: MapVirtual target %p is not a virtual pool", (void *)v); return 0; }
     if (count < 0 || (count && !r)) { LOG("vpool: invalid request count %d", count); return 0; }
