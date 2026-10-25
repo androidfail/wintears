@@ -3,7 +3,8 @@
    - "X" formats (RGBX, RGB_DXT1, BGRX) read alpha as 1 (view swizzle).
    - Depth24 has no portable Vulkan format (AMD lacks D24S8): Depth32F / D32F_S8 as upstream; uploaded 24-bit depth
      data is converted (convert = 1).
-   - 3-component RGB8/16/32 and the RGB10A2 signed kinds are expanded on upload (convert = 2), as upstream.
+   - 3-component RGB8/16/32 are expanded on upload (convert = 2), as upstream; the RGB10A2 signed kinds are unpacked to
+     16 bits a channel (convert = 4).
    - *_UI2F / *_I2F (integer storage read as float) are the USCALED / SSCALED formats.
    - 16-bit packed formats follow upstream's component order, read as least significant bits first; like upstream,
      not checked against real game data.
@@ -20,6 +21,7 @@ typedef struct { VkFormat f; uint8_t noalpha, rb, convert, depth, stencil; } ent
 #define X(f) {VK_FORMAT_##f, 1, 0, 0, 0, 0}
 #define C(f) {VK_FORMAT_##f, 0, 0, 2, 0, 0}     /* expanded on upload */
 #define CX(f) {VK_FORMAT_##f, 1, 0, 2, 0, 0}
+#define C4(f) {VK_FORMAT_##f, 0, 0, 4, 0, 0}    /* RGB10A2 signed: unpacked to 16 bits a channel on upload (I2F as float) */
 #define SW(f) {VK_FORMAT_##f, 0, 1, 0, 0, 0}    /* r and b swapped */
 #define SWX(f) {VK_FORMAT_##f, 1, 1, 0, 0, 0}
 
@@ -50,7 +52,7 @@ static const ent T[0x9D] = {
     [0x57] = E(R8G8_USCALED), E(R8G8_SSCALED), E(R16G16_USCALED), E(R16G16_SSCALED), E(R32G32_UINT), E(R32G32_SINT),
     [0x5D] = CX(R8G8B8A8_USCALED), CX(R8G8B8A8_SSCALED), CX(R16G16B16A16_USCALED), CX(R16G16B16A16_SSCALED), CX(R32G32B32A32_UINT), CX(R32G32B32A32_SINT),
     [0x63] = E(R8G8B8A8_USCALED), E(R8G8B8A8_SSCALED), E(R16G16B16A16_USCALED), E(R16G16B16A16_SSCALED), E(R32G32B32A32_UINT), E(R32G32B32A32_SINT),
-    [0x69] = C(R16G16B16A16_SNORM), C(R16G16B16A16_SINT), E(A2B10G10R10_USCALED_PACK32), C(R16G16B16A16_SSCALED),
+    [0x69] = C4(R16G16B16A16_SNORM), C4(R16G16B16A16_SINT), E(A2B10G10R10_USCALED_PACK32), C4(R16G16B16A16_SFLOAT),
     [0x6D] = X(R8G8B8A8_UNORM), X(R8G8B8A8_SNORM), X(R8G8B8A8_UINT), X(R8G8B8A8_SINT),
     [0x71] = X(R16G16B16A16_SFLOAT), X(R16G16B16A16_UNORM), X(R16G16B16A16_SNORM), X(R16G16B16A16_UINT), X(R16G16B16A16_SINT),
     [0x76] = X(R32G32B32A32_SFLOAT), X(R32G32B32A32_UINT), X(R32G32B32A32_SINT),

@@ -137,6 +137,7 @@ static int create_device(void) {
     vk_texel_align[1] = (uint32_t)p13.storageTexelBufferOffsetAlignmentBytes; vk_texel_single[1] = p13.storageTexelBufferOffsetSingleTexelAlignment;
     for (int i = 0; i < 2; i++) if (!vk_texel_align[i]) vk_texel_align[i] = (uint32_t)vk_props.limits.minTexelBufferOffsetAlignment;
     g_host_align = hp.minImportedHostPointerAlignment;
+    vk_sb_align = vk_props.limits.minStorageBufferOffsetAlignment > 16 ? (uint32_t)vk_props.limits.minStorageBufferOffsetAlignment : 16;
     VLOG("device %s, driver %#x, imported memory alignment %llu, at most %u allocations, BC %s, ASTC %s",
          vk_props.deviceName, vk_props.driverVersion, (unsigned long long)g_host_align, vk_props.limits.maxMemoryAllocationCount,
          f.features.textureCompressionBC ? "yes" : "no", f.features.textureCompressionASTC_LDR ? "yes" : "no (decoded on upload)");
@@ -313,6 +314,23 @@ void vk_after(void (*fn)(void *), void *arg) {
     s->acts[s->nact++] = (act_t){fn, arg};
 }
 
+/* A write the GPU cannot make (memory it does not see): done by the CPU once the open submission has completed, so it
+   lands after the GPU work recorded before it, as on the GPU timeline. */
+typedef struct { void *dst; const void *src; size_t n; uint8_t data[]; } cpu_wr;
+static void do_cpu_write(void *arg) {
+    cpu_wr *w = arg;
+    dm_guest_write_prepare(w->dst, w->n);
+    memmove(w->dst, w->src ? w->src : w->data, w->n);
+    free(w);
+}
+void vk_after_write(uint64_t dst, const void *src, size_t n, int snapshot) {
+    cpu_wr *w = malloc(sizeof *w + (snapshot ? n : 0));
+    if (!w) die("Vulkan: deferred write of %zu bytes", n);
+    w->dst = (void *)(uintptr_t)dst; w->n = n; w->src = snapshot ? NULL : src;
+    if (snapshot) memcpy(w->data, src, n);
+    vk_after(do_cpu_write, w);
+}
+
 static chunk *new_chunk(VkDeviceSize size) {
     pthread_mutex_lock(&g_done_mu);
     chunk *c = size <= CHUNK_SIZE ? g_free_chunks : NULL;
@@ -321,8 +339,9 @@ static chunk *new_chunk(VkDeviceSize size) {
     if (c) { c->used = 0; return c; }
     c = calloc(1, sizeof *c);
     c->size = size > CHUNK_SIZE ? size : CHUNK_SIZE;
-    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = c->size,
-                             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = c->size,   /* index: quads, 8-bit indices; texel: buffer textures copied (vk_tex.c) */
+                             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
     VmaAllocationCreateInfo ac = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT, .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
     VmaAllocationInfo info;
     VKC(vmaCreateBuffer(vk_vma, &bi, &ac, &c->buf, &c->al, &info));
@@ -432,6 +451,7 @@ static void window_tex(uint64_t serial) { (void)serial; }
 
 uint32_t vk_texel_align[2] = {16, 16}, vk_texel_single[2];
 int vk_divisor;
+uint32_t vk_sb_align = 16;
 uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_ubflush, vk_n_barrier;
 static uint64_t g_sub_max;
 static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;

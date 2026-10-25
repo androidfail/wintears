@@ -37,4 +37,6 @@ void vd_init(void);
 void vd_pcache_save(void);   /* new pipelines since the last save: write the cache to the profile (at most once a minute) */
 int vd_ub_update(uint64_t dst, const void *data, uint64_t n);   /* 1: logged (renamed), 0: write it on the GPU timeline */
 void vd_ub_guard(uint64_t lo, uint64_t hi);   /* before a non-uniform GPU access to [lo, hi) */
+void vd_shadow_retire(uint64_t lo, uint64_t hi);   /* before a GPU access to [lo, hi) other than a storage binding (vd_ub_guard does it too) */
+void vd_ub_read(uint64_t lo, void *out, uint64_t len);   /* the bytes as the GPU would read them at this point of the replay (logged uniform updates applied) */
 void vd_ub_flush(void);

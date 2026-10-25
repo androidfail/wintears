@@ -68,6 +68,36 @@ static void image_barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, Vk
     vkCmdPipelineBarrier2(c, &di);
 }
 
+/* The game's bytes are what the display shows, whatever the format says. A blit from an sRGB image would decode them
+   to linear first (a dark picture), so such an image goes through a UNORM scratch image copied bit for bit. */
+static VkImage g_raw; static VmaAllocation g_raw_al; static VkFormat g_raw_fmt; static uint32_t g_raw_w, g_raw_h;
+typedef struct { VkImage img; VmaAllocation al; } raw_old;
+static void raw_free(void *arg) { raw_old *o = arg; vmaDestroyImage(vk_vma, o->img, o->al); free(o); }
+static VkImage unorm_copy(VkCommandBuffer c, const vtex *e, uint32_t w, uint32_t h) {
+    VkFormat f = vt_vkformat(e) == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : vt_vkformat(e) == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_UNDEFINED;
+    if (!f) return vt_image(e);
+    if (!g_raw || g_raw_fmt != f || g_raw_w != w || g_raw_h != h) {
+        if (g_raw) { raw_old *o = malloc(sizeof *o); if (o) { *o = (raw_old){g_raw, g_raw_al}; vk_after(raw_free, o); } }
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        g_raw = VK_NULL_HANDLE;
+        if (vmaCreateImage(vk_vma, &ci, &ac, &g_raw, &g_raw_al, NULL) != VK_SUCCESS) { g_raw = VK_NULL_HANDLE; return vt_image(e); }
+        g_raw_fmt = f; g_raw_w = w; g_raw_h = h;
+    }
+    VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = g_raw, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+    vkCmdPipelineBarrier2(c, &di);   /* its old contents are not needed */
+    VkImageCopy cp = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {w, h, 1}};
+    vkCmdCopyImage(c, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, g_raw, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+    vk_barrier(c);
+    return g_raw;
+}
+
 typedef struct { uint8_t *px; uint32_t w, h, d; int bgra; char path[1024]; } shot_t;
 int vk_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h, size_t pitch);
 const char *vk_shot_path(uint64_t n);
@@ -102,7 +132,7 @@ uint64_t vp_present(const tex_t *t, const int crop[4]) {
         VkImageBlit b = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{sx, sy, 0}, {sx + sw, sy + sh, 1}},
                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{dx, dy, 0}, {dx + dw, dy + dh, 1}}};
         vk_barrier(c);
-        vkCmdBlitImage(c, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, g_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        vkCmdBlitImage(c, unorm_copy(c, e, tw, th), VK_IMAGE_LAYOUT_GENERAL, g_img[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
     }
     const char *shot = e ? vk_shot_path(g_presents + 1) : NULL;
     VkFormat ef = e ? vt_vkformat(e) : VK_FORMAT_UNDEFINED;

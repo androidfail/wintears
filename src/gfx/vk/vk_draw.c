@@ -200,11 +200,26 @@ static const shadow *shadow_make(uint64_t a, uint64_t n) {
                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VKC(vmaCreateBuffer(vk_vma, &bi, &ac, &x->dev, &x->al, NULL));
+    /* filled in replay order (not in the uploads buffer): GPU writes earlier in this submission are in it */
+    vx_end_pass();
     VkBufferCopy r = {ho, 0, n};
-    vkCmdCopyBuffer(vk_pre(), hb, x->dev, 1, &r);
-    vk_barrier(vk_pre());
+    vkCmdCopyBuffer(vk_cmd(), hb, x->dev, 1, &r);
+    vk_barrier(vk_cmd());
     shadow *keep = malloc(sizeof *keep); *keep = *x; vk_after(shadow_free, keep);
     return x;
+}
+/* Any other GPU access to [lo, hi) (uniform update, copy, vertex / index / texel buffer): the shadows over it are
+   written back to pool memory first and dropped; later storage bindings make new ones from there. */
+void vd_shadow_retire(uint64_t lo, uint64_t hi) {
+    shadows_now();
+    for (int i = 0; i < g_nsh;) {
+        if (!(g_sh[i].lo < hi && lo < g_sh[i].hi)) { i++; continue; }
+        vx_end_pass();
+        VkBufferCopy r = {0, g_sh[i].host_off, g_sh[i].hi - g_sh[i].lo};
+        vkCmdCopyBuffer(vk_cmd(), g_sh[i].dev, g_sh[i].host, 1, &r);
+        vk_barrier(vk_cmd());
+        g_sh[i] = g_sh[--g_nsh];   /* its buffer is freed when the submission completes (shadow_make) */
+    }
 }
 void vd_shadows_flush(void) {   /* end of the submission, outside a pass: the GPU's writes back into pool memory */
     shadows_now();
@@ -280,9 +295,13 @@ void vd_ub_flush(void) {   /* the logged updates into memory, on the GPU timelin
             uint8_t *p = vk_stage(hi - lo, 16, &sb, &so);
             ub_apply(g_upd, g_nupd, lo, p, hi - lo);   /* in log order: the newest bytes win */
             VkBufferCopy r = {so, dof, hi - lo}; vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
-        } else for (int k = 0; k < g_nupd; k++) if (g_upd[k].lo < hi && lo < g_upd[k].hi) {   /* spans pools: written by the CPU now */
-            dm_guest_write_prepare((void *)(uintptr_t)g_upd[k].lo, (size_t)(g_upd[k].hi - g_upd[k].lo));
-            memcpy((void *)(uintptr_t)g_upd[k].lo, g_upd[k].data, (size_t)(g_upd[k].hi - g_upd[k].lo));
+        } else for (int k = 0; k < g_nupd; k++) if (g_upd[k].lo < hi && lo < g_upd[k].hi) {   /* spans pools: each update on its own, in log order */
+            uint64_t un = g_upd[k].hi - g_upd[k].lo;
+            if (vk_buf(g_upd[k].lo, un, &db, &dof)) {
+                memcpy(vk_stage(un, 16, &sb, &so), g_upd[k].data, (size_t)un);
+                VkBufferCopy r = {so, dof, un}; vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
+                vk_barrier(vk_cmd());   /* the next update may overlap this one */
+            } else vk_after_write(g_upd[k].lo, g_upd[k].data, (size_t)un, 1);   /* not GPU memory: by the CPU after the submission */
         }
         i = j;
     }
@@ -293,13 +312,15 @@ void vd_ub_flush(void) {   /* the logged updates into memory, on the GPU timelin
     for (int i = 0; i < g_nupd; i++) { g_upd[i].fence = f; g_inf[g_ninf++] = g_upd[i]; }
     g_nupd = 0; g_upd_lo = UINT64_MAX; g_upd_hi = 0;
 }
-void vd_ub_guard(uint64_t lo, uint64_t hi) { if (ub_hit(lo, hi)) vd_ub_flush(); }
+void vd_ub_guard(uint64_t lo, uint64_t hi) { vd_shadow_retire(lo, hi); if (ub_hit(lo, hi)) vd_ub_flush(); }
+void vd_ub_read(uint64_t lo, void *out, uint64_t len) { ub_read(lo, out, len); }
 
 static VkDescriptorBufferInfo ubo_at(uint64_t addr, uint64_t size) {
     VkBuffer b; VkDeviceSize off;
     if (!addr || !vk_buf(addr, 1, &b, &off)) return (VkDescriptorBufferInfo){g_zero, 0, ZERO_SIZE};
     { int ov; const shadow *x = shadow_of(addr, size ? size : 256, &ov); if (x && !((addr - x->lo) % vk_props.limits.minUniformBufferOffsetAlignment))
-        return (VkDescriptorBufferInfo){x->dev, addr - x->lo, (size ? size : 256) < 65536 ? (size ? size : 256) : 65536}; }
+        return (VkDescriptorBufferInfo){x->dev, addr - x->lo, (size ? size : 256) < 65536 ? (size ? size : 256) : 65536};
+      if (x || ov) vd_shadow_retire(addr, addr + (size ? size : 256)); }   /* read from pool memory: the shadow's writes go there first */
     VkDeviceSize al = vk_props.limits.minUniformBufferOffsetAlignment, range = size && size < 65536 ? size : 65536;
     if (off % al) {
         VK_ONCE("uniform buffer at %#llx is not %llu-byte aligned: its bytes are copied at record time", (unsigned long long)addr, (unsigned long long)al);
@@ -313,21 +334,21 @@ static VkDescriptorBufferInfo ubo_at(uint64_t addr, uint64_t size) {
 static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size, int rw) {
     VkBuffer b; VkDeviceSize off;
     if (!addr || !vk_buf(addr, 1, &b, &off)) return (VkDescriptorBufferInfo){g_zero, 0, ZERO_SIZE};
-    { VkDeviceSize lo = off & ~(VkDeviceSize)15, range = (size ? size : 65536) + (off - lo);
-      uint64_t ga = addr - (off - lo); int ov;
-      if (ub_hit(ga, ga + range)) {   /* uniform bytes updated this submission, read as storage */
-          if (!rw) return ub_copy_of(ga, range < vk_props.limits.maxStorageBufferRange ? range : vk_props.limits.maxStorageBufferRange, vk_props.limits.minStorageBufferOffsetAlignment);
-          vd_ub_flush();
-      }
-      const shadow *x = shadow_of(ga, range, &ov);
-      if (!x && rw && !ov) x = shadow_make(ga, range);
-      if (!x && rw && ov) VK_ONCE("written storage buffer %#llx+%#llx overlaps another one in part: left in system memory", (unsigned long long)ga, (unsigned long long)range);
-      if (x) return (VkDescriptorBufferInfo){x->dev, ga - x->lo, range}; }
-    /* bound at the 16-byte boundary below: the translator adds the address's low bits itself (Ryujinx storage buffer alignment) */
-    VkDeviceSize lo = off & ~(VkDeviceSize)15, range = (size ? size : 65536) + (off - lo);
+    /* bound at the vk_sb_align boundary below: the translator adds the address's low bits itself (Ryujinx storage buffer
+       alignment, set to the device's: tools/wt_xlate/patches) */
+    VkDeviceSize lo = off & ~(VkDeviceSize)(vk_sb_align - 1), range = (size ? size : 65536) + (off - lo);
     if (range > vk_props.limits.maxStorageBufferRange) range = vk_props.limits.maxStorageBufferRange;
+    uint64_t ga = addr - (off - lo); int ov;
+    if (ub_hit(ga, ga + range)) {   /* uniform bytes updated this submission, read as storage */
+        if (!rw) return ub_copy_of(ga, range, vk_props.limits.minStorageBufferOffsetAlignment);
+        vd_ub_flush();
+    }
+    const shadow *x = shadow_of(ga, range, &ov);
+    if (!x && ov) vd_shadow_retire(ga, ga + range);   /* overlaps shadows in part: they go back to memory, then one shadow over all of it */
+    if (!x && rw) x = shadow_make(ga, range);
+    if (x) return (VkDescriptorBufferInfo){x->dev, ga - x->lo, range};
     VkBuffer b2; VkDeviceSize o2;
-    while (range > 16 && !vk_buf(addr - (off - lo), range, &b2, &o2)) range >>= 1;
+    while (range > 16 && !vk_buf(ga, range, &b2, &o2)) range >>= 1;
     return (VkDescriptorBufferInfo){b, lo, range};
 }
 
@@ -367,8 +388,8 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             case RB_SBUF: if (b->reg >= 0 && b->reg < 16) d = ssbo_at(S.ssbo[st][b->reg].addr, S.ssbo[st][b->reg].size, b->rw); break;
             case RB_UBOPTR: if (b->reg >= 0 && b->reg < 16) d = ssbo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, b->rw); break;
             case RB_SBUFUBO: if (b->reg >= 0 && b->reg < 16 && S.ubo[st][b->reg].addr) {
-                uint64_t va = 0;   /* the shader loads this storage buffer's address from the user uniform (upstream: read at bind time) */
-                if (S.ubo[st][b->reg].size >= (uint64_t)b->off + 8 && !pal_guarded_copy(&va, (const void *)(uintptr_t)(S.ubo[st][b->reg].addr + b->off), 8)) d = ssbo_at(va, 65536, b->rw);
+                uint64_t va = 0;   /* the shader loads this storage buffer's address from the user uniform (upstream: read at bind time), as updated so far */
+                if (S.ubo[st][b->reg].size >= (uint64_t)b->off + 8) { ub_read(S.ubo[st][b->reg].addr + b->off, (uint8_t *)&va, 8); if (va) d = ssbo_at(va, 65536, b->rw); }
                 break;
             }
             default: break;
@@ -453,7 +474,7 @@ static VkPipelineLayout layout_of(VkDescriptorSetLayout a, VkDescriptorSetLayout
 typedef struct {
     const vk_shader *vs, *fs;
     VkFormat color[8], depth, stencil;
-    uint32_t samples, topo_class, poly_mode, depth_clamp, logic, nattr, nstream;
+    uint32_t ncolor, samples, topo_class, poly_mode, depth_clamp, logic, nattr, nstream;   /* ncolor: the pass's attachment count (empty slots included) */
     struct { uint32_t fmt, binding, offset; } attr[16];
     struct { uint32_t used, divisor; } stream[16];
     struct { uint32_t en, src_rgb, dst_rgb, src_a, dst_a, eq_rgb, eq_a, mask; } blend[8];
@@ -506,10 +527,12 @@ static VkPrimitiveTopology topo(int prim) {
 }
 
 static int g_logic_op, g_divisor;
+static int vfmt_ok(VkFormat f) { VkFormatProperties p; vkGetPhysicalDeviceFormatProperties(vk_phys, f, &p); return (p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0; }
 static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, int prim, VkPipelineLayout lay) {
     gp_key k; memset(&k, 0, sizeof k);
     k.vs = vs; k.fs = fs;
     for (int i = 0; i < 8; i++) k.color[i] = i < S.pass_fmt.ncolor ? S.pass_fmt.color[i] : VK_FORMAT_UNDEFINED;
+    k.ncolor = (uint32_t)S.pass_fmt.ncolor;
     k.depth = S.pass_fmt.depth; k.stencil = S.pass_fmt.stencil; k.samples = S.pass_samples ? S.pass_samples : 1;
     k.topo_class = topo_class(prim); k.poly_mode = S.poly.mode; k.depth_clamp = S.depth_clamp;
     k.logic = g_logic_op && S.color.logic_op != NVN_LOGIC_OP_COPY ? 0x100u | S.color.logic_op : 0;
@@ -541,6 +564,13 @@ static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, in
     for (uint32_t i = 0; i < k.nattr; i++) {
         VkFormat f = vk_vfmt((int)k.attr[i].fmt);
         if (f == VK_FORMAT_UNDEFINED) { VK_ONCE("vertex attribute format %#x has no Vulkan format: left out", k.attr[i].fmt); continue; }
+        if (!vfmt_ok(f)) {
+            /* 3-component 8 / 16-bit kinds (often missing, AMD): the 4-component one, which reads one more component (as Ryujinx) */
+            VkFormat wide = f >= VK_FORMAT_R8G8B8_UNORM && f <= VK_FORMAT_R8G8B8_SRGB ? (VkFormat)(f + (VK_FORMAT_R8G8B8A8_UNORM - VK_FORMAT_R8G8B8_UNORM))
+                          : f >= VK_FORMAT_R16G16B16_UNORM && f <= VK_FORMAT_R16G16B16_SFLOAT ? (VkFormat)(f + (VK_FORMAT_R16G16B16A16_UNORM - VK_FORMAT_R16G16B16_UNORM)) : VK_FORMAT_UNDEFINED;
+            if (wide && vfmt_ok(wide)) { VK_ONCE("vertex format %d is not supported here: read as %d", (int)f, (int)wide); f = wide; }
+            else { VK_ONCE("vertex format %d (NVN %#x) is not supported here: attribute left out (reads 0, 0, 0, 1)", (int)f, k.attr[i].fmt); continue; }
+        }
         va[nva++] = (VkVertexInputAttributeDescription){k.attr[i].offset >> 24, k.attr[i].binding, f, k.attr[i].offset & 0xffffff};
     }
     for (uint32_t s = 0; s < 16; s++) if (k.stream[s].used) {
@@ -688,7 +718,7 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     if (!pr || !vs_has_stage(pr, 0)) { g_skipped[0]++; vd_note_drop("no program / no vertex shader"); return; }
     vk_shader *vs = vs_stage(pr, 0), *fs = vs_has_stage(pr, 1) ? vs_stage(pr, 1) : NULL;
     if (!vs || (vs_has_stage(pr, 1) && !fs)) { g_skipped[1]++; vd_note_drop("shader not translated"); return; }
-    if (g_nupd) {   /* vertex / index buffers read memory: logged uniform updates there reach it first */
+    if (g_nupd || g_nsh) {   /* vertex / index buffers read memory: logged uniform updates and storage shadows there reach it first */
         for (int i = 0; i < S.nattr && i < 16; i++) { va_st va; memcpy(&va, &S.attr[i], 4);
             if (va.fmt && va.stream < 16 && S.vbuf[va.stream].address) vd_ub_guard(S.vbuf[va.stream].address, S.vbuf[va.stream].address + (S.vbuf[va.stream].size ? S.vbuf[va.stream].size : 1)); }
         if (di) vd_ub_guard(di->ibuf, di->ibuf + (uint64_t)di->count * 4);

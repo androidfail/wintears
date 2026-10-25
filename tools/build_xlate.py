@@ -37,7 +37,7 @@ def main() -> int:
         work = Path(tmp)
         ryu = work / "ryujinx-src"
         shutil.copytree(UP / "vendor/ryujinx", ryu, ignore=shutil.ignore_patterns("obj", "bin"))
-        for p in sorted(XLATE.glob("patches/*.patch")):
+        for p in sorted(XLATE.glob("patches/*.patch")) + sorted((ROOT / "tools/wt_xlate/patches").glob("*.patch")):   # upstream's, then WinTears'
             subprocess.run(["git", "apply", "-p1", "--whitespace=nowarn", str(p)], cwd=ryu, check=True)
         src = work / "xlate"
         src.mkdir()

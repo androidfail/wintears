@@ -303,6 +303,7 @@ static vk_shader *translate(stage_t *t, int st, const answers *a) {
     for (uint32_t i = t->c1o; i < t->length; i++) sb_add(&rq, "%02x", t->code[i]);
     sb_add(&rq, "\", %s", ans.p);
     if (st == 5) sb_add(&rq, ", \"local\": [%u, %u, %u]", t->local[0], t->local[1], t->local[2]);
+    if (vk_sb_align != 16) sb_add(&rq, ", \"sb_align\": %u", vk_sb_align);
     sb_add(&rq, ", \"depth_minus_w\": %s}\n", totk_depth_near_minus_w() ? "true" : "false");
     service_start();
     uint64_t t0 = pal_now_ns();
@@ -374,6 +375,8 @@ vk_shader *vs_stage(vk_prog *pr, int st) {
 }
 
 void vs_init(void) {
-    snprintf(g_dir, sizeof g_dir, "%s/shader-cache/vk-1", host_profile_dir());
+    /* translations depend on the storage buffer alignment: other alignments than 16 keep their own cache */
+    if (vk_sb_align == 16) snprintf(g_dir, sizeof g_dir, "%s/shader-cache/vk-1", host_profile_dir());
+    else snprintf(g_dir, sizeof g_dir, "%s/shader-cache/vk-1-sb%u", host_profile_dir(), vk_sb_align);
     if (pal_mkdirs(g_dir)) die("cannot create the shader cache %s", g_dir);
 }

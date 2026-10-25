@@ -1,0 +1,23 @@
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -8,6 +8,11 @@ namespace Ryujinx.Graphics.Shader
+     /// </summary>
+     public interface IGpuAccessor : ILogger
+     {
++        /// <summary>
++        /// WinTears: the host's storage buffer offset alignment, set by the translation service for each job.
++        /// </summary>
++        static int HostStorageBufferOffsetAlignment = 16;
++
+         /// <summary>
+         /// Reads data from the constant buffer 1.
+         /// </summary>
+@@ -208,7 +213,7 @@ namespace Ryujinx.Graphics.Shader
+         /// <returns>Host storage buffer alignment in bytes</returns>
+         int QueryHostStorageBufferOffsetAlignment()
+         {
+-            return 16;
++            return HostStorageBufferOffsetAlignment;
+         }
+ 
+         /// <summary>

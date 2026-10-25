@@ -350,32 +350,43 @@ static void copy_b2b(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
     if (!n) return;
     vd_ub_guard(src, src + n); vd_ub_guard(dst, dst + n);
-    if (!vk_buf(src, n, &sb, &so) || !vk_buf(dst, n, &db, &dof) || (sb == db && src < dst + n && dst < src + n)) {
-        /* not both GPU-visible, or overlapping: done by the CPU at submit, as the null backend does */
-        VK_ONCE("buffer copy %#llx -> %#llx (%llu bytes) outside GPU memory or overlapping: copied by the CPU", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
-        dm_guest_write_prepare((void *)(uintptr_t)dst, (size_t)n);
-        memmove((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)n);
+    if (!vk_buf(src, n, &sb, &so) || !vk_buf(dst, n, &db, &dof)) {
+        /* not both GPU-visible: done by the CPU when the submission has completed (after the GPU work before it) */
+        VK_ONCE("buffer copy %#llx -> %#llx (%llu bytes) outside GPU memory: copied by the CPU after the submission", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n);
+        vk_after_write(dst, (const void *)(uintptr_t)src, (size_t)n, 0);
         return;
     }
     vx_end_pass();
-    VkBufferCopy r = {so, dof, n};
-    vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
+    if (sb == db && src < dst + n && dst < src + n) {   /* overlapping (a copy within one buffer must not): through staging memory */
+        VkBuffer tb; VkDeviceSize to;
+        vk_stage(n, 16, &tb, &to);
+        VkBufferCopy a = {so, to, n}, b = {to, dof, n};
+        vkCmdCopyBuffer(vk_cmd(), sb, tb, 1, &a);
+        vk_barrier(vk_cmd());
+        vkCmdCopyBuffer(vk_cmd(), tb, db, 1, &b);
+    } else {
+        VkBufferCopy r = {so, dof, n};
+        vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
+    }
     vk_barrier(vk_cmd());
 }
 static void update_ub(uint64_t dst, const uint8_t *data, uint64_t n) {
     VkBuffer db; VkDeviceSize off;
     if (!n) return;
-    if (!vk_buf(dst, n, &db, &off) || (off & 3) || (n & 3)) {
-        VK_ONCE("uniform update at %#llx (%llu bytes) outside GPU memory or unaligned: written by the CPU", (unsigned long long)dst, (unsigned long long)n);
-        dm_guest_write_prepare((void *)(uintptr_t)dst, (size_t)n);
-        memcpy((void *)(uintptr_t)dst, data, (size_t)n);
+    if (!vk_buf(dst, n, &db, &off)) {
+        VK_ONCE("uniform update at %#llx (%llu bytes) outside GPU memory: written by the CPU after the submission", (unsigned long long)dst, (unsigned long long)n);
+        vk_after_write(dst, data, (size_t)n, 1);   /* the recording's bytes may be reused once it is submitted */
         return;
     }
     vk_n_ubo++;
+    vd_shadow_retire(dst, dst + n);   /* a storage shadow there would write its old bytes back over this */
     if (vd_ub_update(dst, data, n)) return;
     vd_ub_flush();   /* earlier logged updates first: the order of writes is kept */
     vx_end_pass();
-    for (uint64_t at = 0; at < n; at += 65536) vkCmdUpdateBuffer(vk_cmd(), db, off + at, n - at > 65536 ? 65536 : n - at, data + at);
+    VkBuffer sb; VkDeviceSize so;   /* a buffer copy, not vkCmdUpdateBuffer: no 4-byte alignment needed */
+    memcpy(vk_stage(n, 16, &sb, &so), data, (size_t)n);
+    VkBufferCopy r = {so, off, n};
+    vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
     vk_barrier(vk_cmd());
 }
 
@@ -407,14 +418,27 @@ static void copy_b2t(const p_copy_b2t *c) {
     vd_ub_guard(c->src, c->src + n);
     if (!vk_buf(c->src, n, &sb, &so)) { VK_ONCE("buffer-to-texture copy from %#llx: not GPU memory", (unsigned long long)c->src); return; }
     vx_end_pass();
-    VkBufferImageCopy r = {.bufferOffset = so, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
-    vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    if (vt_converted(e)) {   /* the image holds converted texels (ASTC decoded, RGB widened, ...): the bytes are converted as an upload's */
+        /* shortcut: read by the CPU at record time, so GPU writes to the source earlier in this submission are missed; upgrade to a GPU conversion if a game does that */
+        uint8_t *tmp = malloc((size_t)n);
+        if (!tmp) die("texture copy: %llu bytes", (unsigned long long)n);
+        vd_ub_read(c->src, tmp, n);
+        vt_copy_linear(e, c->tex, sub.mipLevel, sub.baseArrayLayer, sub.layerCount, o, x, tmp, (size_t)row);
+        free(tmp);
+    } else {
+        VkBufferImageCopy r = {.bufferOffset = so, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
+        vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    }
     vk_barrier(vk_cmd());
     snprintf(vt_writer, sizeof vt_writer, "buffer-to-texture copy from %#llx", (unsigned long long)c->src); vt_written(e);
 }
 static void copy_t2b(const p_copy_b2t *c) {   /* the T2B record: tex is the source, src the destination address */
     vtex *e = c->tex ? vt_get(c->tex) : NULL;
     if (!e) return;
+    if (vt_converted(e)) {   /* its texels are not NVN's bytes (wider, or decoded ASTC): copied out they would overrun the destination */
+        VK_ONCE("texture-to-buffer copy from a converted texture (NVN format %#x): skipped", c->tex->d.format);
+        return;
+    }
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     VkImageSubresourceLayers sub; VkOffset3D o; VkExtent3D x;
     region(e, &c->r, view_level(&c->view, c->has_view), view_layer(&c->view, c->has_view), &sub, &o, &x);
@@ -517,10 +541,14 @@ static void copy_t2t(const p_copy_t2t *c) {
                && !((tsf == VK_FORMAT_R8G8B8A8_UNORM && tdf == VK_FORMAT_R8G8B8A8_SRGB) || (tsf == VK_FORMAT_R8G8B8A8_SRGB && tdf == VK_FORMAT_R8G8B8A8_UNORM)
                     || (tsf == VK_FORMAT_B8G8R8A8_UNORM && tdf == VK_FORMAT_B8G8R8A8_SRGB) || (tsf == VK_FORMAT_B8G8R8A8_SRGB && tdf == VK_FORMAT_B8G8R8A8_UNORM));
     if (convert) { static int n; if (n++ < 8) VLOG("copy %ux%u converts format %d -> %d (as a blit)", sx.width, sx.height, (int)tsf, (int)tdf); }
-    if (same && !convert && (vt_vkformat(s) == vt_vkformat(d) || (!vt_depth(s) && !vt_depth(d) && !vk_fmt_block_compressed(vt_vkformat(s)) && !vk_fmt_block_compressed(vt_vkformat(d))))) {
+    if (same && !convert && (vt_vkformat(s) == vt_vkformat(d) || (!vt_depth(s) && !vt_depth(d) && !vk_fmt_block_compressed(vt_vkformat(s)) && !vk_fmt_block_compressed(vt_vkformat(d))
+                                                                  && vt_texel_size(s) == vt_texel_size(d)))) {   /* bit for bit: only between texels of one size */
         if (ds.layerCount != ss.layerCount) ds.layerCount = ss.layerCount = ss.layerCount < ds.layerCount ? ss.layerCount : ds.layerCount;
         VkImageCopy r = {ss, so, ds, dof, sx};
         vkCmdCopyImage(vk_cmd(), vt_image(s), VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    } else if (int_format(vt_vkformat(s)) != int_format(vt_vkformat(d))) {   /* integer <-> float or signed <-> unsigned of another size: neither a copy nor a blit */
+        VK_ONCE("copy between formats %d and %d (texel sizes %u / %u): not possible in Vulkan, skipped", (int)vt_vkformat(s), (int)vt_vkformat(d), vt_texel_size(s), vt_texel_size(d));
+        return;
     } else {
         VkImageBlit r = {ss, {so, {so.x + (int32_t)sx.width, so.y + (int32_t)sx.height, so.z + (int32_t)sx.depth}},
                          ds, {dof, {dof.x + (int32_t)dx.width, dof.y + (int32_t)dx.height, dof.z + (int32_t)dx.depth}}};

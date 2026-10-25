@@ -3,7 +3,8 @@
 // Program.cs (SwshXlate.Translate, compiled unchanged) on the vendored Ryujinx shader translator with upstream's patches.
 //
 // Request (one JSON line, as upstream's): {"variant", "stage": "vs|ps|cs", "code": path, "c1": hex, "tex": {slot: type},
-//   "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: ...}, "local": [x, y, z], "depth_minus_w": bool}
+//   "img": {slot: {type, fmt}}, "attr": {loc: float|sint|uint}, "fout": {idx: ...}, "local": [x, y, z], "depth_minus_w": bool,
+//   "sb_align": the device's storage buffer offset alignment (absent: 16)}
 // Reply: {"ok": true} or {"ok": false, "error": "..."}; outputs <out>/<variant>.spv and <variant>.wtr.
 //
 // The SPIR-V's resources are moved to descriptor set 0 (vertex, compute) or 1 (fragment), so a pipeline's two stages
@@ -115,6 +116,8 @@ static class ShaderService
         };
         if (rq.TryGetPropertyValue("local", out JsonNode local) && local is JsonArray) job["local"] = local.DeepClone();
         job["depth_minus_w"] = rq.TryGetPropertyValue("depth_minus_w", out JsonNode dm) && dm is JsonValue dv && dv.TryGetValue(out bool db) && db;
+        // the replay binds a storage buffer at its address rounded down to this; the shader adds the rest (tools/wt_xlate/patches)
+        Ryujinx.Graphics.Shader.IGpuAccessor.HostStorageBufferOffsetAlignment = rq.TryGetPropertyValue("sb_align", out JsonNode sbA) && sbA is JsonValue sbV && sbV.TryGetValue(out int sbAlign) && sbAlign >= 16 ? sbAlign : 16;
         string err = SwshXlate.Translate(job, outDir);
         if (err != null) throw new Exception("translation failed: " + err);
         string spvPath = Path.Combine(outDir, variant + ".spv"), resPath = Path.Combine(outDir, variant + ".res.json");

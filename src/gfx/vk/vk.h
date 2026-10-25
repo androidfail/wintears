@@ -40,6 +40,7 @@ extern VkPhysicalDeviceProperties vk_props;
 extern uint32_t vk_texel_align[2], vk_texel_single[2];
 extern VkPipelineCache vk_pcache;   /* vk_draw.c: kept in the profile between runs */
 extern int vk_divisor;   /* VK_EXT_vertex_attribute_divisor is enabled: instance divisors above 1 */
+extern uint32_t vk_sb_align;   /* storage buffers are bound at their address rounded down to this; the translated shaders add the rest */
 extern VkSurfaceKHR vk_surface;
 
 /* vk_dev.c ------------------------------------------------------------------------------------------------------ */
@@ -62,6 +63,9 @@ void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *
 /* fn(arg) on the completion thread once the open submission has completed (in submission order). */
 void vk_after(void (*fn)(void *arg), void *arg);
 void vk_wait_done(uint64_t fence);   /* the CPU-side effects up to fence have run too */
+/* n bytes to guest address dst by the CPU once the open submission has completed: src's bytes as they are now
+   (snapshot) or as they are then (src stays valid, e.g. guest memory) */
+void vk_after_write(uint64_t dst, const void *src, size_t n, int snapshot);
 void vk_barrier(VkCommandBuffer c);  /* every earlier access before every later one */
 uint64_t vk_ticks(void);             /* 19.2 MHz counter ticks, the clock of the game's CNTPCT reads */
 
@@ -86,6 +90,11 @@ VkImageAspectFlags vt_aspect(const vtex *e);
 int vt_depth(const vtex *e);
 void vt_size(const vtex *e, unsigned level, uint32_t *w, uint32_t *h, uint32_t *d);
 uint32_t vt_layers(const vtex *e);
+int vt_converted(const vtex *e);          /* its texels are converted from NVN's bytes on upload (vk_fmt convert) */
+uint32_t vt_texel_size(const vtex *e);    /* bytes per texel (block) in the image's own format */
+/* Linear NVN bytes (rows of `row` bytes, layers after depth slices) into a region of e, converted as an upload is;
+   recorded in the replay's command buffer. */
+void vt_copy_linear(vtex *e, const tex_t *t, uint32_t level, uint32_t layer0, uint32_t layers, VkOffset3D o, VkExtent3D x, const uint8_t *src, size_t row);
 /* A view: the whole texture (v NULL) or an NVN view. mode: VT_SAMPLED (NVN swizzle, the view's levels / layers),
    VT_ATTACHMENT (one level, no swizzle), VT_STORAGE (no swizzle). want: the view type the shader declares, or
    VT_ANY_TYPE for the texture's own. */

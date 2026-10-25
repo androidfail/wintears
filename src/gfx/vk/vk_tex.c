@@ -25,7 +25,7 @@ typedef struct { view_key k; VkImageView v; } view_ent;
 struct vtex {
     stor_key k;
     VkImage img; VmaAllocation al; VkFormat fmt; vk_fmt f; VkImageAspectFlags aspect; VkImageCreateFlags flags;
-    uint32_t w, h, d, layers, levels; VkImageType type;
+    uint32_t w, h, d, layers, levels, tsize; VkImageType type;   /* tsize: bytes per texel (block) in the image's own format */
     int mirrored, owned, uploaded;
     char writer[128];   /* what last wrote it (diagnostics: the pass log prints it for sampled textures) */
     struct {   /* the write's inputs, so F9 can follow a sampled texture back to its sources (diagnostics) */
@@ -206,6 +206,8 @@ static uint64_t g_images, g_image_bytes, g_uploads, g_upload_bytes, g_upload_ns,
 static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     vtex *e = calloc(1, sizeof *e);
     e->k = *k; e->f = *f; e->fmt = f->vk; e->levels = k->levels;
+    { int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+      e->tsize = f->convert == 1 || f->convert == 3 ? 4 : f->convert == 2 ? (uint32_t)bpb / 3 * 4 : f->convert == 4 ? 8 : (uint32_t)bpb; }
     shape(t, &e->type, &e->w, &e->h, &e->d, &e->layers);
     e->aspect = f->depth || f->stencil ? (f->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (f->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0) : VK_IMAGE_ASPECT_COLOR_BIT;
     if (e->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) e->aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -224,6 +226,16 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     if (e->type == VK_IMAGE_TYPE_2D && e->layers >= 6 && e->w == e->h && k->samples == 1) fl |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
     if (e->type == VK_IMAGE_TYPE_3D) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     if (vk_fmt_block_compressed(e->fmt) && !f->depth && !f->stencil) fl |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;   /* rendering into blocks through a one-texel-per-block view */
+    if (fl & VK_IMAGE_CREATE_EXTENDED_USAGE_BIT) {
+        /* Views in other formats of the class (an UNORM storage view of an sRGB image, an RGBA16UI target view of BC
+           blocks) need their usage on the image too: whatever any compatible format allows (EXTENDED_USAGE). */
+        VkImageUsageFlags more = usage | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (k->samples == 1 ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+        VkImageFormatProperties ip;
+        for (VkImageUsageFlags bit = VK_IMAGE_USAGE_SAMPLED_BIT; bit <= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; bit <<= 1)   /* each extra one the GPU takes */
+            if ((more & bit) && !(usage & bit) &&
+                vkGetPhysicalDeviceImageFormatProperties(vk_phys, e->fmt, e->type, VK_IMAGE_TILING_OPTIMAL, usage | bit, fl, &ip) == VK_SUCCESS &&
+                (ip.sampleCounts & k->samples) && ip.maxArrayLayers >= e->layers && ip.maxMipLevels >= e->levels) usage |= bit;
+    }
     e->flags = fl;
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = fl, .imageType = e->type, .format = e->fmt,
         .extent = {e->w, e->h, e->d}, .mipLevels = e->levels, .arrayLayers = e->layers, .samples = (VkSampleCountFlagBits)k->samples,
@@ -268,6 +280,72 @@ static void expand_rgb(uint8_t *dst, const uint8_t *src, size_t texels, unsigned
     }
 }
 
+static uint16_t half_of_int(int v) {   /* exact for |v| <= 2048 */
+    if (!v) return 0;
+    unsigned m = (unsigned)(v < 0 ? -v : v), e = 0;
+    while (m >> (e + 1)) e++;
+    return (uint16_t)((v < 0 ? 0x8000u : 0) | (e + 15) << 10 | ((m << (10 - e)) & 0x3ffu));
+}
+/* RGB10A2 signed kinds (0x69 SNORM, 0x6A SINT, 0x6C I2F) -> RGBA16 SNORM / SINT / SFLOAT */
+static void unpack_10a2s(uint16_t *dst, const uint32_t *src, size_t texels, int format) {
+    for (size_t i = 0; i < texels; i++) for (int c = 0; c < 4; c++) {
+        int bits = c < 3 ? 10 : 2, v = (int32_t)(src[i] << (32 - 10 * c - bits)) >> (32 - bits);   /* sign-extended component c */
+        int m = (1 << (bits - 1)) - 1;   /* the largest positive value: 511, 1 */
+        if (format == 0x69) { if (v < -m) v = -m; v = (v * 32767 + (v < 0 ? -m / 2 : m / 2)) / m; }
+        dst[4 * i + c] = format == 0x6C ? half_of_int(v) : (uint16_t)(int16_t)v;
+    }
+}
+
+/* One layer of a level, as linear blocks in NVN's format (rows of whole blocks, `slice` bytes per depth slice): into
+   staging memory in the image's format (convert: vk_fmt.c), copied to (level, layer) at o, w x h x d texels, with c.
+   *out / *out_n: the staged bytes of the main plane (diagnostics). */
+static void put_linear(vtex *e, int format, const uint8_t *lin, size_t slice, uint32_t w, uint32_t h, uint32_t d,
+                       VkCommandBuffer c, uint32_t level, uint32_t layer, VkOffset3D o, uint8_t **out, size_t *out_n) {
+    int bw, bh, bpb = nvn_fmt_bpb(format, &bw, &bh);
+    size_t n = slice * d, texels = (size_t)w * h * d;
+    size_t dn = e->f.convert == 2 ? n / 3 * 4 : e->f.convert == 3 ? texels * 4 : e->f.convert == 4 ? n * 2 : n;
+    VkBuffer sb; VkDeviceSize so;
+    uint8_t *dst = vk_stage(dn, 16, &sb, &so);
+    if (e->f.convert == 3) {
+        for (uint32_t z = 0; z < d; z++)
+            if (vk_astc_decode(lin + z * slice, slice, (unsigned)bw, (unsigned)bh, w, h, format >= 0x87, dst + (size_t)z * w * h * 4)) {
+                VK_ONCE("ASTC %dx%d texture %ux%u did not decode: left blank", bw, bh, w, h);
+                memset(dst + (size_t)z * w * h * 4, 0, (size_t)w * h * 4);
+            }
+    } else if (e->f.convert == 1) {   /* 24-bit depth in the low bits of each 32-bit texel, stencil in the high byte: depth as float */
+        const uint32_t *src = (const uint32_t *)lin; float *df = (float *)dst;
+        for (size_t i = 0; i < n / 4; i++) df[i] = (float)(src[i] & 0xffffffu) * (1.0f / 16777215.0f);
+        if (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {   /* the stencil bytes are their own plane of the image */
+            VkBuffer sb2; VkDeviceSize so2;
+            uint8_t *sp = vk_stage(n / 4, 16, &sb2, &so2);
+            for (size_t i = 0; i < n / 4; i++) sp[i] = (uint8_t)(src[i] >> 24);
+            VkBufferImageCopy rs = {.bufferOffset = so2, .imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, level, layer, 1}, .imageOffset = o, .imageExtent = {w, h, d}};
+            vkCmdCopyBufferToImage(c, sb2, e->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rs);
+        }
+    } else if (e->f.convert == 2) {
+        int is_int = (format >= 0x1B && format <= 0x1C) || (format >= 0x20 && format <= 0x21) || (format >= 0x23 && format <= 0x24);
+        expand_rgb(dst, lin, texels, (unsigned)bpb / 3, is_int);
+    } else if (e->f.convert == 4) unpack_10a2s((uint16_t *)dst, (const uint32_t *)lin, n / 4, format);
+    else memcpy(dst, lin, n);
+    VkBufferImageCopy r = {.bufferOffset = so, .imageSubresource = {e->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, level, layer, 1}, .imageOffset = o, .imageExtent = {w, h, d}};
+    vkCmdCopyBufferToImage(c, sb, e->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    if (out) { *out = dst; *out_n = dn; }
+}
+
+int vt_converted(const vtex *e) { return e->f.convert != 0; }
+uint32_t vt_texel_size(const vtex *e) { return e->tsize; }
+void vt_copy_linear(vtex *e, const tex_t *t, uint32_t level, uint32_t layer0, uint32_t layers, VkOffset3D o, VkExtent3D x, const uint8_t *src, size_t row) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    size_t pitch = (size_t)((x.width + bw - 1) / bw) * bpb, rows = (x.height + bh - 1) / bh, slice = pitch * rows;
+    uint8_t *lin = malloc(slice * x.depth);
+    if (!lin) die("texture copy: %zu bytes", slice * x.depth);
+    for (uint32_t l = 0; l < layers; l++) {
+        for (size_t y = 0; y < rows * x.depth; y++) memcpy(lin + y * pitch, src + ((size_t)l * rows * x.depth + y) * row, pitch);
+        put_linear(e, t->d.format, lin, slice, x.width, x.height, x.depth, vk_cmd(), level, layer0 + l, o, NULL, NULL);
+    }
+    free(lin);
+}
+
 static void upload(vtex *e, const tex_t *t) {
     uint64_t t0 = pal_now_ns();
     g_uploads++; g_upload_bytes += t->L.size; if (e->uploaded) g_reuploads++;
@@ -288,29 +366,8 @@ static void upload(vtex *e, const tex_t *t) {
                 VK_ONCE("texture %ux%u format %#x target %d flags %#x: layout not supported for upload", t->d.width, t->d.height, t->d.format, t->d.target, t->d.flags);
                 free(lin); goto done;
             }
-            size_t out_n = e->f.convert == 2 ? n / 3 * 4 : e->f.convert == 3 ? (size_t)w * h * d * 4 : n;
-            VkBuffer sb; VkDeviceSize so;
-            uint8_t *dst = vk_stage(out_n, 16, &sb, &so);
-            if (e->f.convert == 3) {
-                for (uint32_t z = 0; z < d; z++)
-                    if (vk_astc_decode(lin + z * slice, slice, (unsigned)bw, (unsigned)bh, w, h, t->d.format >= 0x87, dst + (size_t)z * w * h * 4)) {
-                        VK_ONCE("ASTC %dx%d texture %ux%u did not decode: left blank", bw, bh, w, h);
-                        memset(dst + (size_t)z * w * h * 4, 0, (size_t)w * h * 4);
-                    }
-            } else if (e->f.convert == 1) {   /* 24-bit depth in the low bits of each 32-bit texel, stencil in the high byte: depth as float */
-                const uint32_t *src = (const uint32_t *)lin; float *df = (float *)dst;
-                for (size_t i = 0; i < n / 4; i++) df[i] = (float)(src[i] & 0xffffffu) * (1.0f / 16777215.0f);
-                if (e->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {   /* the stencil bytes are their own plane of the image */
-                    VkBuffer sb2; VkDeviceSize so2;
-                    uint8_t *sp = vk_stage(n / 4, 16, &sb2, &so2);
-                    for (size_t i = 0; i < n / 4; i++) sp[i] = (uint8_t)(src[i] >> 24);
-                    VkBufferImageCopy rs = {.bufferOffset = so2, .imageSubresource = {VK_IMAGE_ASPECT_STENCIL_BIT, lv, ly, 1}, .imageExtent = {w, h, d}};
-                    vkCmdCopyBufferToImage(c, sb2, e->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rs);
-                }
-            } else if (e->f.convert == 2) {
-                int is_int = (t->d.format >= 0x1B && t->d.format <= 0x1C) || (t->d.format >= 0x20 && t->d.format <= 0x21) || (t->d.format >= 0x23 && t->d.format <= 0x24);
-                expand_rgb(dst, lin, (size_t)w * h * d, (unsigned)bpb / 3, is_int);
-            } else memcpy(dst, lin, n);
+            uint8_t *dst; size_t out_n;
+            put_linear(e, t->d.format, lin, slice, w, h, d, c, lv, ly, (VkOffset3D){0, 0, 0}, &dst, &out_n);
             { static int texlog = -1, nlog;   /* TOTK_TEXLOG=1: the mean colour of what is uploaded (4-byte texels), to see what a texture holds without looking */
               if (texlog < 0) { const char *e = pal_getenv("TOTK_TEXLOG"); texlog = e && *e == '1'; }
               if (texlog && lv == 0 && ly == 0 && out_n == (size_t)w * h * 4 && nlog < 400) { nlog++;
@@ -318,9 +375,6 @@ static void upload(vtex *e, const tex_t *t) {
                   double nn = (double)w * h * 255.0;
                   VLOG("[tex] upload %ux%u NVN format %#x (Vulkan %d) mean rgba %.3f %.3f %.3f %.3f", w, h, (unsigned)t->d.format, (int)e->fmt, sum[0] / nn, sum[1] / nn, sum[2] / nn, sum[3] / nn); } }
             free(lin);
-            VkBufferImageCopy r = {.bufferOffset = so, .imageSubresource = {e->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, lv, ly, 1},
-                                   .imageExtent = {w, h, d}};
-            vkCmdCopyBufferToImage(c, sb, e->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
         }
     }
 done:
