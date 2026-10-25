@@ -381,10 +381,11 @@ void threads_init(void) {
     cfg.fastmem = 1;
     for (int i = 0; i < NCORE; i++) g_jit[i] = jit_core_create(&cfg, g_monitor, (size_t)i);
     const char *e = pal_getenv("TOTK_SAMPLE");
-    if (e ? *e != '0' : pal_under_wine()) { pthread_t th; if (!pthread_create(&th, NULL, sampler, NULL)) pthread_detach(th); }
+    if (e && *e == '1') { pthread_t th; if (!pthread_create(&th, NULL, sampler, NULL)) pthread_detach(th); }
 }
 
-/* Sampling profiler (on by default under Wine / Proton, TOTK_SAMPLE=1/0): 100 times a second, where each core's
+/* Sampling profiler (TOTK_SAMPLE=1; off by default: under Proton a stopped thread's driver call is interrupted and the
+   kernel starts a GPU submission over, which made the Steam Deck crawl): 100 times a second, where each core's
    owner is (pc and the calling functions in this program); the most frequent places are logged every 10 s. */
 typedef struct { int n, total; struct { char k[260]; unsigned n; } e[600]; } stab;
 static void stab_add(const char *k, void *u) {

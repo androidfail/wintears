@@ -456,6 +456,61 @@ void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *
     return c->map + at;
 }
 
+/* ---------- the submission thread ----------
+   vkQueueSubmit2 and vkQueuePresentKHR run here, in the order they were asked for. On Linux the kernel checks every
+   page of every imported range a submission uses (amdgpu user pointers), about 10 ms a submission on the Steam Deck,
+   and the game's render thread used to wait for that twice a frame (its work, then the present). Fences are timeline
+   values given out at vk_flush, so waiting for one works whether it was submitted yet or not. */
+typedef struct qitem { struct qitem *next; int present; VkCommandBuffer cb[2]; VkSemaphoreSubmitInfo wait, sig[2]; int has_wait, nsig; } qitem;
+static qitem *g_q_head, *g_q_tail;
+static int g_q_busy;
+static pthread_mutex_t g_q_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_q_cv = PTHREAD_COND_INITIALIZER;
+_Atomic uint64_t vk_ns_qsubmit;   /* time in vkQueueSubmit2 (the 10-second line) */
+static void q_push(qitem *it) {
+    pthread_mutex_lock(&g_q_mu);
+    if (g_q_tail) g_q_tail->next = it; else g_q_head = it;
+    g_q_tail = it;
+    pthread_cond_broadcast(&g_q_cv);
+    pthread_mutex_unlock(&g_q_mu);
+}
+void vk_submit_drain(void) {   /* everything asked for so far handed to the driver */
+    pthread_mutex_lock(&g_q_mu);
+    while (g_q_head || g_q_busy) pthread_cond_wait(&g_q_cv, &g_q_mu);
+    pthread_mutex_unlock(&g_q_mu);
+}
+void vk_queue_present(void) { qitem *it = calloc(1, sizeof *it); if (!it) die("Vulkan: present"); it->present = 1; q_push(it); }
+void vp_do_present(void);   /* vk_present.c: acquire, copy, present (this thread) */
+static void *submit_thread(void *unused) {
+    (void)unused;
+    pal_thread_set_name("vk submit");
+    for (uint64_t n = 0;; ) {
+        pthread_mutex_lock(&g_q_mu);
+        while (!g_q_head) pthread_cond_wait(&g_q_cv, &g_q_mu);
+        qitem *it = g_q_head; g_q_head = it->next; if (!g_q_head) g_q_tail = NULL;
+        g_q_busy = 1;
+        pthread_mutex_unlock(&g_q_mu);
+        if (it->present) vp_do_present();
+        else {
+            VkCommandBufferSubmitInfo cb[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = it->cb[0]},
+                                               {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = it->cb[1]}};
+            VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = it->has_wait ? 1 : 0, .pWaitSemaphoreInfos = &it->wait,
+                                .commandBufferInfoCount = 2, .pCommandBufferInfos = cb, .signalSemaphoreInfoCount = (uint32_t)it->nsig, .pSignalSemaphoreInfos = it->sig};
+            uint64_t tq = pal_now_ns();
+            VkResult r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
+            atomic_fetch_add(&vk_ns_qsubmit, pal_now_ns() - tq);
+            if (n++ < 3) VLOG("submission %llu: %s", (unsigned long long)it->sig[0].value, r == VK_SUCCESS ? "accepted" : "refused");
+            if (r != VK_SUCCESS) die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
+        }
+        free(it);
+        pthread_mutex_lock(&g_q_mu);
+        g_q_busy = 0;
+        pthread_cond_broadcast(&g_q_cv);
+        pthread_mutex_unlock(&g_q_mu);
+    }
+    return NULL;
+}
+
 uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo *signal) {
     vk_open();
     sub *s = g_cur;
@@ -464,18 +519,14 @@ uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo
     VkDependencyInfo hd = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &hb};
     vkCmdPipelineBarrier2(s->main, &hd);   /* the CPU reads what the GPU wrote into pool memory once the fence is done */
     VKC(vkEndCommandBuffer(s->pre)); VKC(vkEndCommandBuffer(s->main));
-    VkCommandBufferSubmitInfo cb[2] = {{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->pre},
-                                       {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main}};
-    VkSemaphoreSubmitInfo sig[2] = {{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_tl, .value = g_fence + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
-    if (signal) sig[1] = *signal;
-    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = wait,
-                        .commandBufferInfoCount = 2, .pCommandBufferInfos = cb, .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig};
     if (!g_fence) { pthread_mutex_lock(&g_pool_mu); imports_describe(); pthread_mutex_unlock(&g_pool_mu); }
-    uint64_t tq = pal_now_ns();
-    VkResult r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
-    { extern _Atomic uint64_t vk_ns_qsubmit; atomic_fetch_add(&vk_ns_qsubmit, pal_now_ns() - tq); }
-    { static int n; if (n++ < 3) VLOG("submission %llu: %s", (unsigned long long)(g_fence + 1), r == VK_SUCCESS ? "accepted" : "refused"); }
-    if (r != VK_SUCCESS) die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
+    qitem *it = calloc(1, sizeof *it);
+    if (!it) die("Vulkan: submission");
+    it->cb[0] = s->pre; it->cb[1] = s->main;
+    it->sig[0] = (VkSemaphoreSubmitInfo){VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_tl, .value = g_fence + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    it->nsig = 1; if (signal) it->sig[it->nsig++] = *signal;
+    if (wait) { it->wait = *wait; it->has_wait = 1; }
+    q_push(it);
     s->fence = ++g_fence; s->next = NULL; s->t_submit = pal_now_ns();
     g_cur = NULL;
     pthread_mutex_lock(&g_done_mu);
@@ -536,6 +587,8 @@ static int init(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, done_thread, NULL)) die("Vulkan: completion thread");
     pthread_detach(t);
+    if (pthread_create(&t, NULL, submit_thread, NULL)) die("Vulkan: submission thread");
+    pthread_detach(t);
     vt_init(); vs_init(); vd_init();
     if (vp_init()) return -1;
     return 0;
@@ -572,7 +625,6 @@ void vk_log_memory(void) {
          res / 1048576.0, com / 1048576.0, hs / 1048576.0, (img[0] + img[1] + img[2]) / 1048576.0, img[0] / 1048576.0, img[1] / 1048576.0, img[2] / 1048576.0, img[3] / 1048576.0,
          atomic_load(&g_chunk_bytes) / 1048576.0, heaps);
 }
-_Atomic uint64_t vk_ns_qsubmit;   /* time in vkQueueSubmit2 (the 10-second line) */
 static uint64_t submit(const uint64_t *handles, int n) {
     uint64_t t0 = pal_now_ns();
     {   /* the sampler profiles this thread while it replays (threads.c, the [replay] line) */

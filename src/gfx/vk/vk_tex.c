@@ -388,25 +388,25 @@ void vt_copy_linear(vtex *e, const tex_t *t, uint32_t level, uint32_t layer0, ui
 }
 
 /* Content check, used when pages are not write-protected (Wine / Proton; nvn_dirty.c). Every texture used by a
-   submission is compared with what was uploaded: whole (a fast four-lane hash) when it is up to 256 KiB or was
-   rewritten lately ("hot": the game's font atlases get glyphs written into them a few at a time, and sampling missed
-   those: blank and clipped dialogue on the Steam Deck); otherwise sampled (64 bytes of every 4 KiB) with a whole
-   hash every 8th submission (every 32nd above 1 MiB), at a phase of its own so that they do not all come at once.
+   submission is compared with what was uploaded: whole when it is up to 16 KiB or was rewritten lately ("hot": the
+   game's font atlases get glyphs written into them a few at a time, and sampling alone missed those: blank and
+   clipped dialogue on the Steam Deck); otherwise ("cold") looked at every 4th submission only, sampled (64 bytes of
+   every 4 KiB) with a whole hash every 16th (64th above 1 MiB), at a phase of its own so that they do not all come at
+   once. Checking every used texture at each submission was half the replay: whole hashes read about 50 MB a frame,
+   and sampling touches every page of hundreds of MB (a cache and TLB miss each).
    A texture stays hot for 64 unchanged checks. vk_ns_hash (the 10-second line) is the time spent here.
-   shortcut: the first partial rewrite of a large, cold texture is seen up to 8 or 32 submissions late; upgrade to
+   shortcut: the first rewrite of a cold texture is seen up to 4 submissions late (16 or 64 when sampling misses it); upgrade to
    Linux soft-dirty bits (/proc/self/pagemap) if that shows up. */
 uint64_t vk_ns_hash;
 int nvn_dirty_protecting(void);
-static uint64_t hash_whole(const uint8_t *p, uint64_t n) {   /* four independent lanes: about four times the speed of one */
-    const uint64_t K = 0xff51afd7ed558ccdull;
-    uint64_t h0 = 0x9E3779B97F4A7C15ull ^ n, h1 = h0 + 1, h2 = h0 + 2, h3 = h0 + 3, v0, v1, v2, v3, i = 0;
-    for (; i + 32 <= n; i += 32) {
-        memcpy(&v0, p + i, 8); memcpy(&v1, p + i + 8, 8); memcpy(&v2, p + i + 16, 8); memcpy(&v3, p + i + 24, 8);
-        h0 = (h0 ^ v0) * K; h0 ^= h0 >> 29; h1 = (h1 ^ v1) * K; h1 ^= h1 >> 29;
-        h2 = (h2 ^ v2) * K; h2 ^= h2 >> 29; h3 = (h3 ^ v3) * K; h3 ^= h3 >> 29;
-    }
-    for (; i < n; i++) h0 = (h0 ^ p[i]) * 0x100000001b3ull;
-    return ((h0 * K ^ h1) * K ^ h2) * K ^ h3;
+static inline uint64_t rotl64(uint64_t x, int r) { return x << r | x >> (64 - r); }
+static uint64_t hash_whole(const uint8_t *p, uint64_t n) {   /* eight independent add-rotate lanes: memory speed (2.2x the multiply lanes) */
+    uint64_t h[8] = {1, 2, 3, 4, 5, 6, 7, 8}, v, i = 0;
+    for (; i + 64 <= n; i += 64) for (int k = 0; k < 8; k++) { memcpy(&v, p + i + 8 * k, 8); h[k] = rotl64(h[k], 7) + (v ^ i); }
+    uint64_t r = 0x9E3779B97F4A7C15ull ^ n;
+    for (; i < n; i++) r = (r ^ p[i]) * 0x100000001b3ull;
+    for (int k = 0; k < 8; k++) { r = (r ^ h[k]) * 0xff51afd7ed558ccdull; r ^= r >> 29; }
+    return r;
 }
 static uint64_t hash_sampled(const uint8_t *p, uint64_t n) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ n, v;
@@ -423,8 +423,9 @@ static void content_note(vtex *e, const tex_t *t, uint64_t sub) {   /* at upload
 }
 static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
     uint64_t t0 = pal_now_ns(), n = t->L.size;
-    unsigned every = n > (1u << 20) ? 32 : 8, phase = (unsigned)((uintptr_t)e >> 6);
-    int whole = n <= (256u << 10) || e->hot || (sub + phase) % every == 0;
+    unsigned every = n > (1u << 20) ? 64 : 16, phase = (unsigned)((uintptr_t)e >> 6);
+    if (n > (16u << 10) && !e->hot && (sub + phase) % 4) return 0;   /* cold: looked at every 4th submission */
+    int whole = n <= (16u << 10) || e->hot || (sub + phase) % every == 0;
     int changed = whole ? hash_whole(t->mem, n) != e->hash : hash_sampled(t->mem, n) != e->shash;
     if (changed) e->hot = 64; else if (e->hot) e->hot--;
     vk_ns_hash += pal_now_ns() - t0;
