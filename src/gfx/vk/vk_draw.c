@@ -326,10 +326,11 @@ static VkDescriptorBufferInfo ubo_at(uint64_t addr, uint64_t size) {
         VK_ONCE("uniform buffer at %#llx is not %llu-byte aligned: its bytes are copied at record time", (unsigned long long)addr, (unsigned long long)al);
         return ub_copy_of(addr, range, al);
     }
-    VkBuffer b2; VkDeviceSize o2;   /* as much of the 64 KiB the shader may read as the pool has */
+    VkBuffer b2 = b; VkDeviceSize o2 = off;   /* as much of the 64 KiB the shader may read as the pool has */
     while (range > 256 && !vk_buf(addr, range, &b2, &o2)) range >>= 1;
+    if (range <= 256 && !vk_buf(addr, range, &b2, &o2)) { b2 = b; o2 = off; }
     if (ub_hit(addr, addr + range)) return ub_copy_of(addr, range, al);
-    return (VkDescriptorBufferInfo){b, off, range};
+    return (VkDescriptorBufferInfo){b2, o2, range};   /* the buffer of the whole range (a windowed pool's window) */
 }
 static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size, int rw) {
     VkBuffer b; VkDeviceSize off;
@@ -347,9 +348,10 @@ static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size, int rw) {
     if (!x && ov) vd_shadow_retire(ga, ga + range);   /* overlaps shadows in part: they go back to memory, then one shadow over all of it */
     if (!x && rw) x = shadow_make(ga, range);
     if (x) return (VkDescriptorBufferInfo){x->dev, ga - x->lo, range};
-    VkBuffer b2; VkDeviceSize o2;
+    VkBuffer b2 = b; VkDeviceSize o2 = lo;
     while (range > 16 && !vk_buf(ga, range, &b2, &o2)) range >>= 1;
-    return (VkDescriptorBufferInfo){b, lo, range};
+    if (range <= 16 && !vk_buf(ga, range, &b2, &o2)) { b2 = b; o2 = lo; }
+    return (VkDescriptorBufferInfo){b2, o2, range};   /* the buffer of the whole range (a windowed pool's window) */
 }
 
 typedef struct { tex_t t; view_t v; int has_v; } slot_tex;
@@ -671,7 +673,9 @@ static void vertex_buffers(VkCommandBuffer c, const vk_shader *vs) {
         if (!(used >> s & 1)) continue;
         VkBuffer pb; VkDeviceSize po;
         uint64_t addr = S.vbuf[s].address, size = S.vbuf[s].size;
-        if (addr && vk_buf(addr, 1, &pb, &po)) { b[s] = pb; o[s] = po; sz[s] = VK_WHOLE_SIZE; (void)size; }
+        /* by its size: a windowed pool's window ends near the range (VK_WHOLE_SIZE would stop at the window's end) */
+        if (addr && size && vk_buf(addr, size, &pb, &po)) { b[s] = pb; o[s] = po; sz[s] = size; }
+        else if (addr && vk_buf(addr, 1, &pb, &po)) { b[s] = pb; o[s] = po; sz[s] = VK_WHOLE_SIZE; }
         else { b[s] = g_zero; o[s] = 0; sz[s] = VK_WHOLE_SIZE; }
         stride[s] = s < (uint32_t)S.nstream ? S.stream[s].stride : 0;
         vkCmdBindVertexBuffers2(c, s, 1, &b[s], &o[s], &sz[s], &stride[s]);

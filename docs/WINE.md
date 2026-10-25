@@ -18,9 +18,13 @@ GPU driver accepts. Each rule below cost at least one broken Deck run. Code chec
   - the whole guest heap is not one import (its pages change protection); each pool is imported on its own
     (`TOTK_IMPORT_HEAP`).
 - **The kernel checks every page of every imported range a submission uses, at each `vkQueueSubmit2`** (about 10 ms a
-  submission on the Deck). Submissions and presents therefore run on their own thread (`vk_dev.c`, submission thread),
-  and no device feature that makes RADV put every allocation in every submission is enabled (buffer device address,
-  update-after-bind descriptors).
+  submission on the Deck, 40 ms on Great Sky Island where the pools cover most of the 2 GiB heap). So:
+  - pools of 8 MiB and more are imported in 1 MiB-aligned windows on demand, around each range the GPU is given
+    (`vk_buf`), so a submission names only the windows its draws use; callers must pass the real length of the range
+    (a window ends near it: no `VK_WHOLE_SIZE` over a lookup of 1 byte);
+  - submissions and presents run on their own thread (`vk_dev.c`, submission thread);
+  - no device feature that makes RADV put every allocation in every submission is enabled (buffer device address,
+    update-after-bind descriptors).
 - **An import must be gone before the game frees its memory.** Pool finalize waits for the GPU and frees the import
   itself; freeing it later made a submission name pages that no longer existed (device lost).
 - **Wine's heap takes one process-wide lock per HeapAlloc, and maps / unmaps every large block.** Wine refuses the

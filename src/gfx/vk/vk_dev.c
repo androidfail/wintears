@@ -171,7 +171,7 @@ static int create_device(void) {
    Each GPU-visible pool becomes a VkBuffer over the game's memory (imported host memory, no copy). The game keeps a few
    thousand pools alive, more than the allocation limit of some drivers (4096), so pools inside the guest heap share one
    import of the whole heap; other pools (the alias region) get their own. */
-typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; int refs; } import_t;
+typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; int refs, windowed; } import_t;   /* windowed: see vk_buf */
 static pidx g_imports;               /* sorted by address, key = import_t * */
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_pool_n, g_import_n;
@@ -194,7 +194,7 @@ static import_t *import_fail(uintptr_t lo, uintptr_t hi, const char *step, int r
     if (n++ < 4) { vk_describe_range(lo, hi, what, sizeof what); VLOG("import of %p..%p (%.1f MiB) failed at %s (%d): %s", (void *)lo, (void *)hi, (hi - lo) / 1048576.0, step, r, what); }
     return NULL;
 }
-static import_t *import_range(uintptr_t lo, uintptr_t hi) {
+static import_t *import_range_in(uintptr_t lo, uintptr_t hi, int listed) {
     VkMemoryHostPointerPropertiesEXT hp = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     VkResult hr = vkGetMemoryHostPointerPropertiesEXT(vk_dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)lo, &hp);
     if (hr != VK_SUCCESS || !hp.memoryTypeBits) return import_fail(lo, hi, "host pointer properties", (int)hr);
@@ -223,11 +223,48 @@ static import_t *import_range(uintptr_t lo, uintptr_t hi) {
     import_t *im_ = calloc(1, sizeof *im_);
     *im_ = (import_t){lo, hi, mem, buf, 0};
     if (g_nimp_log < 64) g_imp_log[g_nimp_log++] = (typeof(g_imp_log[0])){lo, hi};
+    if (!listed) return im_;
     { static int n; if (n++ < 24) VLOG("imported %p..%p (%.1f MiB) for the GPU", (void *)lo, (void *)hi, (hi - lo) / 1048576.0); }
     pidx_ent e = {lo, hi, lo, im_, 0, im_, 0};
     if (!pidx_insert(&g_imports, &e)) die("Vulkan: pool table");
     g_import_n++;
     return im_;
+}
+static import_t *import_range(uintptr_t lo, uintptr_t hi) { return import_range_in(lo, hi, 1); }
+
+/* Windowed pools (Wine / Proton). The Linux kernel re-reads the page tables of every imported range a submission
+   names, at each submission: with whole pools that was most of TOTK's 2 GiB heap and 40 ms per submission on Great
+   Sky Island (the submission thread at 90 % of a core, the frame rate capped by it). A large pool is therefore
+   imported in pieces on demand: the 1 MiB-aligned window around each range the GPU is given (vk_buf), clipped to
+   the pool, so a submission names only the windows its draws use. Windows of one pool may overlap (they pin the same
+   pages; the GPU sees one memory). */
+#define WIN_GRAIN (1u << 20)
+#define WIN_POOL_MIN (8u << 20)   /* smaller pools are imported whole */
+#include "nvn_hmap.h"
+static nvn_hmap g_win = {.klen = 16};   /* {lo, hi} -> import_t *, g_pool_mu */
+static uint64_t g_win_n, g_win_bytes;
+static import_t *window_of(const import_t *pool, uintptr_t a, uintptr_t b) {   /* g_pool_mu held */
+    uintptr_t k[2] = {a & ~(uintptr_t)(WIN_GRAIN - 1), (b + WIN_GRAIN - 1) & ~(uintptr_t)(WIN_GRAIN - 1)};
+    if (k[0] < pool->lo) k[0] = pool->lo;
+    if (k[1] > pool->hi) k[1] = pool->hi;
+    import_t *w = nvn_hm_get(&g_win, k);
+    if (w) return w;
+    w = import_range_in(k[0], k[1], 0);
+    if (!w) return NULL;
+    nvn_hm_put(&g_win, k, w);
+    g_win_n++; g_win_bytes += k[1] - k[0];
+    { static int n; if (n++ < 4) VLOG("pool %p..%p (%.0f MiB) given to the GPU in windows: first %p..%p", (void *)pool->lo, (void *)pool->hi,
+                                      (pool->hi - pool->lo) / 1048576.0, (void *)k[0], (void *)k[1]); }
+    return w;
+}
+static void windows_drop(uintptr_t lo, uintptr_t hi, import_t **out, int *n, int cap) {   /* g_pool_mu held: take a pool's windows out */
+    for (uint32_t i = 0; i < g_win.cap && *n < cap; i++) {
+        import_t *w = g_win.vals ? g_win.vals[i] : NULL;
+        if (!w || w->lo < lo || w->hi > hi) continue;
+        uintptr_t k[2] = {w->lo, w->hi}; nvn_hm_del(&g_win, k);
+        g_win_n--; g_win_bytes -= w->hi - w->lo;
+        out[(*n)++] = w; i = (uint32_t)-1;   /* deletion shifts entries: rescan */
+    }
 }
 
 static void pool_add(const void *mem, uint64_t size) {
@@ -242,6 +279,14 @@ static void pool_add(const void *mem, uint64_t size) {
            drivers want an imported range inside one memory mapping; protection changes split the heap's) */
         static int whole = -1; if (whole < 0) { const char *e = pal_getenv("TOTK_IMPORT_HEAP"); whole = e ? *e != '0' : !pal_under_wine(); if (!whole) VLOG("pools in the heap are imported one by one (%s)", e ? "TOTK_IMPORT_HEAP=0" : "Wine / Proton"); }
         if (whole && a >= hb && b <= hb + hs) im = import_range((uintptr_t)hb, (uintptr_t)(hb + hs));
+        if (!im && !whole && hi - lo >= WIN_POOL_MIN) {   /* windowed: imported in pieces by vk_buf */
+            im = calloc(1, sizeof *im);
+            if (!im) die("Vulkan: pool table");
+            *im = (import_t){lo, hi, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 1};
+            pidx_ent pe = {lo, hi, lo, im, 0, im, 0};
+            if (!pidx_insert(&g_imports, &pe)) die("Vulkan: pool table");
+            g_import_n++;
+        }
         if (!im) im = import_range(lo, hi);
         if (!im) VK_ONCE("memory pool %p+%#llx cannot be imported: the GPU does not see it (first case)", mem, (unsigned long long)size);
     }
@@ -275,13 +320,18 @@ static void pool_del(const void *mem) {
         vt_pool_gone(lo, hi);
         uint64_t f = vk_flush(NULL, NULL);
         pthread_mutex_unlock(&vk_mu);
+        enum { MAXW = 4096 }; import_t **wins = im->windowed ? malloc(MAXW * sizeof *wins) : NULL; int nw = 0;
+        if (im->windowed && !wins) die("Vulkan: pool windows");
+        if (im->windowed) { pthread_mutex_lock(&g_pool_mu); windows_drop(lo, hi, wins, &nw, MAXW); pthread_mutex_unlock(&g_pool_mu); }
         /* The import goes before this returns, once the GPU is done with it: the game frees the memory as soon as
            Finalize returns, and RADV puts every allocation in every submission, so a submission in between named
            user pages that were gone and the Steam Deck lost the device (while loading, when pools come and go). */
         int away = runtime_core_away();
         vk_wait_done(f);
         runtime_core_back(&away);
-        free_import(im);
+        for (int i = 0; i < nw; i++) free_import(wins[i]);
+        free(wins);
+        if (im->windowed) free(im); else free_import(im);
     }
 }
 
@@ -320,9 +370,11 @@ static import_t *standin_make(uintptr_t lo, uintptr_t hi) {   /* g_pool_mu held 
 int vk_buf(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     pthread_mutex_lock(&g_pool_mu);
     const pidx_ent *e = pidx_find(&g_imports, (uintptr_t)addr, len ? len : 1);
-    if (e) { *buf = ((import_t *)e->buf)->buf; *off = addr - e->lo; }
+    const import_t *im0 = e ? e->buf : NULL;
+    if (im0 && im0->windowed) im0 = window_of(im0, (uintptr_t)addr, (uintptr_t)(addr + (len ? len : 1)));
+    if (im0) { *buf = im0->buf; *off = addr - im0->lo; }
     pthread_mutex_unlock(&g_pool_mu);
-    if (e) return 1;
+    if (e) return im0 != NULL;
     /* not imported: a virtual pool's pages, through their physical pool (its stand-in when that is not importable) */
     uint64_t ph = totk_vpool_physical((const void *)(uintptr_t)addr, len ? len : 1), plo, pspan;
     if (!ph || !totk_vpool_phys_pool(ph, &plo, &pspan)) return 0;
@@ -649,7 +701,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
     if (now - last >= 10000000000ull) {
         last = now;
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
-        { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6); vk_ns_hash = 0; }
+        { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu pool windows (%.0f MiB)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6, (unsigned long long)g_win_n, g_win_bytes / 1048576.0); vk_ns_hash = 0; }
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
         vk_log_memory();
