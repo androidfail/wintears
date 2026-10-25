@@ -48,6 +48,7 @@ typedef struct thr {
     uint64_t cseq, core_since; struct thr *cnext;
     uint32_t wh[4]; int nwh;
     jit_context *ctx;          /* the registers the thread runs now (nested host-to-guest calls replace it) */
+    void *osh;                 /* host thread handle for the sampler (never closed: the sampler may still hold it) */
 } thr_t;
 static thr_t *g_all;
 
@@ -332,6 +333,7 @@ static void *thread_main(void *p) {
     pthread_setspecific(g_keythr, t);
     pthread_setspecific(runtime_keys[2], (void *)(uintptr_t)t->tls);
     { char nm[32]; snprintf(nm, sizeof nm, "guest %#x p%d", t->handle, t->prio); pal_thread_set_name(nm); }
+    t->osh = pal_thread_handle_self();
     G_lock(); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
     jit_context c;
     memset(&c, 0, sizeof c);
@@ -360,6 +362,7 @@ static void thread_exit(thr_t *t) {
     pthread_exit(NULL);
 }
 
+static void *sampler(void *unused);
 void threads_init(void) {
     if (pthread_key_create(&g_keythr, NULL)) die("thread key");
     for (int i = 0; i < 8; i++) if (pthread_key_create(&runtime_keys[i], NULL)) die("runtime key");
@@ -368,6 +371,45 @@ void threads_init(void) {
     jit_config cfg = {0};
     cfg.fastmem = 1;
     for (int i = 0; i < NCORE; i++) g_jit[i] = jit_core_create(&cfg, g_monitor, (size_t)i);
+    const char *e = pal_getenv("TOTK_SAMPLE");
+    if (e ? *e != '0' : pal_under_wine()) { pthread_t th; if (!pthread_create(&th, NULL, sampler, NULL)) pthread_detach(th); }
+}
+
+/* Sampling profiler (on by default under Wine / Proton, TOTK_SAMPLE=1/0): 100 times a second, where each core's
+   owner is (pc and the calling functions in this program); the most frequent places are logged every 10 s. */
+static void *sampler(void *unused) {
+    (void)unused;
+    pal_thread_set_name("sampler");
+    enum { MAXK = 512 };
+    static struct { char k[160]; unsigned n; } tab[MAXK]; int ntab = 0; unsigned total = 0; uint64_t last = pal_now_ns();
+    for (;;) {
+        pal_sleep_ns(10000000);
+        void *hs[NCORE];
+        G_lock();
+        for (int c = 0; c < NCORE; c++) { thr_t *o = g_core_owner[c]; hs[c] = o ? o->osh : NULL; }
+        pthread_mutex_unlock(&G);
+        for (int c = 0; c < NCORE; c++) {
+            char k[160];
+            if (!hs[c]) snprintf(k, sizeof k, "(core free)");
+            else if (!pal_thread_sample(hs[c], k, sizeof k)) continue;
+            int i = 0; while (i < ntab && strcmp(tab[i].k, k)) i++;
+            if (i == ntab) { if (ntab == MAXK) continue; snprintf(tab[ntab++].k, sizeof tab[0].k, "%s", k); }
+            tab[i].n++; total++;
+        }
+        if (pal_now_ns() - last < 10000000000ull || !total) continue;
+        last = pal_now_ns();
+        char out[2048]; size_t at = 0;
+        for (int shown = 0; shown < 14; shown++) {
+            int b = -1; for (int i = 0; i < ntab; i++) if (tab[i].n && (b < 0 || tab[i].n > tab[b].n)) b = i;
+            if (b < 0) break;
+            at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0, "%s%u%% %s", shown ? " | " : "", tab[b].n * 100 / total, tab[b].k);
+            tab[b].n = 0;
+            if (at >= sizeof out) break;
+        }
+        LOG("[cores] where the core owners are (%u samples): %s", total, out);
+        ntab = 0; total = 0;
+    }
+    return NULL;
 }
 
 /* Register the main thread and return its handle (nnosInitialize takes it as the main thread handle) */
@@ -375,7 +417,7 @@ uint32_t host_thread_main_init(jit_context *ctx) {
     thr_t *t = calloc(1, sizeof *t);
     if (!t) die("thread allocation");
     pthread_cond_init(&t->cv, NULL);
-    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self();
+    t->started = 1; t->prio = 44; t->core = 0; t->mask = 7; t->pt = pthread_self(); t->osh = pal_thread_handle_self();
     t->cur_core = -1;
     uint64_t stack_size, stack = host_main_stack(&stack_size);
     t->stack_top = stack + stack_size - 0x100;

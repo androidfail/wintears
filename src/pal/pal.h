@@ -166,7 +166,12 @@ uint64_t pal_sleep_probe(uint64_t ns);
 /* Access violations seen by the fault handler since the start (each is slow under Wine). */
 uint64_t pal_fault_total(void);
 /* The busiest threads since the last call: "name 87%, name 40%, ..." (percent of one core). */
-void pal_thread_cpu_report(char *out, size_t cap);         /* stderr + debugger output */
+void pal_thread_cpu_report(char *out, size_t cap);
+/* Sampling profiler: a handle to the calling thread for pal_thread_sample. */
+void *pal_thread_handle_self(void);
+/* Stop thread h for a moment and describe where it is: "module+offset" of its pc (or "jit" for code outside any
+   module), then up to two return addresses into this program found on its stack ("< exe+offset"). 0 if it failed. */
+int pal_thread_sample(void *h, char *out, size_t cap);         /* stderr + debugger output */
 
 #ifdef __cplusplus
 }

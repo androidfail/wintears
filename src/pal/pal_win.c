@@ -779,6 +779,55 @@ void pal_thread_cpu_report(char *out, size_t cap) {
     }
 }
 
+void *pal_thread_handle_self(void) {
+    HANDLE h = NULL;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0);
+    return h;
+}
+static void describe_pc(uint64_t pc, char *out, size_t cap) {
+    HMODULE m = NULL; char name[MAX_PATH];
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)pc, &m) || !m) {
+        snprintf(out, cap, "jit"); return;
+    }
+    if (m == GetModuleHandleA(NULL)) { snprintf(out, cap, "exe+%#llx", (unsigned long long)(pc - (uint64_t)(uintptr_t)m)); return; }
+    DWORD n = GetModuleFileNameA(m, name, sizeof name); const char *b = name;
+    for (DWORD i = 0; i < n; i++) if (name[i] == '\\' || name[i] == '/') b = name + i + 1;
+    snprintf(out, cap, "%s+%#llx", n ? b : "?", (unsigned long long)(pc - (uint64_t)(uintptr_t)m));
+}
+/* A qword on the stack that points just after a call instruction in this program is taken as a return address. */
+static int after_call(const uint8_t *p) {
+    return p[-5] == 0xE8 || (p[-6] == 0xFF && p[-5] == 0x15) || (p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0)
+        || (p[-3] == 0x41 && p[-2] == 0xFF && (p[-1] & 0xF8) == 0xD0) || (p[-3] == 0xFF && (p[-2] & 0xF8) == 0x50);
+}
+int pal_thread_sample(void *h, char *out, size_t cap) {
+    static uint64_t text0, text1;
+    if (!text1) {
+        uint8_t *b = (uint8_t *)GetModuleHandleA(NULL); IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(b + ((IMAGE_DOS_HEADER *)b)->e_lfanew);
+        text0 = (uint64_t)(uintptr_t)b + 0x1000; text1 = (uint64_t)(uintptr_t)b + nt->OptionalHeader.SizeOfImage;
+    }
+    static uint64_t stk[2048];   /* one sampler thread */
+    CONTEXT c = {0}; c.ContextFlags = CONTEXT_CONTROL;
+    if (SuspendThread((HANDLE)h) == (DWORD)-1) return 0;
+    int ok = GetThreadContext((HANDLE)h, &c) != 0; size_t got = 0;
+    if (ok)   /* the stack, page by page while it reads (no locks taken while the thread is stopped) */
+        for (uint64_t a = c.Rsp & ~7ull; got < 2048; ) {
+            uint64_t end = (a | 4095) + 1; size_t n = (size_t)(end - a) / 8, r = 0; if (n > 2048 - got) n = 2048 - got;
+            if (!ReadProcessMemory(GetCurrentProcess(), (void *)(uintptr_t)a, stk + got, n * 8, (SIZE_T *)&r) || !r) break;
+            got += r / 8; a = end;
+        }
+    ResumeThread((HANDLE)h);
+    if (!ok) return 0;
+    describe_pc(c.Rip, out, cap);
+    size_t at = strlen(out);
+    for (size_t i = 0, found = 0; i < got && found < 2; i++)
+        if (stk[i] >= text0 + 8 && stk[i] < text1 && after_call((const uint8_t *)(uintptr_t)stk[i])) {
+            at += (size_t)snprintf(out + at, at < cap ? cap - at : 0, " < exe+%#llx", (unsigned long long)(stk[i] - text0 + 0x1000));
+            found++;
+        }
+    return 1;
+}
+
 int pal_process_memory(uint64_t *resident, uint64_t *committed) {
     PROCESS_MEMORY_COUNTERS_EX m = {.cb = sizeof m};
     if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m)) return -1;
