@@ -29,7 +29,7 @@ struct vtex {
     int mirrored, owned, uploaded;
     char writer[128];   /* what last wrote it (diagnostics: the pass log prints it for sampled textures) */
     struct {   /* the write's inputs, so F9 can follow a sampled texture back to its sources (diagnostics) */
-        uint64_t present; int ndraws, nsh, nin;
+        uint64_t present; int ndraws, nsh, nin, ndrop; char drop[96];
         char sh[4][40];
         struct { uint64_t mem; uint32_t w, h, fmt; } in[8];
     } prov;
@@ -72,6 +72,7 @@ static void prov_add(vtex *e, uint64_t mem, uint32_t w, uint32_t h, uint32_t fmt
     for (int i = 0; i < e->prov.nin; i++) if (e->prov.in[i].mem == mem && e->prov.in[i].fmt == fmt) return;
     if (e->prov.nin < 8) e->prov.in[e->prov.nin++] = (typeof(e->prov.in[0])){mem, w, h, fmt};
 }
+void vt_prov_drop(vtex *e, const char *why) { if (e) { e->prov.ndrop++; snprintf(e->prov.drop, sizeof e->prov.drop, "%s", why); } }
 void vt_prov_copy(vtex *e, const tex_t *src) { if (e && src) prov_add(e, (uint64_t)(uintptr_t)src->mem, src->d.width, src->d.height, (uint32_t)src->d.format); }
 void vt_prov_draw(vtex *e, const char *vs, const char *fs) {   /* a draw into e (a target of the open pass) read the pending inputs */
     if (!e) return;
@@ -89,6 +90,7 @@ static void prov_walk(const vtex *e, int depth, const vtex **seen, int *nseen) {
     VLOG("[chain] %*simage %p: storage %#llx %ux%u class %#x VK %d; last written by %s at present %llu; %d draws, %d inputs",
          depth * 2, "", (void *)e, (unsigned long long)e->k.mem, e->w, e->h, e->k.cls, (int)e->fmt, vt_writer_of(e), (unsigned long long)e->prov.present, e->prov.ndraws, e->prov.nin);
     for (int i = 0; i < e->prov.nsh; i++) VLOG("[chain] %*s  shaders %s", depth * 2, "", e->prov.sh[i]);
+    if (e->prov.ndrop) VLOG("[chain] %*s  %d draws into it were DROPPED since (last: %s)", depth * 2, "", e->prov.ndrop, e->prov.drop);
     if (!vk_fmt_block_compressed(e->fmt) && !e->f.depth && !e->f.stencil) vx_note_sampled(e->img, e->fmt, e->w, e->h);   /* its contents now, logged after the pass */
     if (depth >= 10) return;
     for (int i = 0; i < e->prov.nin; i++) {

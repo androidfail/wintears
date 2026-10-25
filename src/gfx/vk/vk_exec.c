@@ -76,6 +76,7 @@ void vk_capture_request(void) {
     uint64_t n = vk_present_count() + 1;
     atomic_store(&vk_capture_at, n);
     VLOG("[capture] F9: logging the passes of the frame after present %llu", (unsigned long long)n);
+    void vd_log_skipped(void); vd_log_skipped();
 }
 static int plog(void) {
     if (g_plog < 0) {
@@ -588,6 +589,8 @@ static void clear_tex(const p_clear_tex *c) {
 /* TOTK: SetRenderEnableConditional, mode 0 = render if the two counters at addr / addr + 16 are equal. The counters
    are written when earlier submissions complete; read at replay (shortcut: a counter reported earlier in the same
    submission is not seen yet). */
+static char g_off_why[96];
+void vd_note_drop(const char *why);
 static int cond_eval(const p_render_cond *c) {
     uint64_t a, b; memcpy(&a, (const void *)(uintptr_t)c->addr, 8); memcpy(&b, (const void *)(uintptr_t)(c->addr + 16), 8);
     return c->mode == 0 ? a == b : a != b;
@@ -631,11 +634,13 @@ void vx_run(const uint8_t *p) {
         case OP_CLEAR_TEX: clear_tex((const p_clear_tex *)a); break;
         case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.has_sc = 1; vd_state_op(h.op, a); break;
-        case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value; break;
-        case OP_RENDER_COND: S.render_disabled = !cond_eval((const p_render_cond *)a); break;
+        case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value; snprintf(g_off_why, sizeof g_off_why, "rendering off (SetRenderEnable false)"); break;
+        case OP_RENDER_COND: { const p_render_cond *rc = (const p_render_cond *)a; uint64_t x, y; memcpy(&x, (const void *)(uintptr_t)rc->addr, 8); memcpy(&y, (const void *)(uintptr_t)(rc->addr + 16), 8);
+            S.render_disabled = !cond_eval(rc);
+            snprintf(g_off_why, sizeof g_off_why, "rendering off (conditional mode %d: counters %#llx %#llx at %#llx, read on the CPU)", (int)rc->mode, (unsigned long long)x, (unsigned long long)y, (unsigned long long)rc->addr); break; }
         case OP_BARRIER: vx_end_pass(); vk_barrier(vk_cmd()); break;
-        case OP_DRAW: if (!S.render_disabled) vd_draw((const p_draw *)a, NULL); break;
-        case OP_DRAW_IDX: if (!S.render_disabled) vd_draw(NULL, (const p_draw_idx *)a); break;
+        case OP_DRAW: if (!S.render_disabled) vd_draw((const p_draw *)a, NULL); else vd_note_drop(g_off_why); break;
+        case OP_DRAW_IDX: if (!S.render_disabled) vd_draw(NULL, (const p_draw_idx *)a); else vd_note_drop(g_off_why); break;
         case OP_DISPATCH: vd_dispatch((const p_dispatch *)a); break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
         default: vd_state_op(h.op, a); break;   /* binds and render state */

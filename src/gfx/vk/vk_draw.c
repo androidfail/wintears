@@ -669,14 +669,25 @@ static int quad_indices(VkCommandBuffer c, const uint8_t *src, int itype, int fi
 }
 
 static void draw_inner(VkCommandBuffer c, const p_draw *dw, const p_draw_idx *di, int prim, int quads);
+/* A draw that is not made: its reason goes to the current colour target 0 (the F9 chain prints it) and to a count. */
+static uint64_t g_dropped_off;
+void vd_note_drop(const char *why) {
+    if (!strncmp(why, "render", 6)) g_dropped_off++;
+    if (S.has_rt && S.rt.n > 0 && S.rt.color[0]) vt_prov_drop(vt_get(S.rt.color[0]), why);
+}
+void vd_log_skipped(void) {
+    VLOG("[capture] draws so far %llu; dropped: no program %llu, no shader %llu, no target %llu, no pipeline %llu, index %llu, rendering off %llu",
+         (unsigned long long)g_draws, (unsigned long long)g_skipped[0], (unsigned long long)g_skipped[1], (unsigned long long)g_skipped[2],
+         (unsigned long long)g_skipped[3], (unsigned long long)g_skipped[4], (unsigned long long)g_dropped_off);
+}
 void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     g_draws++;
     if (!g_state_ready) state_reset();
     fixed_init();
     vk_prog *pr = vs_prog(S.prog);
-    if (!pr || !vs_has_stage(pr, 0)) { g_skipped[0]++; return; }
+    if (!pr || !vs_has_stage(pr, 0)) { g_skipped[0]++; vd_note_drop("no program / no vertex shader"); return; }
     vk_shader *vs = vs_stage(pr, 0), *fs = vs_has_stage(pr, 1) ? vs_stage(pr, 1) : NULL;
-    if (!vs || (vs_has_stage(pr, 1) && !fs)) { g_skipped[1]++; return; }
+    if (!vs || (vs_has_stage(pr, 1) && !fs)) { g_skipped[1]++; vd_note_drop("shader not translated"); return; }
     if (g_nupd) {   /* vertex / index buffers read memory: logged uniform updates there reach it first */
         for (int i = 0; i < S.nattr && i < 16; i++) { va_st va; memcpy(&va, &S.attr[i], 4);
             if (va.fmt && va.stream < 16 && S.vbuf[va.stream].address) vd_ub_guard(S.vbuf[va.stream].address, S.vbuf[va.stream].address + (S.vbuf[va.stream].size ? S.vbuf[va.stream].size : 1)); }
@@ -691,7 +702,7 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     int prim = dw ? dw->prim : di->prim;
     VkPipelineLayout lay = layout_of(vs->dsl, fs ? fs->dsl : VK_NULL_HANDLE);
     VkPipeline p = graphics_pipeline(vs, fs, prim, lay);
-    if (!p || p == (VkPipeline)1) { g_skipped[3]++; return; }
+    if (!p || p == (VkPipeline)1) { g_skipped[3]++; vd_note_drop("no pipeline"); return; }
     void vx_note_draw(void); vx_note_draw();
     { extern int vk_passlog_on; if (vk_passlog_on) VLOG("[pass]  draw %s + %s prim %d vp %g,%g %gx%g sc %d %d,%d %dx%d cull %d dt %d blend_en %#x mask %#x raster_discard %d",
         vs->name, fs ? fs->name : "-", prim, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.has_sc, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.poly.cull, S.ds.dt, S.color.blend_en, S.chmask.mask, S.raster_discard); }
@@ -727,7 +738,7 @@ static void draw_inner(VkCommandBuffer c, const p_draw *dw, const p_draw_idx *di
         for (int i = 0; i < di->count; i++) d[i] = src[i];
         vkCmdBindIndexBuffer(c, sb, so, VK_INDEX_TYPE_UINT16);
     } else {
-        if (!vk_buf(di->ibuf, (uint64_t)di->count * isz, &ib, &io) || io % isz) { g_skipped[4]++; VK_ONCE("index buffer %#llx not in GPU memory / unaligned: draw skipped", (unsigned long long)di->ibuf); return; }
+        if (!vk_buf(di->ibuf, (uint64_t)di->count * isz, &ib, &io) || io % isz) { g_skipped[4]++; vd_note_drop("index buffer not in GPU memory"); VK_ONCE("index buffer %#llx not in GPU memory / unaligned: draw skipped", (unsigned long long)di->ibuf); return; }
         vkCmdBindIndexBuffer(c, ib, io, isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     }
     vkCmdDrawIndexed(c, (uint32_t)di->count, inst, 0, di->base_vertex, (uint32_t)di->base_instance);

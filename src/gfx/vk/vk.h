@@ -101,6 +101,7 @@ void vt_prov_input(const tex_t *t);
 void vt_prov_draw(vtex *e, const char *vs, const char *fs);
 void vt_prov_copy(vtex *e, const tex_t *src);
 void vt_prov_dump(const vtex *e);
+void vt_prov_drop(vtex *e, const char *why);
 /* A view of a block-compressed image whose texel is one block (BC4 as RGBA16UI: the game renders into BC textures this way):
    1 and the block size in texels in *bw / *bh; its extent is the image's in blocks. */
 int vt_block_view(const vtex *e, const tex_t *t, const view_t *v, int *bw, int *bh);
