@@ -134,11 +134,12 @@ if(WINTEARS_JIT)
   target_compile_options(gfx PRIVATE -Wno-missing-field-initializers)   # Vulkan structs: {sType, .field = ...}
   set_source_files_properties(src/gfx/vk/vk_mem.cpp PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-unused-variable;-Wno-missing-field-initializers")
   target_link_libraries(gfx PUBLIC host SDL3::SDL3-static astcdec-sse4.1-static)
-  # alloc.cpp: operator new / delete with a per-thread cache (Wine's heap lock stalled the JIT compiler on the Steam
-  # Deck). Static, so libstdc++'s own allocations use it too and no MinGW DLLs ship with the exe.
+  # alloc.cpp: operator new / delete and malloc / free with per-thread and large-block caches (Wine's heap lock and
+  # its mmap per large block cost the Steam Deck dearly). Static, so libstdc++'s own allocations use it too.
   add_executable(wintears src/app/main.c src/app/alloc.cpp)
   target_link_libraries(wintears PRIVATE gfx)
-  target_link_options(wintears PRIVATE -static)
+  target_link_options(wintears PRIVATE -static
+    "LINKER:--wrap=malloc" "LINKER:--wrap=free" "LINKER:--wrap=calloc" "LINKER:--wrap=realloc")   # alloc.cpp: also C code
 endif()
 
 # ---- tests ----
