@@ -445,6 +445,21 @@ static VkFormat own_format(const vtex *e, const tex_t *t, const view_t *v, int h
     if (!vk_fmt_of(nf, &f) || f.depth || f.stencil || f.convert || vt_depth(e) || vk_fmt_block_compressed(f.vk) || vk_fmt_block_compressed(vt_vkformat(e))) return VK_FORMAT_UNDEFINED;
     return f.vk != vt_vkformat(e) ? f.vk : VK_FORMAT_UNDEFINED;
 }
+/* The Vulkan format a texture (with its view) holds its texels in; UNDEFINED for depth, compressed or converted ones. */
+static VkFormat tex_vkfmt(const tex_t *t, const view_t *v, int has_v) {
+    vk_fmt f; int nf = has_v && v->set_format ? v->format : t->d.format;
+    if (!vk_fmt_of(nf, &f) || f.depth || f.stencil || f.convert || vk_fmt_block_compressed(f.vk)) return VK_FORMAT_UNDEFINED;
+    return f.vk;
+}
+static int int_format(VkFormat f) {   /* integer texels: Vulkan blits them only to integer formats of the same kind */
+    switch (f) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16G16_UINT:
+    case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 1;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32A32_SINT: return 2;
+    default: return 0;
+    }
+}
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = c->src ? vt_get(c->src) : NULL, *d = c->dst ? vt_get(c->dst) : NULL;
     if (plog()) VLOG("[pass] copy %ux%u fmt %#x -> %ux%u fmt %#x (%s %s)", c->src ? c->src->d.width : 0, c->src ? c->src->d.height : 0, c->src ? c->src->d.format : 0,
@@ -475,7 +490,15 @@ static void copy_t2t(const p_copy_t2t *c) {
         }
         VK_ONCE("copy between formats %#x and %#x (depth involved, texel sizes %d / %d): not possible, left to the blit", c->src->d.format, c->dst->d.format, bs, bt);
     }
-    if (same && (vt_vkformat(s) == vt_vkformat(d) || (!vt_depth(s) && !vt_depth(d) && !vk_fmt_block_compressed(vt_vkformat(s)) && !vk_fmt_block_compressed(vt_vkformat(d))))) {
+    /* A copy between two textures of different colour formats converts the texels (the Switch's 2D engine), as a blit
+       does: a R11G11B10F capture copied into an RGB10A2 texture bit for bit read back as bright blue. Same format, an
+       sRGB / linear twin, or integer and float formats (no blit between them): bit for bit. */
+    VkFormat tsf = tex_vkfmt(c->src, &c->sv, c->has_sv), tdf = tex_vkfmt(c->dst, &c->dv, c->has_dv);
+    int convert = same && tsf && tdf && tsf != tdf && int_format(tsf) == int_format(tdf) && !int_format(tsf)
+               && !((tsf == VK_FORMAT_R8G8B8A8_UNORM && tdf == VK_FORMAT_R8G8B8A8_SRGB) || (tsf == VK_FORMAT_R8G8B8A8_SRGB && tdf == VK_FORMAT_R8G8B8A8_UNORM)
+                    || (tsf == VK_FORMAT_B8G8R8A8_UNORM && tdf == VK_FORMAT_B8G8R8A8_SRGB) || (tsf == VK_FORMAT_B8G8R8A8_SRGB && tdf == VK_FORMAT_B8G8R8A8_UNORM));
+    if (convert) { static int n; if (n++ < 8) VLOG("copy %ux%u converts format %d -> %d (as a blit)", sx.width, sx.height, (int)tsf, (int)tdf); }
+    if (same && !convert && (vt_vkformat(s) == vt_vkformat(d) || (!vt_depth(s) && !vt_depth(d) && !vk_fmt_block_compressed(vt_vkformat(s)) && !vk_fmt_block_compressed(vt_vkformat(d))))) {
         if (ds.layerCount != ss.layerCount) ds.layerCount = ss.layerCount = ss.layerCount < ds.layerCount ? ss.layerCount : ds.layerCount;
         VkImageCopy r = {ss, so, ds, dof, sx};
         vkCmdCopyImage(vk_cmd(), vt_image(s), VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
