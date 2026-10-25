@@ -405,6 +405,37 @@ static int texel_bytes(const vtex *e, const tex_t *t, int *block, int *bh) {
     if (vt_depth(e)) { *block = *bh = 1; return vt_vkformat(e) == VK_FORMAT_D16_UNORM ? 2 : 4; }
     return nvn_fmt_bpb(t->d.format, block, bh);
 }
+/* Images are shared by textures of one texel size (vk_tex.c: an RGBA8 and an RGB10A2 texture over the same bytes are one
+   image, made in the first one's format). Copies are bit for bit, but a blit converts and a texture clear encodes in the
+   image's own format: through the image of another texture's format the bytes come out wrong (opaque black RGBA8 read
+   as RGB10A2 is bright blue). So a blit or clear for a texture whose format is not its image's goes through a scratch
+   image in the texture's format, copied bit for bit to or from the shared image. */
+typedef struct { VkFormat f; uint32_t w, h; VkImage img; VmaAllocation al; } tmp_ent;
+static tmp_ent g_tmp[64]; static int g_ntmp;
+static VkImage tmp_image(VkFormat f, uint32_t w, uint32_t h) {
+    for (int i = 0; i < g_ntmp; i++) if (g_tmp[i].f == f && g_tmp[i].w == w && g_tmp[i].h == h) return g_tmp[i].img;
+    if (g_ntmp == 64) { VK_ONCE("more than 64 scratch image shapes: blits and clears in another format fall back to the image's format"); return VK_NULL_HANDLE; }
+    VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    tmp_ent t = {f, w, h, VK_NULL_HANDLE, NULL};
+    if (vmaCreateImage(vk_vma, &ci, &ac, &t.img, &t.al, NULL) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = t.img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+    vkCmdPipelineBarrier2(vk_cmd(), &di);
+    g_tmp[g_ntmp++] = t;
+    return t.img;
+}
+/* the format a texture (with its view) is read or written in, when it is a plain colour format other than its image's */
+static VkFormat own_format(const vtex *e, const tex_t *t, const view_t *v, int has_v) {
+    vk_fmt f; int nf = has_v && v->set_format ? v->format : t->d.format;
+    if (!vk_fmt_of(nf, &f) || f.depth || f.stencil || f.convert || vt_depth(e) || vk_fmt_block_compressed(f.vk) || vk_fmt_block_compressed(vt_vkformat(e))) return VK_FORMAT_UNDEFINED;
+    return f.vk != vt_vkformat(e) ? f.vk : VK_FORMAT_UNDEFINED;
+}
 static void copy_t2t(const p_copy_t2t *c) {
     vtex *s = c->src ? vt_get(c->src) : NULL, *d = c->dst ? vt_get(c->dst) : NULL;
     if (plog()) VLOG("[pass] copy %ux%u fmt %#x -> %ux%u fmt %#x (%s %s)", c->src ? c->src->d.width : 0, c->src ? c->src->d.height : 0, c->src ? c->src->d.format : 0,
@@ -447,14 +478,31 @@ static void copy_t2t(const p_copy_t2t *c) {
         if (ds.layerCount != ss.layerCount) ds.layerCount = ss.layerCount = ss.layerCount < ds.layerCount ? ss.layerCount : ds.layerCount;
         r.srcSubresource = ss; r.dstSubresource = ds;
         int linear = (c->flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) && !vt_depth(s);
-        vkCmdBlitImage(vk_cmd(), vt_image(s), VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+        VkFilter filt = linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+        VkFormat sf = own_format(s, c->src, &c->sv, c->has_sv), df = own_format(d, c->dst, &c->dv, c->has_dv);
+        VkImage simg = vt_image(s), dt = VK_NULL_HANDLE, st;
+        if ((sf || df) && ss.layerCount == 1 && sx.depth == 1 && dx.depth == 1) {   /* the blit in the textures' own formats */
+            if (sf && (st = tmp_image(sf, sx.width, sx.height))) {
+                VkImageCopy cp = {ss, so, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, sx};
+                vkCmdCopyImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, st, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+                vk_barrier(vk_cmd());
+                simg = st; r.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.srcOffsets[0] = (VkOffset3D){0, 0, 0}; r.srcOffsets[1] = (VkOffset3D){(int32_t)sx.width, (int32_t)sx.height, 1};
+            }
+            if (df && (dt = tmp_image(df, dx.width, dx.height))) {
+                VkOffset3D d0 = r.dstOffsets[0], d1 = r.dstOffsets[1];
+                r.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.dstOffsets[0] = (VkOffset3D){d0.x - dof.x, d0.y - dof.y, 0}; r.dstOffsets[1] = (VkOffset3D){d1.x - dof.x, d1.y - dof.y, 1};
+                vkCmdBlitImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, dt, VK_IMAGE_LAYOUT_GENERAL, 1, &r, filt);
+                vk_barrier(vk_cmd());
+                VkImageCopy cp = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, ds, dof, dx};
+                vkCmdCopyImage(vk_cmd(), dt, VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+            } else vkCmdBlitImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r, filt);
+        } else vkCmdBlitImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r, filt);
     }
     vk_barrier(vk_cmd());
     vt_written(d);
 }
-static int is_srgb(VkFormat f) { return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB; }
-static float srgb_enc(float x) { x = x < 0 ? 0 : x > 1 ? 1 : x; return x <= 0.0031308f ? x * 12.92f : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f; }
-static float srgb_dec(float x) { x = x < 0 ? 0 : x > 1 ? 1 : x; return x <= 0.04045f ? x / 12.92f : powf((x + 0.055f) / 1.055f, 2.4f); }
 static void clear_tex(const p_clear_tex *c) {
     vtex *e = c->tex ? vt_get(c->tex) : NULL;
     if (!e || vt_depth(e) || vk_fmt_block_compressed(vt_vkformat(e))) return;
@@ -463,12 +511,23 @@ static void clear_tex(const p_clear_tex *c) {
     VkImageSubresourceLayers sub; VkOffset3D o; VkExtent3D x;
     region(e, &c->r, lv, view_layer(&c->view, c->has_view), &sub, &o, &x);
     uint32_t w, h, d; vt_size(e, lv, &w, &h, &d);
-    if (o.x || o.y || x.width < w || x.height < h) VK_ONCE("partial texture clear (%ux%u of %ux%u): the whole level is cleared for now", x.width, x.height, w, h);
     vx_end_pass();
     VkClearColorValue v; memcpy(&v, c->c.u, 16);
-    { vk_fmt tf;   /* an sRGB texture object over an image made as its linear twin (or the reverse): the clear is of the object's format, the image clears raw */
-      if (vk_fmt_of(c->tex->d.format, &tf) && is_srgb(tf.vk) != is_srgb(vt_vkformat(e)) && (is_srgb(tf.vk) || is_srgb(vt_vkformat(e))))
-          for (int i = 0; i < 3; i++) v.float32[i] = is_srgb(tf.vk) ? srgb_enc(v.float32[i]) : srgb_dec(v.float32[i]); }
+    VkFormat tf = own_format(e, c->tex, &c->view, c->has_view);
+    VkImage ti = tf && x.depth == 1 ? tmp_image(tf, x.width, x.height) : VK_NULL_HANDLE;
+    if (ti) {   /* encoded in the texture's own format (only the region), then copied bit for bit into the shared image */
+        VkImageSubresourceRange tr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(vk_cmd(), ti, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &tr);
+        vk_barrier(vk_cmd());
+        for (uint32_t l = 0; l < sub.layerCount; l++) {
+            VkImageCopy cp = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, lv, sub.baseArrayLayer + l, 1}, o, x};
+            vkCmdCopyImage(vk_cmd(), ti, VK_IMAGE_LAYOUT_GENERAL, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        }
+        vk_barrier(vk_cmd());
+        vt_written(e);
+        return;
+    }
+    if (o.x || o.y || x.width < w || x.height < h) VK_ONCE("partial texture clear (%ux%u of %ux%u): the whole level is cleared for now", x.width, x.height, w, h);
     VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, sub.baseArrayLayer, sub.layerCount};
     vkCmdClearColorImage(vk_cmd(), vt_image(e), VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
     vk_barrier(vk_cmd());
