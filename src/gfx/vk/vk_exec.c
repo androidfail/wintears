@@ -102,6 +102,50 @@ void vx_draw_time_end(uint32_t q, const char *what) {
 }
 void vx_note_draw(void) { g_pass_draws++; }
 
+/* ---------- TOTK_PASSLOG: what a logged pass wrote (colour target 0 at a 3x3 grid of 8x8 patches, averaged when the GPU is done) ---------- */
+static struct { VkImage img; VkFormat fmt; uint32_t lv, layer, w, h; int ok; } g_pc0;
+typedef struct { VkFormat fmt; const uint8_t *src; uint32_t n; int bpp; char what[48]; } pout;
+static float half(uint16_t h) { int e = h >> 10 & 31, m = h & 1023; float v = e ? ldexpf(1.0f + m / 1024.0f, e - 15) : ldexpf(m / 1024.0f, -14); return e == 31 ? 65504.0f : h >> 15 ? -v : v; }
+static float ufl(uint32_t b, int mb) { int e = (int)(b >> mb), m = (int)(b & ((1u << mb) - 1)); return e == 31 ? 65504.0f : e ? ldexpf(1.0f + (float)m / (float)(1 << mb), e - 15) : ldexpf((float)m / (float)(1 << mb), -14); }
+static int texel(VkFormat f, const uint8_t *p, float o[4]) {   /* bytes per texel; 0 = not decoded */
+    o[0] = o[1] = o[2] = 0; o[3] = 1;
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: for (int i = 0; i < 4; i++) o[i] = p[i] / 255.0f; return 4;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: o[0] = p[2] / 255.0f; o[1] = p[1] / 255.0f; o[2] = p[0] / 255.0f; o[3] = p[3] / 255.0f; return 4;
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: { uint32_t v; memcpy(&v, p, 4); o[0] = ufl(v & 2047, 6); o[1] = ufl(v >> 11 & 2047, 6); o[2] = ufl(v >> 22, 5); return 4; }
+    case VK_FORMAT_R16G16B16A16_SFLOAT: { uint16_t h[4]; memcpy(h, p, 8); for (int i = 0; i < 4; i++) o[i] = half(h[i]); return 8; }
+    case VK_FORMAT_R16G16_SFLOAT: { uint16_t h[2]; memcpy(h, p, 4); o[0] = half(h[0]); o[1] = half(h[1]); return 4; }
+    case VK_FORMAT_R32_SFLOAT: memcpy(&o[0], p, 4); return 4;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: { uint32_t v; memcpy(&v, p, 4); o[0] = (v & 1023) / 1023.0f; o[1] = (v >> 10 & 1023) / 1023.0f; o[2] = (v >> 20 & 1023) / 1023.0f; o[3] = (v >> 30) / 3.0f; return 4; }
+    default: return 0;
+    }
+}
+static void pout_log(void *arg) {
+    pout *o = arg; double s[4] = {0, 0, 0, 0}; float t[4];
+    for (uint32_t i = 0; i < o->n; i++) { texel(o->fmt, o->src + (size_t)i * (size_t)o->bpp, t); for (int c = 0; c < 4; c++) s[c] += t[c]; }
+    VLOG("[pass]   wrote (%s): rgba %.3f %.3f %.3f %.3f", o->what, s[0] / o->n, s[1] / o->n, s[2] / o->n, s[3] / o->n);
+    free(o);
+}
+static void pass_output_sample(void) {   /* after vkCmdEndRendering */
+    if (!g_pc0.ok) return;
+    g_pc0.ok = 0;
+    float probe[4]; uint8_t z[16] = {0}; int bpp = texel(g_pc0.fmt, z, probe);
+    if (!bpp) { VLOG("[pass]   wrote: format %d not decoded", (int)g_pc0.fmt); return; }
+    uint32_t pw = g_pc0.w < 8 ? g_pc0.w : 8, ph = g_pc0.h < 8 ? g_pc0.h : 8, nr = 0;
+    VkBuffer sb; VkDeviceSize so; const uint8_t *p = vk_stage((VkDeviceSize)9 * pw * ph * (uint32_t)bpp, 16, &sb, &so);
+    VkBufferImageCopy r[9];
+    for (uint32_t gy = 0; gy < 3; gy++) for (uint32_t gx = 0; gx < 3; gx++, nr++)
+        r[nr] = (VkBufferImageCopy){.bufferOffset = so + (VkDeviceSize)nr * pw * ph * (uint32_t)bpp, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, g_pc0.lv, g_pc0.layer, 1},
+            .imageOffset = {(int32_t)((g_pc0.w - pw) * (1 + 2 * gx) / 6), (int32_t)((g_pc0.h - ph) * (1 + 2 * gy) / 6), 0}, .imageExtent = {pw, ph, 1}};
+    vk_barrier(vk_cmd());
+    vkCmdCopyImageToBuffer(vk_cmd(), g_pc0.img, VK_IMAGE_LAYOUT_GENERAL, sb, nr, r);
+    pout *o = malloc(sizeof *o);
+    if (!o) return;
+    o->fmt = g_pc0.fmt; o->src = p; o->n = 9 * pw * ph; o->bpp = bpp;
+    snprintf(o->what, sizeof o->what, "%ux%u format %d", g_pc0.w, g_pc0.h, (int)g_pc0.fmt);
+    vk_after(pout_log, o);   /* staging memory lives until the submission is done */
+}
+
 /* ---------- render passes ---------- */
 void vx_end_pass(void) {
     if (!g_pass) return;
@@ -109,6 +153,7 @@ void vx_end_pass(void) {
                      (int)S.pass_fmt.depth, g_pass_draws, g_pass_clears);
     if (g_oq_open) { vkCmdEndQuery(vk_cmd(), g_oq, (uint32_t)((g_oq_n - 1) % OQ_N)); g_oq_open = 0; }
     vkCmdEndRendering(vk_cmd());
+    if (vk_passlog_on) pass_output_sample();
     if (g_pass_q != UINT32_MAX) {
         vkCmdWriteTimestamp2(vk_cmd(), VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_qp, g_pass_q + 1);
         ptime *t = malloc(sizeof *t); t->q = g_pass_q;
@@ -188,6 +233,12 @@ static int begin_pass(void) {
     for (int i = 0; i < n; i++) if (col[i]) { S.pass_samples = vt_samples(col[i]); break; }
     if (dep && S.pass_samples == 1) S.pass_samples = vt_samples(dep);
     if (vk_passlog_on) g_pass_q = ptime_begin();
+    g_pc0.ok = 0;
+    if (vk_passlog_on && n > 0 && col[0]) {   /* what target 0 ends up holding is logged when the pass ends */
+        const view_t *v0 = S.rt.has_cview[0] ? &S.rt.cview[0] : NULL;
+        g_pc0.img = vt_image(col[0]); g_pc0.fmt = cf[0]; g_pc0.lv = v0 && v0->set_levels ? v0->base_level : 0;
+        g_pc0.layer = v0 && v0->set_layers ? v0->min_layer : 0; g_pc0.w = w; g_pc0.h = h; g_pc0.ok = !vk_fmt_block_compressed(vt_vkformat(col[0]));
+    }
     vk_n_pass++;
     vkCmdBeginRendering(vk_cmd(), &ri);
     if (g_oq_on) {   /* counting samples: this pass has its own query */
@@ -224,6 +275,8 @@ static void clear_color(const p_clear_color *c) {
         g_stat_skip[0]++; VK_ONCE("colour clear with channel mask %#x: the masked draw failed, done as a full clear", c->mask);
     }
     g_pass_clears++;
+    if (plog()) { float f[4]; uint32_t u[4]; memcpy(f, c->rgba, 16); memcpy(u, c->rgba, 16);
+                  VLOG("[pass]   clear colour %d to %.3f %.3f %.3f %.3f (bits %08x %08x %08x %08x)", c->index, f[0], f[1], f[2], f[3], u[0], u[1], u[2], u[3]); }
     VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)c->index};
     memcpy(ca.clearValue.color.float32, c->rgba, 16);   /* integer targets: NVN passes the integer bits the same way */
     VkClearRect r = {clear_rect(), 0, g_pass_layers};   /* a clear covers every layer of a layered target */
