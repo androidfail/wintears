@@ -29,10 +29,14 @@ typedef struct {
     uint8_t *host; uint64_t span;
     pal_section *section;          /* physical: its memory */
     const pool_t **page_src;       /* virtual: per 64 KiB page, the physical pool mapped there (NULL = unmapped) */
+    uint64_t *page_off;            /* virtual: per page, the offset in that physical pool */
 } vstate;
 #define MAX_POOLS 256
 static vstate g_pools[MAX_POOLS];
 static pthread_mutex_t g_map_mu = PTHREAD_MUTEX_INITIALIZER;
+/* page tables and pool slots, for totk_vpool_physical (the GPU backend, under its own lock): held only around changes,
+   never across a call out (g_map_mu is held across gpu_pool_add / del, which take the backend's lock) */
+static pthread_mutex_t g_pt_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static vstate *state_of(const uint8_t *host) {   /* g_map_mu held */
     for (int i = 0; i < MAX_POOLS; i++) if (g_pools[i].host && g_pools[i].host == host) return &g_pools[i];
@@ -76,7 +80,7 @@ int totk_vpool_init(pool_t *o) {
     if (phys && !(o->flags & F_CPU_NO_ACCESS))
         die("vpool: CPU-visible physical pool (size %#llx flags %#x): aliasing the game's own memory is not supported on Windows yet",
             (unsigned long long)o->size, o->flags);
-    pthread_mutex_lock(&g_map_mu);
+    pthread_mutex_lock(&g_map_mu); pthread_mutex_lock(&g_pt_mu);
     vstate *s = state_new();
     uint64_t span = o->size;
     if (phys) {
@@ -87,12 +91,13 @@ int totk_vpool_init(pool_t *o) {
     } else {
         uintptr_t at = pal_reserve_below((size_t)span, GUEST_LIMIT);
         s->page_src = calloc((size_t)(span / TOTK_VPOOL_PAGE), sizeof *s->page_src);
-        if (!at || !s->page_src) die("vpool: virtual pool of %#llx bytes below 2^39", (unsigned long long)span);
+        s->page_off = calloc((size_t)(span / TOTK_VPOOL_PAGE), sizeof *s->page_off);
+        if (!at || !s->page_src || !s->page_off) die("vpool: virtual pool of %#llx bytes below 2^39", (unsigned long long)span);
         s->host = (uint8_t *)at;
     }
     s->span = span;
     o->host = o->mem = s->host; o->span = span;
-    pthread_mutex_unlock(&g_map_mu);
+    pthread_mutex_unlock(&g_pt_mu); pthread_mutex_unlock(&g_map_mu);
     LOG("[nvn] %s memory pool: %#llx bytes at %p", phys ? "physical" : "virtual", (unsigned long long)span, (void *)o->mem);
     return 1;
 }
@@ -111,10 +116,10 @@ int totk_vpool_fini(pool_t *o) {
         free(runs);
         for (uint64_t p = 0; p < s->span / TOTK_VPOOL_PAGE; p++)
             if (s->page_src[p]) pal_unmap_view((uintptr_t)(s->host + p * TOTK_VPOOL_PAGE));
-        free(s->page_src);
+        pthread_mutex_lock(&g_pt_mu); free(s->page_src); free(s->page_off); s->page_src = NULL; s->page_off = NULL; pthread_mutex_unlock(&g_pt_mu);
         if (pal_unreserve((uintptr_t)s->host, (size_t)s->span)) die("vpool: release of virtual pool %p", (void *)s->host);
     }
-    memset(s, 0, sizeof *s);
+    pthread_mutex_lock(&g_pt_mu); memset(s, 0, sizeof *s); pthread_mutex_unlock(&g_pt_mu);
     pthread_mutex_unlock(&g_map_mu);
     o->host = NULL; o->mem = o->game_mem; o->span = 0;
     return 1;
@@ -152,9 +157,32 @@ static int apply_request(vstate *v, const totk_mapping_request *r) {   /* g_map_
             LOG("vpool: view of physical offset %#llx at %#llx failed", (unsigned long long)off, (unsigned long long)at);
             return 0;
         }
-        v->page_src[page] = p;
+        v->page_src[page] = p; v->page_off[page] = off;
     }
     return 1;
+}
+
+/* The physical memory behind [mem, mem + size) of a virtual pool: the address of its first byte in the physical pool's
+   own mapping when every page is mapped to consecutive pages of one physical pool; 0 otherwise (not in a virtual pool,
+   a hole, or scattered pages). The GPU sees physical pages, so a texture written through one virtual address is read
+   through another that maps the same pages (the menus' scene snapshot, in TOTK's transient pool), and a remapped
+   address is new memory. */
+uint64_t totk_vpool_physical(const void *mem, uint64_t size) {
+    uint64_t r = 0;
+    pthread_mutex_lock(&g_pt_mu);
+    for (int i = 0; i < MAX_POOLS; i++) {
+        vstate *s = &g_pools[i];
+        if (!s->host || !s->page_src || (const uint8_t *)mem < s->host || (const uint8_t *)mem >= s->host + s->span) continue;
+        uint64_t at = (uint64_t)((const uint8_t *)mem - s->host), p0 = at / TOTK_VPOOL_PAGE, p1 = (at + (size ? size : 1) - 1) / TOTK_VPOOL_PAGE;
+        if (p1 >= s->span / TOTK_VPOOL_PAGE || !s->page_src[p0]) break;
+        int ok = 1;
+        for (uint64_t p = p0 + 1; ok && p <= p1; p++) ok = s->page_src[p] == s->page_src[p0] && s->page_off[p] == s->page_off[p0] + (p - p0) * TOTK_VPOOL_PAGE;
+        vstate *ps = ok ? state_of(s->page_src[p0]->host) : NULL;
+        if (ps) r = (uint64_t)(uintptr_t)(ps->host + s->page_off[p0] + at % TOTK_VPOOL_PAGE);
+        break;
+    }
+    pthread_mutex_unlock(&g_pt_mu);
+    return r;
 }
 
 int totk_vpool_map(pool_t *v, int count, const totk_mapping_request *r) {
@@ -168,7 +196,9 @@ int totk_vpool_map(pool_t *v, int count, const totk_mapping_request *r) {
     for (int i = 0; i < nold; i++) if (near_request(&old[i], r, count)) gpu_pool_del(v->mem + old[i].first * TOTK_VPOOL_PAGE);   /* the backend's view of the old pages */
     free(old);
     int ok = 1;
+    pthread_mutex_lock(&g_pt_mu);
     for (int i = 0; ok && i < count; i++) ok = apply_request(s, &r[i]);
+    pthread_mutex_unlock(&g_pt_mu);
     nnow = runs_of(s, &now);
     for (int i = 0; i < nnow; i++) if (near_request(&now[i], r, count)) gpu_pool_add(v->mem + now[i].first * TOTK_VPOOL_PAGE, now[i].count * TOTK_VPOOL_PAGE);
     free(now);

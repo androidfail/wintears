@@ -61,19 +61,21 @@ void vt_written(vtex *e) {
 const char *vt_writer_of(const vtex *e) { return e && e->writer[0] ? e->writer : "nothing since it was made (zero) or an upload"; }
 
 /* ---- provenance (diagnostics): what each write read, followed back from a sampled texture when F9 logs a frame ---- */
+static uint64_t stor_mem(const tex_t *t);
 static struct { uint64_t mem; uint32_t w, h, fmt; } g_pin[8]; static int g_npin;
 void vt_prov_reset(void) { g_npin = 0; }
 void vt_prov_input(const tex_t *t) {   /* a texture the coming draw samples */
     if (!t || !t->mem) return;
-    for (int i = 0; i < g_npin; i++) if (g_pin[i].mem == (uint64_t)(uintptr_t)t->mem && g_pin[i].fmt == (uint32_t)t->d.format) return;
-    if (g_npin < 8) g_pin[g_npin++] = (typeof(g_pin[0])){(uint64_t)(uintptr_t)t->mem, t->d.width, t->d.height, (uint32_t)t->d.format};
+    uint64_t m = stor_mem(t);
+    for (int i = 0; i < g_npin; i++) if (g_pin[i].mem == m && g_pin[i].fmt == (uint32_t)t->d.format) return;
+    if (g_npin < 8) g_pin[g_npin++] = (typeof(g_pin[0])){m, t->d.width, t->d.height, (uint32_t)t->d.format};
 }
 static void prov_add(vtex *e, uint64_t mem, uint32_t w, uint32_t h, uint32_t fmt) {
     for (int i = 0; i < e->prov.nin; i++) if (e->prov.in[i].mem == mem && e->prov.in[i].fmt == fmt) return;
     if (e->prov.nin < 8) e->prov.in[e->prov.nin++] = (typeof(e->prov.in[0])){mem, w, h, fmt};
 }
 void vt_prov_drop(vtex *e, const char *why) { if (e) { e->prov.ndrop++; snprintf(e->prov.drop, sizeof e->prov.drop, "%s", why); } }
-void vt_prov_copy(vtex *e, const tex_t *src) { if (e && src) prov_add(e, (uint64_t)(uintptr_t)src->mem, src->d.width, src->d.height, (uint32_t)src->d.format); }
+void vt_prov_copy(vtex *e, const tex_t *src) { if (e && src) prov_add(e, stor_mem(src), src->d.width, src->d.height, (uint32_t)src->d.format); }
 void vt_prov_draw(vtex *e, const char *vs, const char *fs) {   /* a draw into e (a target of the open pass) read the pending inputs */
     if (!e) return;
     e->prov.ndraws++;
@@ -131,11 +133,23 @@ static int tex_mirrored(const tex_t *t) {   /* upstream nvn_mtl.m tex_mirrored *
    with the same format or its sRGB / linear twin. TOTK_COMPRESSED_ALIAS=1 shares across formats (A/B). */
 static int stor_compressed(const tex_t *t) { return (t->d.flags & NVN_TEXTURE_FLAGS_COMPRESSIBLE) && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE); }
 static int compressed_alias_on(void) { static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_COMPRESSED_ALIAS"); on = e && atoi(e); } return on; }
+/* The memory an image is keyed by: in a virtual pool, the physical pages behind it (nvn_vpool.c), so two virtual views
+   of one page share the image and a remapped page is new storage; the image then also outlives remaps of the virtual
+   range (the backend drops the images over a virtual run when the game maps pages next to it). TOTK_VPOOL_PHYS=0: the
+   virtual address (A/B). */
+uint64_t totk_vpool_physical(const void *mem, uint64_t size);
+static uint64_t stor_mem(const tex_t *t) {
+    static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_VPOOL_PHYS"); on = !e || atoi(e); }
+    if (on && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) { uint64_t p = totk_vpool_physical(t->mem, t->L.size);
+        static int n; if (n < 8) { n++; VLOG("texture %ux%u NVN format %#x at virtual %p: %s %#llx", t->d.width, t->d.height, t->d.format, (void *)t->mem, p ? "keyed by physical" : "pages not contiguous / unmapped, keyed by virtual", (unsigned long long)p); }
+        if (p) return p; }
+    return (uint64_t)(uintptr_t)t->mem;
+}
 static int key_of(const tex_t *t, const vk_fmt *f, stor_key *k) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!t->mem || !t->L.size || !bpb) return 0;
     memset(k, 0, sizeof *k);
-    k->mem = (uint64_t)(uintptr_t)t->mem; k->size = t->L.size;
+    k->mem = stor_mem(t); k->size = t->L.size;
     k->w = t->d.width ? t->d.width : 1; k->h = t->d.height ? t->d.height : 1; k->d = t->d.depth ? t->d.depth : 1;
     k->levels = t->d.levels ? t->d.levels : 1; k->target = (uint32_t)t->d.target; k->samples = t->d.samples > 1 ? (uint32_t)t->d.samples : 1;
     /* format class: uncompressed colour by texel size, everything else by format */
