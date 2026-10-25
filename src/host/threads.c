@@ -53,17 +53,24 @@ static thr_t *g_all;
 
 static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 /* Where guest threads wait (the 10-second log, runtime_wait_report): G itself, a free core, guest waits; svcs. */
-static _Atomic uint64_t g_ns_lock, g_ns_core, g_ns_block, g_n_lock_slow, g_n_core_wait, g_n_block, g_n_svc, g_n_preempt;
+static _Atomic uint64_t g_ns_lock, g_ns_core, g_ns_block, g_n_lock_slow, g_n_core_wait, g_n_block, g_n_preempt;
+/* Core time: free (no owner), handed over but the new owner not running yet, running guest code; the rest is spent
+   in svcs and host calls while holding the core. */
+static _Atomic uint64_t g_ns_free, g_ns_handoff, g_ns_jit;
+static uint64_t g_free_since[3];
 static void G_lock(void) {
     if (!pthread_mutex_trylock(&G)) return;
     uint64_t t0 = pal_now_ns(); pthread_mutex_lock(&G);
     atomic_fetch_add(&g_ns_lock, pal_now_ns() - t0); atomic_fetch_add(&g_n_lock_slow, 1);
 }
 void runtime_wait_report(char *out, size_t cap) {
-    snprintf(out, cap, "lock G waited %.0f ms (%llu times), waiting for a core %.0f ms (%llu times, %llu preemptions), guest waits %.0f ms (%llu), %llu svcs",
+    static uint64_t last; uint64_t now = pal_now_ns(), span = last ? now - last : 0; last = now;
+    double fr = atomic_exchange(&g_ns_free, 0) / 1e6, ho = atomic_exchange(&g_ns_handoff, 0) / 1e6, jt = atomic_exchange(&g_ns_jit, 0) / 1e6, all = 3 * span / 1e6;
+    snprintf(out, cap, "lock G waited %.0f ms (%llu times), waiting for a core %.0f ms (%llu times, %llu preemptions), guest waits %.0f ms (%llu); "
+             "of %.0f core-ms: guest code %.0f, free %.0f, handing over %.0f, svcs and host calls %.0f",
              atomic_exchange(&g_ns_lock, 0) / 1e6, (unsigned long long)atomic_exchange(&g_n_lock_slow, 0), atomic_exchange(&g_ns_core, 0) / 1e6,
              (unsigned long long)atomic_exchange(&g_n_core_wait, 0), (unsigned long long)atomic_exchange(&g_n_preempt, 0),
-             atomic_exchange(&g_ns_block, 0) / 1e6, (unsigned long long)atomic_exchange(&g_n_block, 0), (unsigned long long)atomic_exchange(&g_n_svc, 0));
+             atomic_exchange(&g_ns_block, 0) / 1e6, (unsigned long long)atomic_exchange(&g_n_block, 0), all, jt, fr, ho, all - jt - fr - ho);
 }
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
@@ -138,22 +145,34 @@ static void core_grant(int c) {   /* holding G: give free core c to the best wai
 static void core_put(thr_t *t) {   /* holding G */
     if (t->cur_core < 0) return;
     int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
+    if (!g_core_owner[c]) g_free_since[c] = now_ns();
+}
+/* t waits for a core: halt the one owner it may displace (the worst priority worse than t's, not already asked). */
+static void preempt_for(const thr_t *t) {
+    int v = -1;
+    for (int i = 0; i < NCORE; i++) {
+        thr_t *o = g_core_owner[i];
+        if (core_allowed(t, i) && o && o->prio > t->prio && !o->preempt && (v < 0 || o->prio > g_core_owner[v]->prio)) v = i;
+    }
+    if (v >= 0) { g_core_owner[v]->preempt = 1; jit_halt(g_jit[v]); }   /* the owner stops at its next block (run, JIT_STOP_HALT) */
 }
 static void core_take(thr_t *t) {   /* holding G; waits until a core in t's mask is handed over */
     if (t->cur_core >= 0) return;
     if (!(t->mask & ((1u << NCORE) - 1))) die("thread %#x core mask %#llx has no application core", t->handle, (unsigned long long)t->mask);
     int c = t->core >= 0 && t->core < NCORE && core_allowed(t, t->core) && !g_core_owner[t->core] ? t->core : -1;
     for (int i = 0; c < 0 && i < NCORE; i++) if (core_allowed(t, i) && !g_core_owner[i]) c = i;
-    if (c >= 0) { t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t; return; }
+    if (c >= 0) {
+        t->cur_core = c; t->core_since = now_ns(); g_core_owner[c] = t;
+        if (g_free_since[c]) atomic_fetch_add(&g_ns_free, t->core_since - g_free_since[c]);
+        g_free_since[c] = 0; return;
+    }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
-    for (int i = 0; i < NCORE; i++)
-        if (core_allowed(t, i) && g_core_owner[i] && g_core_owner[i]->prio > t->prio) {
-            g_core_owner[i]->preempt = 1; atomic_fetch_add(&g_n_preempt, 1);
-            jit_halt(g_jit[i]);   /* the owner stops at its next block and gives the core up (run, JIT_STOP_HALT) */
-        }
+    preempt_for(t);
     uint64_t t0 = pal_now_ns();
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
-    atomic_fetch_add(&g_ns_core, pal_now_ns() - t0); atomic_fetch_add(&g_n_core_wait, 1);
+    uint64_t t1 = pal_now_ns();
+    atomic_fetch_add(&g_ns_core, t1 - t0); atomic_fetch_add(&g_n_core_wait, 1);
+    if (t1 > t->core_since) atomic_fetch_add(&g_ns_handoff, t1 - t->core_since);
 }
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
 /* Host services that wait for other threads give the core up around the wait (no host locks held). */
@@ -169,7 +188,17 @@ void runtime_core_back(int *away) {
 void runtime_core_checkpoint(void) {
     thr_t *t = me_or_null();
     if (!t || !t->preempt) return;
-    G_lock(); t->preempt = 0; core_put(t); core_take(t); pthread_mutex_unlock(&G);
+    G_lock(); t->preempt = 0;
+    /* The waiter that asked may have got another core meanwhile: hand this one over only to a better thread, never
+       to a worse one that the owner would then displace again. */
+    int better = 0;
+    for (thr_t *w = g_core_wait; w && !better; w = w->cnext) better = core_allowed(w, t->cur_core) && w->prio < t->prio;
+    if (better) {
+        atomic_fetch_add(&g_n_preempt, 1); core_put(t);
+        for (thr_t *w = g_core_wait; w; w = w->cnext) preempt_for(w);   /* better waiters still without a core */
+        core_take(t);
+    }
+    pthread_mutex_unlock(&G);
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
@@ -237,7 +266,9 @@ static void run(thr_t *t, jit_context *c) {
         if (t->cur_core < 0) die("thread %#x runs guest code without a virtual core", t->handle);
         jit_core *jc = g_jit[t->cur_core];
         jit_load(jc, c);
+        uint64_t tj = pal_now_ns();
         int stop = jit_run(jc);
+        atomic_fetch_add(&g_ns_jit, pal_now_ns() - tj);
         jit_save(jc, c);
         if (stop == JIT_STOP_HALT) { runtime_core_checkpoint(); continue; }
         if (stop == JIT_STOP_EXCEPTION) {
