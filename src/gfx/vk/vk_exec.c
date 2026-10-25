@@ -643,6 +643,15 @@ void vx_run(const uint8_t *p) {
         case OP_REPORT_COUNTER: {
             ctr_act *c = calloc(1, sizeof *c); memcpy(&c->type, a, 8); memcpy(&c->addr, a + 8, 8);
             if (g_oq_on && c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { vx_end_pass(); c->real = 1; c->from = g_oq_start; c->to = g_oq_n; }   /* later draws do not count */
+            else {   /* known now: the counter field is written in replay order, as the GPU does. TOTK gates its clears with a
+                        conditional on a counter the CPU sets to 1 and a report after the clear resets; written only when the
+                        submission completed, a second gated clear in the same submission ran too and wiped what was drawn
+                        after the first (the menus' scene snapshot: black behind every menu). The timestamp still comes when
+                        the GPU is done (the CPU may wait for it). */
+                uint64_t v = c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1u << 20 : 0;
+                dm_guest_write_prepare((void *)(uintptr_t)c->addr, 8);
+                memcpy((void *)(uintptr_t)c->addr, &v, 8);
+            }
             vk_after(do_counter, c); break;
         }
         case OP_RESET_COUNTER: {
