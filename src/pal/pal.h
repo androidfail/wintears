@@ -161,6 +161,8 @@ void pal_debug_write(const char *text);
 int pal_process_memory(uint64_t *resident, uint64_t *committed);
 /* Running under Wine / Proton (the Steam Deck). */
 int pal_under_wine(void);
+/* How long a short sleep really takes here (twenty sleeps of `ns`; the average in ns), for the log. */
+uint64_t pal_sleep_probe(uint64_t ns);
 /* Access violations seen by the fault handler since the start (each is slow under Wine). */
 uint64_t pal_fault_total(void);
 /* The busiest threads since the last call: "name 87%, name 40%, ..." (percent of one core). */

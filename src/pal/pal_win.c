@@ -364,7 +364,17 @@ static DWORD timer_tls = TLS_OUT_OF_INDEXES;
 static INIT_ONCE timer_once = INIT_ONCE_STATIC_INIT;
 static BOOL CALLBACK timer_init(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; timer_tls = TlsAlloc(); return TRUE; }
 
+/* Under Wine a waitable timer is a wineserver object: each wait is a round trip and wakes late (the Steam Deck ran at
+   7 fps with every thread mostly idle). NtDelayExecution is a plain nanosleep there. */
+typedef LONG (NTAPI *ntdelay_t)(BOOLEAN, PLARGE_INTEGER);
+static ntdelay_t wine_delay(void) {
+    static ntdelay_t f; static int looked;
+    if (!looked) { looked = 1; if (pal_under_wine()) f = (ntdelay_t)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtDelayExecution"); }
+    return f;
+}
 void pal_sleep_ns(uint64_t ns) {
+    ntdelay_t d = wine_delay();
+    if (d) { LARGE_INTEGER iv; iv.QuadPart = -(LONGLONG)((ns + 99) / 100); d(FALSE, &iv); return; }
     InitOnceExecuteOnce(&timer_once, timer_init, NULL, NULL);
     HANDLE t = timer_tls != TLS_OUT_OF_INDEXES ? (HANDLE)TlsGetValue(timer_tls) : NULL;
     if (!t && timer_tls != TLS_OUT_OF_INDEXES) {
@@ -376,6 +386,12 @@ void pal_sleep_ns(uint64_t ns) {
     due.QuadPart = -(LONGLONG)((ns + 99) / 100);
     if (t && SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(t, INFINITE);
     else Sleep(ms_timeout((int64_t)ns));
+}
+
+uint64_t pal_sleep_probe(uint64_t ns) {
+    uint64_t t0 = pal_now_ns();
+    for (int i = 0; i < 20; i++) pal_sleep_ns(ns);
+    return (pal_now_ns() - t0) / 20;
 }
 
 /* ---- files and paths ------------------------------------------------------------------------------------------- */
