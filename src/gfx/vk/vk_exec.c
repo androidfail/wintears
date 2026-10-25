@@ -80,7 +80,8 @@ static int plog(void) {
         for (char *q; e && *e && g_nplog < 8; e = *q == ',' ? q + 1 : q) { g_plogs[g_nplog] = (int)strtol(e, &q, 10); if (q == e) break; g_nplog++; }
         g_plog = g_nplog > 0;
     }
-    vk_passlog_on = vk_present_count() == atomic_load(&vk_capture_at);
+    uint64_t cap = atomic_load(&vk_capture_at);
+    vk_passlog_on = cap && vk_present_count() == cap;
     for (int i = 0; i < g_nplog; i++) if (vk_present_count() == (uint64_t)g_plogs[i]) vk_passlog_on = 1;
     return vk_passlog_on;
 }
