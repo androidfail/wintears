@@ -275,7 +275,9 @@ static uint64_t stack_move(int unmap, uint64_t dst, uint64_t src, uint64_t size)
             }
         if (pal_commit((uintptr_t)dst, (size_t)size, PAL_PROT_READ | PAL_PROT_WRITE)) die("commit moved stack");
         memcpy((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, size);
-        if (pal_protect((uintptr_t)src, (size_t)size, PAL_PROT_NONE)) die("protect moved stack source");
+        /* The source stays accessible (Horizon makes it inaccessible; the game never touches it). The guest heap is
+           imported for the GPU as one range, and Linux's GPU drivers (the Steam Deck under Proton) check every page of
+           an imported range at each submission: one inaccessible page made the first submission fail (device lost). */
         stack_maps[nstack_maps++] = (StackMap){dst, src, size};
     }
     pal_mutex_unlock(&memory_lock);
