@@ -59,6 +59,12 @@ static _Atomic uint64_t g_ns_lock, g_ns_core, g_ns_block, g_n_lock_slow, g_n_cor
    in svcs and host calls while holding the core. */
 static _Atomic uint64_t g_ns_free, g_ns_handoff, g_ns_jit;
 static uint64_t g_free_since[3];
+/* Calls from guest code: count and time per svc (index < 0x100) and per host stub (0x100 + stub index); the reasons
+   jit_run returned. */
+enum { NCALL = 0x100 + 8192 };
+static _Atomic uint64_t g_call_n[NCALL], g_call_ns[NCALL], g_n_run, g_n_stop_halt, g_n_stop_wait;
+static inline int call_slot(uint32_t n) { return n < 0x100 ? (int)n : n >= BRIDGE_SVC_BASE && n - BRIDGE_SVC_BASE < NCALL - 0x100 ? (int)(0x100 + n - BRIDGE_SVC_BASE) : -1; }
+static inline void call_note(uint32_t n, uint64_t t0) { int i = call_slot(n); if (i >= 0) { atomic_fetch_add(&g_call_n[i], 1); atomic_fetch_add(&g_call_ns[i], pal_now_ns() - t0); } }
 static void G_lock(void) {
     if (!pthread_mutex_trylock(&G)) return;
     uint64_t t0 = pal_now_ns(); pthread_mutex_lock(&G);
@@ -269,9 +275,9 @@ static void run(thr_t *t, jit_context *c) {
         jit_load(jc, c);
         uint64_t tj = pal_now_ns();
         int stop = jit_run(jc);
-        atomic_fetch_add(&g_ns_jit, pal_now_ns() - tj);
+        atomic_fetch_add(&g_ns_jit, pal_now_ns() - tj); atomic_fetch_add(&g_n_run, 1);
         jit_save(jc, c);
-        if (stop == JIT_STOP_HALT) { runtime_core_checkpoint(); continue; }
+        if (stop == JIT_STOP_HALT) { atomic_fetch_add(&g_n_stop_halt, 1); runtime_core_checkpoint(); continue; }
         if (stop == JIT_STOP_EXCEPTION) {
             uint64_t pc;
             int kind = jit_exception(jc, &pc);
@@ -279,6 +285,7 @@ static void run(thr_t *t, jit_context *c) {
                 /* WFE / WFI (the SDK's light message queues and spin locks wait for an event with WFE): the core is
                    given up for a moment so other guest threads run, then the guest continues after the instruction,
                    as after a spurious wake-up (the code re-checks its condition). */
+                atomic_fetch_add(&g_n_stop_wait, 1);
                 int away = runtime_core_away();
                 pal_yield();
                 runtime_core_back(&away);
@@ -295,12 +302,13 @@ static void run(thr_t *t, jit_context *c) {
         uint32_t n = jit_svc_number(jc);
         if (n == HOST_RETURN_SVC) break;
         if (n >= BRIDGE_SVC_BASE) {
-            if (bridge_dispatch(host_bridge(), n, c)) continue;
+            uint64_t ts = pal_now_ns(); int done = bridge_dispatch(host_bridge(), n, c); call_note(n, ts);
+            if (done) continue;
             report_stop("unknown host stub svc", n, c);
             die("unknown host stub");
         }
         t->last_svc = (int)n; t->last_lr = c->x[30]; t->last_fp = c->x[29]; t->nsvc++;
-        if (host_svc(n, c)) continue;
+        { uint64_t ts = pal_now_ns(); int done = host_svc(n, c); call_note(n, ts); if (done) continue; }
         report_stop("unimplemented svc", n, c);
         die("svc 0x%02x is not implemented yet", n);
     }
@@ -377,37 +385,91 @@ void threads_init(void) {
 
 /* Sampling profiler (on by default under Wine / Proton, TOTK_SAMPLE=1/0): 100 times a second, where each core's
    owner is (pc and the calling functions in this program); the most frequent places are logged every 10 s. */
+typedef struct { int n, total; struct { char k[260]; unsigned n; } e[600]; } stab;
+static void stab_add(const char *k, void *u) {
+    stab *s = u; int i = 0;
+    while (i < s->n && strcmp(s->e[i].k, k)) i++;
+    if (i == s->n) { if (s->n == (int)(sizeof s->e / sizeof *s->e)) return; snprintf(s->e[s->n++].k, sizeof s->e[0].k, "%s", k); s->e[i].n = 0; }
+    s->e[i].n++; s->total++;
+}
+static void stab_log(stab *s, const char *what, int show) {
+    char out[4096]; size_t at = 0;
+    for (int shown = 0; shown < show; shown++) {
+        int b = -1; for (int i = 0; i < s->n; i++) if (s->e[i].n && (b < 0 || s->e[i].n > s->e[b].n)) b = i;
+        if (b < 0) break;
+        at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0, "%s%.1f%% %s", shown ? " | " : "", s->e[b].n * 100.0 / s->total, s->e[b].k);
+        s->e[b].n = 0;
+        if (at >= sizeof out) break;
+    }
+    LOG("%s (%d samples): %s", what, s->total, s->total ? out : "-");
+    s->n = 0; s->total = 0;
+}
+static void log_calls(void) {   /* the svcs and host functions guest code spent the most time in */
+    char out[3000]; size_t at = 0; uint64_t ns[NCALL], n[NCALL], tn = 0;
+    for (int i = 0; i < NCALL; i++) { ns[i] = atomic_exchange(&g_call_ns[i], 0); n[i] = atomic_exchange(&g_call_n[i], 0); tn += n[i]; }
+    for (int shown = 0; shown < 16; shown++) {
+        int b = -1; for (int i = 0; i < NCALL; i++) if (ns[i] && (b < 0 || ns[i] > ns[b])) b = i;
+        if (b < 0) break;
+        const char *nm = b < 0x100 ? host_svc_name((unsigned)b) : bridge_name(host_bridge(), BRIDGE_SVC_BASE + (uint32_t)(b - 0x100));
+        at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0, "%s%s%s%#x %llux %.0f ms", shown ? ", " : "", nm ? nm : "", nm ? " " : "",
+                               b < 0x100 ? (unsigned)b : BRIDGE_SVC_BASE + (unsigned)(b - 0x100), (unsigned long long)n[b], ns[b] / 1e6);
+        ns[b] = 0;
+        if (at >= sizeof out) break;
+    }
+    LOG("[calls] guest code ran %llu times between stops (%llu halts for preemption, %llu WFE waits), %llu calls; most time in: %s",
+        (unsigned long long)atomic_exchange(&g_n_run, 0), (unsigned long long)atomic_exchange(&g_n_stop_halt, 0),
+        (unsigned long long)atomic_exchange(&g_n_stop_wait, 0), (unsigned long long)tn, out);
+}
+static void log_threads(void) {   /* every guest thread: priority, what it is doing, its last svc */
+    static const char *wk[] = {"", "lock", "condvar", "address", "sync"};
+    char out[1200]; size_t at = 0; int part = 0;
+    G_lock();
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (t->exited) continue;
+        int queued = 0; for (thr_t *w = g_core_wait; w && !queued; w = w->cnext) queued = w == t;
+        char st[64];
+        if (t->cur_core >= 0) snprintf(st, sizeof st, "on core %d%s", t->cur_core, t->preempt ? " (asked to yield)" : "");
+        else if (queued) snprintf(st, sizeof st, "wants a core");
+        else if (t->wkind > 0 && t->wkind < 5) snprintf(st, sizeof st, "waits %s %#llx", wk[t->wkind], (unsigned long long)t->waddr);
+        else if (!t->started) snprintf(st, sizeof st, "not started");
+        else snprintf(st, sizeof st, "away (sleep or host wait)");
+        at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0, "%s%#x p%d mask %llx %s, last svc %#x, %llu svcs",
+                               at ? "; " : "", t->handle, t->prio, (unsigned long long)t->mask, st, t->last_svc, (unsigned long long)t->nsvc);
+        if (at > 900) { LOG("[threads %d] %s", part++, out); at = 0; out[0] = 0; }
+    }
+    pthread_mutex_unlock(&G);
+    if (at) LOG("[threads %d] %s", part, out);
+}
 static void *sampler(void *unused) {
     (void)unused;
     pal_thread_set_name("sampler");
-    enum { MAXK = 512 };
-    static struct { char k[160]; unsigned n; } tab[MAXK]; int ntab = 0; unsigned total = 0; uint64_t last = pal_now_ns();
+    static stab cores, others;
+    uint64_t last = pal_now_ns(), last_dump = last; unsigned tick = 0;
+    { char b[3000]; pal_linux_report(b, sizeof b); }   /* baselines */
     for (;;) {
-        pal_sleep_ns(10000000);
-        void *hs[NCORE];
+        pal_sleep_ns(10000000); tick++;
+        void *hs[NCORE]; unsigned long ids[NCORE + 1]; int nids = 0;
         G_lock();
         for (int c = 0; c < NCORE; c++) { thr_t *o = g_core_owner[c]; hs[c] = o ? o->osh : NULL; }
         pthread_mutex_unlock(&G);
         for (int c = 0; c < NCORE; c++) {
-            char k[160];
-            if (!hs[c]) snprintf(k, sizeof k, "(core free)");
-            else if (!pal_thread_sample(hs[c], k, sizeof k)) continue;
-            int i = 0; while (i < ntab && strcmp(tab[i].k, k)) i++;
-            if (i == ntab) { if (ntab == MAXK) continue; snprintf(tab[ntab++].k, sizeof tab[0].k, "%s", k); }
-            tab[i].n++; total++;
+            char k[260];
+            if (!hs[c]) { stab_add("(core free)", &cores); continue; }
+            ids[nids++] = pal_thread_id_of(hs[c]);
+            if (pal_thread_sample(hs[c], k, sizeof k)) stab_add(k, &cores);
         }
-        if (pal_now_ns() - last < 10000000000ull || !total) continue;
-        last = pal_now_ns();
-        char out[2048]; size_t at = 0;
-        for (int shown = 0; shown < 14; shown++) {
-            int b = -1; for (int i = 0; i < ntab; i++) if (tab[i].n && (b < 0 || tab[i].n > tab[b].n)) b = i;
-            if (b < 0) break;
-            at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0, "%s%u%% %s", shown ? " | " : "", tab[b].n * 100 / total, tab[b].k);
-            tab[b].n = 0;
-            if (at >= sizeof out) break;
-        }
-        LOG("[cores] where the core owners are (%u samples): %s", total, out);
-        ntab = 0; total = 0;
+        if (tick % 20 == 0) pal_sample_busy_threads(ids, nids, stab_add, &others);   /* 5 times a second */
+        uint64_t now = pal_now_ns();
+        if (now - last < 10000000000ull) continue;
+        if (now - last > 13000000000ull) LOG("[cores] the sampler itself was late by %.1f s", (now - last) / 1e9 - 10);
+        last = now;
+        stab_log(&cores, "[cores] where the core owners are", 16);
+        stab_log(&others, "[other threads] where the other busy threads are", 16);
+        log_calls();
+        char b[6000];
+        pal_linux_report(b, sizeof b); LOG("[linux] %s", b);
+        pal_exception_report(b, sizeof b); LOG("[exceptions] %s", b);
+        if (now - last_dump >= 30000000000ull) { last_dump = now; log_threads(); }
     }
     return NULL;
 }

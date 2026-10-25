@@ -10,6 +10,7 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
 #include <knownfolders.h>
 #include <process.h>
 #include <shlobj.h>
@@ -219,8 +220,21 @@ static INIT_ONCE veh_once = INIT_ONCE_STATIC_INIT;
 /* pal_win_x64.S */
 extern char pal_guarded_copy_insn[], pal_guarded_copy_fault[];
 
+static struct { volatile LONG code; volatile LONG64 n; } exc_codes[16];
+static volatile LONG64 exc_av_jit, exc_av_mod;
 static LONG CALLBACK veh(EXCEPTION_POINTERS *e) {
     EXCEPTION_RECORD *r = e->ExceptionRecord;
+    for (int i = 0; i < 16; i++) {
+        LONG c = exc_codes[i].code;
+        if (!c) { InterlockedCompareExchange(&exc_codes[i].code, (LONG)r->ExceptionCode, 0); c = exc_codes[i].code; }
+        if (c == (LONG)r->ExceptionCode) { InterlockedIncrement64(&exc_codes[i].n); break; }
+    }
+    /* not for the guarded copy: the sampler reads stacks with it while a thread that may hold the loader lock is stopped */
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->ContextRecord->Rip != (DWORD64)(uintptr_t)pal_guarded_copy_insn) {
+        HMODULE m = NULL;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)r->ExceptionAddress, &m) && m) InterlockedIncrement64(&exc_av_mod);
+        else InterlockedIncrement64(&exc_av_jit);
+    }
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
     InterlockedIncrement64(&fault_total);
     ULONG_PTR op = r->ExceptionInformation[0];
@@ -734,7 +748,6 @@ int pal_under_wine(void) {
     return w;
 }
 
-#include <tlhelp32.h>
 void pal_thread_cpu_report(char *out, size_t cap) {
     enum { MAXT = 256 };
     static struct { DWORD id; uint64_t cpu; } prev[MAXT]; static int nprev; static uint64_t prev_wall;
@@ -810,23 +823,251 @@ int pal_thread_sample(void *h, char *out, size_t cap) {
     CONTEXT c = {0}; c.ContextFlags = CONTEXT_CONTROL;
     if (SuspendThread((HANDLE)h) == (DWORD)-1) return 0;
     int ok = GetThreadContext((HANDLE)h, &c) != 0; size_t got = 0;
-    if (ok)   /* the stack, page by page while it reads (no locks taken while the thread is stopped) */
+    if (ok)   /* the stack, page by page while it reads (plain copies: no Wine call while the thread is stopped) */
         for (uint64_t a = c.Rsp & ~7ull; got < 2048; ) {
-            uint64_t end = (a | 4095) + 1; size_t n = (size_t)(end - a) / 8, r = 0; if (n > 2048 - got) n = 2048 - got;
-            if (!ReadProcessMemory(GetCurrentProcess(), (void *)(uintptr_t)a, stk + got, n * 8, (SIZE_T *)&r) || !r) break;
-            got += r / 8; a = end;
+            uint64_t end = (a | 4095) + 1; size_t n = (size_t)(end - a) / 8; if (n > 2048 - got) n = 2048 - got;
+            if (pal_guarded_copy(stk + got, (const void *)(uintptr_t)a, n * 8)) break;
+            got += n; a = end;
         }
     ResumeThread((HANDLE)h);
     if (!ok) return 0;
     describe_pc(c.Rip, out, cap);
     size_t at = strlen(out);
-    for (size_t i = 0, found = 0; i < got && found < 2; i++)
+    for (size_t i = 0, found = 0; i < got && found < 3; i++)
         if (stk[i] >= text0 + 8 && stk[i] < text1 && after_call((const uint8_t *)(uintptr_t)stk[i])) {
             at += (size_t)snprintf(out + at, at < cap ? cap - at : 0, " < exe+%#llx", (unsigned long long)(stk[i] - text0 + 0x1000));
             found++;
         }
     return 1;
 }
+
+unsigned long pal_thread_id_of(void *h) { return GetThreadId((HANDLE)h); }
+
+void pal_sample_busy_threads(const unsigned long *skip, int nskip, void (*add)(const char *key, void *u), void *u) {
+    enum { MAXT = 256 };
+    static struct { DWORD id; uint64_t cpu; } prev[MAXT]; static int nprev; static uint64_t prev_wall;
+    struct { DWORD id; uint64_t cpu; } cur[MAXT]; int ncur = 0;
+    uint64_t wall = pal_now_ns(), span = prev_wall ? wall - prev_wall : 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok && ncur < MAXT; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+        HANDLE th = OpenThread(THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        FILETIME c, x, k, us;
+        if (GetThreadTimes(th, &c, &x, &k, &us)) {
+            uint64_t t = (((uint64_t)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((uint64_t)us.dwHighDateTime << 32 | us.dwLowDateTime)) * 100, used = 0;
+            for (int i = 0; i < nprev; i++) if (prev[i].id == te.th32ThreadID) { used = t - prev[i].cpu; break; }
+            cur[ncur].id = te.th32ThreadID; cur[ncur].cpu = t; ncur++;
+            int skipped = 0; for (int i = 0; i < nskip; i++) skipped |= skip[i] == te.th32ThreadID;
+            if (!skipped && span && used * 50 >= span) {
+                char where[200], key[260], name[48];
+                if (pal_thread_sample(th, where, sizeof where)) {
+                    snprintf(name, sizeof name, "%lu", (unsigned long)te.th32ThreadID);
+                    typedef HRESULT (WINAPI *gtd_t)(HANDLE, PWSTR *);
+                    static gtd_t gtd; static int looked;
+                    if (!looked) { looked = 1; gtd = (gtd_t)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription"); }
+                    PWSTR d = NULL;
+                    if (gtd && SUCCEEDED(gtd(th, &d)) && d) { if (d[0]) WideCharToMultiByte(CP_UTF8, 0, d, -1, name, sizeof name, NULL, NULL); LocalFree(d); }
+                    snprintf(key, sizeof key, "%s: %s", name, where);
+                    add(key, u);
+                }
+            }
+        }
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+    nprev = ncur; for (int i = 0; i < ncur; i++) { prev[i].id = cur[i].id; prev[i].cpu = cur[i].cpu; }
+    prev_wall = wall;
+}
+
+/* ---- diagnostics: Linux files through Wine's Z: drive ---- */
+static int rdfile(const char *path, char *buf, int cap) {
+    buf[0] = 0;
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return -1;
+    DWORD n, tot = 0;
+    while (tot < (DWORD)cap - 1 && ReadFile(f, buf + tot, (DWORD)cap - 1 - tot, &n, NULL) && n) tot += n;
+    CloseHandle(f); buf[tot] = 0;
+    return (int)tot;
+}
+static void chomp(char *s) { size_t n = strlen(s); while (n && (s[n - 1] == '\n' || s[n - 1] == ' ')) s[--n] = 0; }
+static long long field_after(const char *buf, const char *key) {   /* "Key:   123 kB" -> 123 */
+    const char *p = strstr(buf, key); if (!p) return -1;
+    p += strlen(key); while (*p == ' ' || *p == '\t' || *p == ':') p++;
+    return atoll(p);
+}
+static void cgroup_dir(char *out, size_t cap) {
+    char b[512]; out[0] = 0;
+    if (rdfile("Z:\\proc\\self\\cgroup", b, sizeof b) <= 0) return;
+    char *p = strstr(b, "0::"); if (!p) return;
+    p += 3; chomp(p); char *nl = strchr(p, '\n'); if (nl) *nl = 0;
+    snprintf(out, cap, "Z:\\sys\\fs\\cgroup%s", p);
+    for (char *q = out; *q; q++) if (*q == '/') *q = '\\';
+}
+#define APPEND(...) do { at += (size_t)snprintf(out + at, at < cap ? cap - at : 0, __VA_ARGS__); } while (0)
+
+void pal_diag_boot(char *out, size_t cap) {
+    size_t at = 0; out[0] = 0;
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    typedef const char *(CDECL *wv_t)(void); typedef void (CDECL *wh_t)(const char **, const char **);
+    wv_t wv = nt ? (wv_t)(void *)GetProcAddress(nt, "wine_get_version") : NULL, wb = nt ? (wv_t)(void *)GetProcAddress(nt, "wine_get_build_id") : NULL;
+    wh_t wh = nt ? (wh_t)(void *)GetProcAddress(nt, "wine_get_host_version") : NULL;
+    if (wv) APPEND("Wine %s", wv());
+    if (wb) APPEND(" (%s)", wb());
+    if (wh) { const char *sys = "", *rel = ""; wh(&sys, &rel); APPEND(", host %s %s", sys, rel); }
+    DWORD_PTR pm = 0, sm = 0; GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm);
+    APPEND("%scpus %lu, affinity %#llx of %#llx, priority class %#lx", at ? "; " : "", (unsigned long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
+           (unsigned long long)pm, (unsigned long long)sm, (unsigned long)GetPriorityClass(GetCurrentProcess()));
+    static const char *envs[] = {"WINEESYNC", "WINEFSYNC", "WINE_FSYNC_SIMULATE_SCHED_QUANTUM", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC",
+                                 "PROTON_USE_NTSYNC", "WINENTSYNC", "WINE_CPU_TOPOLOGY", "WINEDEBUG", "SteamDeck", "SteamAppId",
+                                 "PROTON_VERSION", "WINEDLLOVERRIDES", "LD_PRELOAD", "DXVK_ASYNC", "RADV_PERFTEST", "MESA_VK_WSI_PRESENT_MODE",
+                                 "TOTK_IMPORT_HEAP", "TOTK_DIRTY_PROTECT", "TOTK_SAMPLE", "DM_PRESENT_HZ"};
+    for (size_t i = 0; i < sizeof envs / sizeof *envs; i++) { const char *v = getenv(envs[i]); if (v) APPEND(", %s=%.60s", envs[i], v); }
+    if (!wv) return;
+    char b[8192];
+    if (rdfile("Z:\\proc\\cpuinfo", b, sizeof b) > 0) { char *p = strstr(b, "model name"); if (p) { p = strchr(p, ':'); char *nl = p ? strchr(p, '\n') : NULL; if (nl) *nl = 0; if (p) APPEND("; cpu%s", p + 1); } }
+    if (rdfile("Z:\\sys\\devices\\system\\cpu\\cpu0\\cpufreq\\scaling_governor", b, sizeof b) > 0) { chomp(b); APPEND(", governor %s", b); }
+    if (rdfile("Z:\\sys\\devices\\system\\cpu\\cpu0\\cpufreq\\scaling_max_freq", b, sizeof b) > 0) APPEND(", max %lld MHz", atoll(b) / 1000);
+    if (rdfile("Z:\\sys\\devices\\system\\cpu\\cpu0\\cpufreq\\scaling_min_freq", b, sizeof b) > 0) APPEND(", min %lld MHz", atoll(b) / 1000);
+    if (rdfile("Z:\\sys\\devices\\system\\cpu\\smt\\active", b, sizeof b) > 0) { chomp(b); APPEND(", smt %s", b); }
+    if (rdfile("Z:\\sys\\devices\\system\\cpu\\online", b, sizeof b) > 0) { chomp(b); APPEND(", online %s", b); }
+    if (rdfile("Z:\\proc\\meminfo", b, sizeof b) > 0)
+        APPEND("; memory %lld MiB, available %lld MiB, swap %lld MiB (free %lld)", field_after(b, "MemTotal") / 1024, field_after(b, "MemAvailable") / 1024,
+               field_after(b, "SwapTotal") / 1024, field_after(b, "SwapFree") / 1024);
+    if (rdfile("Z:\\proc\\sys\\vm\\swappiness", b, sizeof b) > 0) { chomp(b); APPEND(", swappiness %s", b); }
+    if (rdfile("Z:\\sys\\kernel\\mm\\transparent_hugepage\\enabled", b, sizeof b) > 0) { chomp(b); APPEND(", THP %s", b); }
+    if (rdfile("Z:\\proc\\self\\stat", b, sizeof b) > 0) {
+        char *p = strrchr(b, ')'); int f = 2; long long nice = 0;
+        for (char *q = p; q && *q; q++) if (*q == ' ' && ++f == 19) { nice = atoll(q + 1); break; }
+        APPEND("; nice %lld", nice);
+    }
+    if (rdfile("Z:\\proc\\self\\limits", b, sizeof b) > 0) { char *p = strstr(b, "Max realtime priority"); if (p) { char *nl = strchr(p, '\n'); if (nl) *nl = 0; APPEND(", %s", p); } }
+    char cg[600]; cgroup_dir(cg, sizeof cg);
+    if (cg[0]) {
+        char path[700]; APPEND("; cgroup %s", cg + 17);
+        snprintf(path, sizeof path, "%s\\cpu.max", cg); if (rdfile(path, b, sizeof b) > 0) { chomp(b); APPEND(", cpu.max %s", b); }
+        snprintf(path, sizeof path, "%s\\cpu.weight", cg); if (rdfile(path, b, sizeof b) > 0) { chomp(b); APPEND(", cpu.weight %s", b); }
+        snprintf(path, sizeof path, "%s\\memory.max", cg); if (rdfile(path, b, sizeof b) > 0) { chomp(b); APPEND(", memory.max %s", b); }
+        snprintf(path, sizeof path, "%s\\memory.high", cg); if (rdfile(path, b, sizeof b) > 0) { chomp(b); APPEND(", memory.high %s", b); }
+    }
+}
+
+void pal_linux_report(char *out, size_t cap) {
+    size_t at = 0; out[0] = 0;
+    if (!pal_under_wine()) return;
+    enum { MAXT = 512 };
+    typedef struct { int tid; uint64_t cpu, wait, minf, majf, vcs, ics; } task;
+    static task prev[MAXT]; static int nprev; static uint64_t pwall;
+    static task cur[MAXT]; int ncur = 0;
+    struct { int tid; uint64_t cpu, wait, majf; char st, comm[20]; int on; } top[MAXT]; int ntop = 0;
+    uint64_t wall = pal_now_ns(), span = pwall ? wall - pwall : 0; pwall = wall;
+    uint64_t tcpu = 0, twait = 0, tminf = 0, tmajf = 0; int nst[4] = {0};   /* R S D other */
+    char b[4096], path[96];
+    WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA("Z:\\proc\\self\\task\\*", &fd);
+    if (fh == INVALID_HANDLE_VALUE) { APPEND("no /proc access"); return; }
+    do {
+        int tid = atoi(fd.cFileName); if (tid <= 0 || ncur >= MAXT) continue;
+        snprintf(path, sizeof path, "Z:\\proc\\self\\task\\%d\\stat", tid);
+        if (rdfile(path, b, sizeof b) <= 0) continue;
+        char *lp = strchr(b, '('), *rp = strrchr(b, ')'); if (!lp || !rp) continue;
+        task t = {.tid = tid}; char st = rp[2], comm[20]; int on = -1;
+        snprintf(comm, sizeof comm, "%.*s", (int)(rp - lp - 1), lp + 1);
+        int f = 2; unsigned long long ut = 0, sy = 0;
+        for (char *q = rp + 1; *q; q++) if (*q == ' ') {
+            f++;
+            if (f == 10) t.minf = strtoull(q + 1, NULL, 10); else if (f == 12) t.majf = strtoull(q + 1, NULL, 10);
+            else if (f == 14) ut = strtoull(q + 1, NULL, 10); else if (f == 15) sy = strtoull(q + 1, NULL, 10);
+            else if (f == 39) { on = atoi(q + 1); break; }
+        }
+        t.cpu = (ut + sy) * 10000000ull;   /* USER_HZ = 100 */
+        snprintf(path, sizeof path, "Z:\\proc\\self\\task\\%d\\schedstat", tid);
+        if (rdfile(path, b, sizeof b) > 0) { char *e; t.cpu = strtoull(b, &e, 10); t.wait = strtoull(e, NULL, 10); }
+        cur[ncur++] = t;
+        nst[st == 'R' ? 0 : st == 'S' ? 1 : st == 'D' ? 2 : 3]++;
+        task *p = NULL; for (int i = 0; i < nprev; i++) if (prev[i].tid == tid) { p = &prev[i]; break; }
+        if (!p || !span) continue;
+        uint64_t dc = t.cpu - p->cpu, dw = t.wait - p->wait, dmaj = t.majf - p->majf;
+        tcpu += dc; twait += dw; tminf += t.minf - p->minf; tmajf += dmaj;
+        if (dc * 100 >= span || dw * 100 >= span || dmaj) {
+            top[ntop].tid = tid; top[ntop].cpu = dc; top[ntop].wait = dw; top[ntop].majf = dmaj; top[ntop].st = st; top[ntop].on = on;
+            snprintf(top[ntop].comm, sizeof top[ntop].comm, "%s", comm); ntop++;
+        }
+    } while (FindNextFileA(fh, &fd));
+    FindClose(fh);
+    memcpy(prev, cur, sizeof(task) * (size_t)ncur); nprev = ncur;
+    if (!span) { APPEND("(first sample, %d tasks)", ncur); return; }
+    APPEND("%d tasks (running %d, sleeping %d, disk wait %d, other %d); cpu %.0f ms, waiting for a cpu %.0f ms; page faults %llu minor, %llu major",
+           ncur, nst[0], nst[1], nst[2], nst[3], tcpu / 1e6, twait / 1e6, (unsigned long long)tminf, (unsigned long long)tmajf);
+    APPEND("; busiest tasks:");
+    for (int shown = 0; shown < 12; shown++) {
+        int best = -1; for (int i = 0; i < ntop; i++) if (top[i].tid && (best < 0 || top[i].cpu + top[i].wait > top[best].cpu + top[best].wait)) best = i;
+        if (best < 0) break;
+        char wch[64] = ""; snprintf(path, sizeof path, "Z:\\proc\\self\\task\\%d\\wchan", top[best].tid);
+        if (rdfile(path, wch, sizeof wch) > 0) chomp(wch);
+        APPEND(" %s/%d cpu %.0f%% runq %.0f%% %c cpu%d%s%s", top[best].comm, top[best].tid, top[best].cpu * 100.0 / span, top[best].wait * 100.0 / span,
+               top[best].st, top[best].on, wch[0] && strcmp(wch, "0") ? " in " : "", wch[0] && strcmp(wch, "0") ? wch : "");
+        if (top[best].majf) APPEND(" %llu major faults", (unsigned long long)top[best].majf);
+        APPEND(",");
+        top[best].tid = 0;
+    }
+    /* the machine */
+    static const char *psi[] = {"cpu", "io", "memory"};
+    for (int i = 0; i < 3; i++) {
+        snprintf(path, sizeof path, "Z:\\proc\\pressure\\%s", psi[i]);
+        if (rdfile(path, b, sizeof b) > 0) { char *p = strstr(b, "avg10="); if (p) APPEND(" %s pressure %.1f%%", psi[i], atof(p + 6)); }
+    }
+    if (rdfile("Z:\\proc\\loadavg", b, sizeof b) > 0) { chomp(b); APPEND("; load %.14s", b); }
+    APPEND("; MHz");
+    for (int i = 0; i < 16; i++) {
+        snprintf(path, sizeof path, "Z:\\sys\\devices\\system\\cpu\\cpu%d\\cpufreq\\scaling_cur_freq", i);
+        if (rdfile(path, b, sizeof b) <= 0) break;
+        APPEND(" %lld", atoll(b) / 1000);
+    }
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof path, "Z:\\sys\\class\\drm\\card%d\\device\\pp_dpm_sclk", i);
+        if (rdfile(path, b, sizeof b) > 0) { char *s = strchr(b, '*'); if (s) { char *l = s; while (l > b && l[-1] != '\n') l--; *s = 0; APPEND("; gpu clock %s", strchr(l, ':') ? strchr(l, ':') + 2 : l); } break; }
+    }
+    for (int i = 0; i < 12; i++) {
+        char nm[64]; snprintf(path, sizeof path, "Z:\\sys\\class\\hwmon\\hwmon%d\\name", i);
+        if (rdfile(path, nm, sizeof nm) <= 0) continue;
+        chomp(nm);
+        snprintf(path, sizeof path, "Z:\\sys\\class\\hwmon\\hwmon%d\\temp1_input", i);
+        if (rdfile(path, b, sizeof b) > 0) APPEND("; %s %lld C", nm, atoll(b) / 1000);
+        snprintf(path, sizeof path, "Z:\\sys\\class\\hwmon\\hwmon%d\\power1_average", i);
+        if (rdfile(path, b, sizeof b) > 0) APPEND(" %.1f W", atoll(b) / 1e6);
+        snprintf(path, sizeof path, "Z:\\sys\\class\\hwmon\\hwmon%d\\power1_cap", i);
+        if (rdfile(path, b, sizeof b) > 0) APPEND(" (cap %.1f W)", atoll(b) / 1e6);
+    }
+    if (rdfile("Z:\\proc\\meminfo", b, sizeof b) > 0)
+        APPEND("; available %lld MiB, swap used %lld MiB", field_after(b, "MemAvailable") / 1024, (field_after(b, "SwapTotal") - field_after(b, "SwapFree")) / 1024);
+    if (rdfile("Z:\\proc\\self\\status", b, sizeof b) > 0)
+        APPEND("; this process %lld MiB resident, %lld MiB swapped, %lld switches voluntary / %lld involuntary (main thread)", field_after(b, "VmRSS") / 1024,
+               field_after(b, "VmSwap") / 1024, field_after(b, "voluntary_ctxt_switches"), field_after(b, "nonvoluntary_ctxt_switches"));
+    char cg[600]; cgroup_dir(cg, sizeof cg);
+    if (cg[0]) {
+        static long long last_thr = -1, last_us = -1;
+        char cpath[700]; snprintf(cpath, sizeof cpath, "%s\\cpu.stat", cg);
+        if (rdfile(cpath, b, sizeof b) > 0) {
+            long long thr = field_after(b, "nr_throttled"), us = field_after(b, "throttled_usec");
+            if (last_thr >= 0) APPEND("; cgroup throttled %lld times, %lld ms", thr - last_thr, (us - last_us) / 1000);
+            last_thr = thr; last_us = us;
+        }
+    }
+}
+
+void pal_exception_report(char *out, size_t cap) {
+    static LONG64 last[16], last_jit, last_mod;
+    size_t at = 0; out[0] = 0;
+    for (int i = 0; i < 16 && exc_codes[i].code; i++) {
+        LONG64 n = exc_codes[i].n; APPEND("%s%#lx: %lld", at ? ", " : "", (unsigned long)exc_codes[i].code, (long long)(n - last[i])); last[i] = n;
+    }
+    LONG64 j = exc_av_jit, m = exc_av_mod;
+    APPEND("%saccess violations in generated code %lld, in modules %lld", at ? "; " : "", (long long)(j - last_jit), (long long)(m - last_mod));
+    last_jit = j; last_mod = m;
+}
+#undef APPEND
 
 int pal_process_memory(uint64_t *resident, uint64_t *committed) {
     PROCESS_MEMORY_COUNTERS_EX m = {.cb = sizeof m};

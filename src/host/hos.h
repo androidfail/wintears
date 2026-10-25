@@ -120,3 +120,4 @@ void dm_guest_write_prepare(void *addr, size_t n);                       /* upst
 void dm_guest_write_prep_register(void (*fn)(void *addr, size_t n));     /* gfx/nvn_dirty.c */
 int host_svc(unsigned num, jit_context *c);       /* 1 = answered */
 extern int host_trace_svcs;
+const char *host_svc_name(unsigned n);

@@ -171,7 +171,17 @@ void pal_thread_cpu_report(char *out, size_t cap);
 void *pal_thread_handle_self(void);
 /* Stop thread h for a moment and describe where it is: "module+offset" of its pc (or "jit" for code outside any
    module), then up to two return addresses into this program found on its stack ("< exe+offset"). 0 if it failed. */
-int pal_thread_sample(void *h, char *out, size_t cap);         /* stderr + debugger output */
+int pal_thread_sample(void *h, char *out, size_t cap);
+/* Samples the other busy threads (2 % of a core or more since the last call), skipping the given thread ids and the
+   caller: add(key) per sample, key = "name: where". */
+void pal_sample_busy_threads(const unsigned long *skip, int nskip, void (*add)(const char *key, void *u), void *u);
+unsigned long pal_thread_id_of(void *h);
+/* Diagnostics for slow runs (mostly Wine / Proton on Linux; empty elsewhere): the environment once at start, the
+   Linux view of this process and machine since the last call (scheduler, faults, frequencies, pressure, memory,
+   cgroup throttling), and the exceptions seen. */
+void pal_diag_boot(char *out, size_t cap);
+void pal_linux_report(char *out, size_t cap);
+void pal_exception_report(char *out, size_t cap);         /* stderr + debugger output */
 
 #ifdef __cplusplus
 }

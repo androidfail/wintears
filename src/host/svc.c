@@ -134,6 +134,7 @@ static const char *svc_name(uint32_t n) {
     return n < sizeof names / sizeof *names && names[n] ? names[n] : "?";
 }
 
+const char *host_svc_name(unsigned n) { return svc_name(n); }
 int host_svc(unsigned num, jit_context *c) {
     uint64_t *r = c->x;
     runtime_core_checkpoint();
