@@ -112,14 +112,13 @@ static void observed_main(void) { LOG("ENTER nnMain"); call_original("nnMain", 0
 static uint32_t observed_region(uint64_t out, uint64_t size) {
     uint64_t a[2] = {out, size};
     uint32_t r = (uint32_t)call_original("_ZN2nn2os21AllocateAddressRegionEPmm", 2, a);
-    LOG("AllocateAddressRegion size=%llx result=%x address=%llx", (unsigned long long)size, r,
-        (unsigned long long)(r ? 0 : *(uint64_t *)(uintptr_t)out));
+    if (r) LOG("AllocateAddressRegion size=%llx failed %#x", (unsigned long long)size, r);   /* one line per call was 4,700 per session */
     return r;
 }
 static uint32_t observed_pages(uint64_t addr, uint64_t size) {
     uint64_t a[2] = {addr, size};
     uint32_t r = (uint32_t)call_original("_ZN2nn2os19AllocateMemoryPagesEmm", 2, a);
-    LOG("AllocateMemoryPages address=%llx size=%llx result=%x", (unsigned long long)addr, (unsigned long long)size, r);
+    if (r) LOG("AllocateMemoryPages address=%llx size=%llx failed %#x", (unsigned long long)addr, (unsigned long long)size, r);   /* one line per call was 17,600 per session */
     return r;
 }
 

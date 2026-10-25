@@ -64,6 +64,9 @@ static uint64_t g_free_since[3];
 enum { NCALL = 0x100 + 8192 };
 static _Atomic uint64_t g_call_n[NCALL], g_call_ns[NCALL], g_n_run, g_n_stop_halt, g_n_stop_wait;
 static inline int call_slot(uint32_t n) { return n < 0x100 ? (int)n : n >= BRIDGE_SVC_BASE && n - BRIDGE_SVC_BASE < NCALL - 0x100 ? (int)(0x100 + n - BRIDGE_SVC_BASE) : -1; }
+/* The timers below (every jit_run, svc, host call, wait: several clock reads and shared counters each) run only with
+   TOTK_DIAG=1 (the [calls] and waits lines). */
+static int g_diag;
 static inline void call_note(uint32_t n, uint64_t t0) { int i = call_slot(n); if (i >= 0) { atomic_fetch_add(&g_call_n[i], 1); atomic_fetch_add(&g_call_ns[i], pal_now_ns() - t0); } }
 static void G_lock(void) {
     if (!pthread_mutex_trylock(&G)) return;
@@ -175,8 +178,9 @@ static void core_take(thr_t *t) {   /* holding G; waits until a core in t's mask
     }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     preempt_for(t);
-    uint64_t t0 = pal_now_ns();
+    uint64_t t0 = g_diag ? pal_now_ns() : 0;
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
+    if (!g_diag) return;
     uint64_t t1 = pal_now_ns();
     atomic_fetch_add(&g_ns_core, t1 - t0); atomic_fetch_add(&g_n_core_wait, 1);
     if (t1 > t->core_since) atomic_fetch_add(&g_ns_handoff, t1 - t->core_since);
@@ -221,12 +225,12 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
         clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
         if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
     }
-    uint64_t t0 = pal_now_ns(); atomic_fetch_add(&g_n_block, 1);
+    uint64_t t0 = g_diag ? pal_now_ns() : 0; if (g_diag) atomic_fetch_add(&g_n_block, 1);
     while (!t->woke) {
         int rc = ns > 0 ? pthread_cond_timedwait(&t->cv, &G, &dl) : pthread_cond_wait(&t->cv, &G);
-        if (rc == ETIMEDOUT && !t->woke) { wait_unlink(t); t->wkind = 0; atomic_fetch_add(&g_ns_block, pal_now_ns() - t0); return R_TIMEOUT; }
+        if (rc == ETIMEDOUT && !t->woke) { wait_unlink(t); t->wkind = 0; if (g_diag) atomic_fetch_add(&g_ns_block, pal_now_ns() - t0); return R_TIMEOUT; }
     }
-    atomic_fetch_add(&g_ns_block, pal_now_ns() - t0);
+    if (g_diag) atomic_fetch_add(&g_ns_block, pal_now_ns() - t0);
     return t->wres;
 }
 
@@ -273,9 +277,9 @@ static void run(thr_t *t, jit_context *c) {
         if (t->cur_core < 0) die("thread %#x runs guest code without a virtual core", t->handle);
         jit_core *jc = g_jit[t->cur_core];
         jit_load(jc, c);
-        uint64_t tj = pal_now_ns();
+        uint64_t tj = g_diag ? pal_now_ns() : 0;
         int stop = jit_run(jc);
-        atomic_fetch_add(&g_ns_jit, pal_now_ns() - tj); atomic_fetch_add(&g_n_run, 1);
+        if (g_diag) { atomic_fetch_add(&g_ns_jit, pal_now_ns() - tj); atomic_fetch_add(&g_n_run, 1); }
         jit_save(jc, c);
         if (stop == JIT_STOP_HALT) { atomic_fetch_add(&g_n_stop_halt, 1); runtime_core_checkpoint(); continue; }
         if (stop == JIT_STOP_EXCEPTION) {
@@ -302,13 +306,13 @@ static void run(thr_t *t, jit_context *c) {
         uint32_t n = jit_svc_number(jc);
         if (n == HOST_RETURN_SVC) break;
         if (n >= BRIDGE_SVC_BASE) {
-            uint64_t ts = pal_now_ns(); int done = bridge_dispatch(host_bridge(), n, c); call_note(n, ts);
+            uint64_t ts = g_diag ? pal_now_ns() : 0; int done = bridge_dispatch(host_bridge(), n, c); if (g_diag) call_note(n, ts);
             if (done) continue;
             report_stop("unknown host stub svc", n, c);
             die("unknown host stub");
         }
         t->last_svc = (int)n; t->last_lr = c->x[30]; t->last_fp = c->x[29]; t->nsvc++;
-        { uint64_t ts = pal_now_ns(); int done = host_svc(n, c); call_note(n, ts); if (done) continue; }
+        { uint64_t ts = g_diag ? pal_now_ns() : 0; int done = host_svc(n, c); if (g_diag) call_note(n, ts); if (done) continue; }
         report_stop("unimplemented svc", n, c);
         die("svc 0x%02x is not implemented yet", n);
     }
@@ -380,6 +384,7 @@ void threads_init(void) {
     jit_config cfg = {0};
     cfg.fastmem = 1;
     for (int i = 0; i < NCORE; i++) g_jit[i] = jit_core_create(&cfg, g_monitor, (size_t)i);
+    { const char *d = pal_getenv("TOTK_DIAG"); g_diag = d && *d == '1'; }
     const char *e = pal_getenv("TOTK_SAMPLE");
     if (e && *e == '1') { pthread_t th; if (!pthread_create(&th, NULL, sampler, NULL)) pthread_detach(th); }
 }

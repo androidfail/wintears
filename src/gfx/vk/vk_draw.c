@@ -529,6 +529,58 @@ static VkPrimitiveTopology topo(int prim) {
 }
 
 static int g_logic_op, g_divisor;
+uint64_t vk_ns_pipe_bg;   /* pipeline building on the workers (the 10-second line) */
+/* Pipelines (and graphics shader translations, vk_shader.c) can be made on worker threads (TOTK_ASYNC_SHADERS=1, the
+   default under Wine / Proton): a draw whose pipeline is not there yet is left out, so a new area costs a few frames
+   with something missing instead of a freeze of a second or more (pipelines took up to 1.2 s and translations up to
+   2 s per 10 s on the Steam Deck when entering an area). Compute work is never left out. */
+int async_shaders(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = pal_getenv("TOTK_ASYNC_SHADERS"); on = e ? *e == '1' : pal_under_wine();
+                  VLOG("shaders and pipelines: %s (TOTK_ASYNC_SHADERS)", on ? "made in the background, draws wait for them" : "made when first needed"); }
+    return on;
+}
+#define PIPE_BUILDING ((VkPipeline)(uintptr_t)2)
+typedef struct pbuild {
+    struct pbuild *next; gp_key k; const char *vs_name, *fs_name;
+    VkPipelineShaderStageCreateInfo st[2];
+    VkVertexInputAttributeDescription va[16]; VkVertexInputBindingDescription vb[16]; VkVertexInputBindingDivisorDescriptionEXT vd[16];
+    VkPipelineVertexInputDivisorStateCreateInfoEXT vds; VkPipelineVertexInputStateCreateInfo vi; VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vp; VkPipelineRasterizationStateCreateInfo rs; VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineDepthStencilStateCreateInfo ds; VkPipelineColorBlendAttachmentState cb[8]; VkPipelineColorBlendStateCreateInfo cbs;
+    VkPipelineDynamicStateCreateInfo dy; VkPipelineRenderingCreateInfo ri; VkGraphicsPipelineCreateInfo ci;
+} pbuild;
+static pthread_mutex_t g_pipes_mu = PTHREAD_MUTEX_INITIALIZER;   /* g_pipes and the queue */
+static pthread_cond_t g_pipes_cv = PTHREAD_COND_INITIALIZER;
+static pbuild *g_pq_head, *g_pq_tail;
+uint64_t g_waiting_pipe;   /* draws left out while their pipeline or shader is made (the 10-second line) */
+static VkPipeline pipe_build(pbuild *b) {   /* creates it, files it under its key, frees b */
+    uint64_t t0 = pal_now_ns();
+    VkPipeline p;
+    VkResult r = vkCreateGraphicsPipelines(vk_dev, vk_pcache, 1, &b->ci, NULL, &p);
+    if (r != VK_SUCCESS) { VLOG("pipeline for %s + %s not created (%d)", b->vs_name, b->fs_name, (int)r); p = VK_NULL_HANDLE; }
+    pthread_mutex_lock(&g_pipes_mu);
+    nvn_hm_put(&g_pipes, &b->k, p ? (void *)p : (void *)1);   /* 1 = failed: not tried again */
+    uint64_t n = ++g_pipe_n;
+    pthread_mutex_unlock(&g_pipes_mu);
+    if (n <= 4 || n % 500 == 0) VLOG("%llu pipelines (last one %.1f ms)", (unsigned long long)n, (pal_now_ns() - t0) / 1e6);
+    free(b);
+    return p;
+}
+static void *pipe_worker(void *unused) {
+    (void)unused;
+    pal_thread_set_name("vk pipelines");
+    for (;;) {
+        pthread_mutex_lock(&g_pipes_mu);
+        while (!g_pq_head) pthread_cond_wait(&g_pipes_cv, &g_pipes_mu);
+        pbuild *b = g_pq_head; g_pq_head = b->next; if (!g_pq_head) g_pq_tail = NULL;
+        pthread_mutex_unlock(&g_pipes_mu);
+        uint64_t t0 = pal_now_ns();
+        pipe_build(b);
+        vk_ns_pipe_bg += pal_now_ns() - t0;
+    }
+    return NULL;
+}
 static int vfmt_ok(VkFormat f) { VkFormatProperties p; vkGetPhysicalDeviceFormatProperties(vk_phys, f, &p); return (p.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0; }
 static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, int prim, VkPipelineLayout lay) {
     gp_key k; memset(&k, 0, sizeof k);
@@ -555,13 +607,19 @@ static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, in
             k.blend[i].dst_a = b->dst_a; k.blend[i].eq_rgb = b->eq_rgb; k.blend[i].eq_a = b->eq_a;
         }
     }
+    pthread_mutex_lock(&g_pipes_mu);
     VkPipeline p = nvn_hm_get(&g_pipes, &k);
+    pthread_mutex_unlock(&g_pipes_mu);
+    if (p == PIPE_BUILDING) return VK_NULL_HANDLE;   /* still being built: the draw is left out this time */
     if (p) return p;
 
-    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs->mod, .pName = "main"}};
+    pbuild *b = calloc(1, sizeof *b);
+    if (!b) die("Vulkan: pipeline");
+    b->k = k; b->vs_name = vs->name; b->fs_name = fs ? fs->name : "-";
+    b->st[0] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs->mod, .pName = "main"};
     int nst = 1;
-    if (fs) st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs->mod, .pName = "main"};
-    VkVertexInputAttributeDescription va[16]; VkVertexInputBindingDescription vb[16]; VkVertexInputBindingDivisorDescriptionEXT vd[16];
+    if (fs) b->st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs->mod, .pName = "main"};
+    VkVertexInputAttributeDescription *va = b->va; VkVertexInputBindingDescription *vb = b->vb; VkVertexInputBindingDivisorDescriptionEXT *vd = b->vd;
     uint32_t nva = 0, nvb = 0, nvd = 0;
     for (uint32_t i = 0; i < k.nattr; i++) {
         VkFormat f = vk_vfmt((int)k.attr[i].fmt);
@@ -581,42 +639,47 @@ static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, in
         if (div > 1 && g_divisor) vd[nvd++] = (VkVertexInputBindingDivisorDescriptionEXT){s, div};
         else if (div > 1) VK_ONCE("instance divisor %u: the GPU has no divisor support, every instance steps", div);
     }
-    VkPipelineVertexInputDivisorStateCreateInfoEXT vds = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT, .vertexBindingDivisorCount = nvd, .pVertexBindingDivisors = vd};
-    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .pNext = nvd ? &vds : NULL,
+    b->vds = (VkPipelineVertexInputDivisorStateCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT, .vertexBindingDivisorCount = nvd, .pVertexBindingDivisors = vd};
+    b->vi = (VkPipelineVertexInputStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .pNext = nvd ? &b->vds : NULL,
         .vertexBindingDescriptionCount = nvb, .pVertexBindingDescriptions = vb, .vertexAttributeDescriptionCount = nva, .pVertexAttributeDescriptions = va};
-    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = topo(prim)};
-    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .depthClampEnable = k.depth_clamp ? VK_TRUE : VK_FALSE,
+    b->ia = (VkPipelineInputAssemblyStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = topo(prim)};
+    b->vp = (VkPipelineViewportStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    b->rs = (VkPipelineRasterizationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .depthClampEnable = k.depth_clamp ? VK_TRUE : VK_FALSE,
         .polygonMode = k.poly_mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : k.poly_mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL, .lineWidth = 1.0f};
-    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = (VkSampleCountFlagBits)k.samples,
+    b->ms = (VkPipelineMultisampleStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = (VkSampleCountFlagBits)k.samples,
                                                .alphaToCoverageEnable = k.a2c ? VK_TRUE : VK_FALSE};
-    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    VkPipelineColorBlendAttachmentState cb[8]; uint32_t ncb = 0;
+    b->ds = (VkPipelineDepthStencilStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    uint32_t ncb = 0;
     for (int i = 0; i < 8 && i < S.pass_fmt.ncolor; i++) {
-        cb[i] = (VkPipelineColorBlendAttachmentState){k.blend[i].en, bfac(k.blend[i].src_rgb), bfac(k.blend[i].dst_rgb), bop(k.blend[i].eq_rgb),
+        b->cb[i] = (VkPipelineColorBlendAttachmentState){k.blend[i].en, bfac(k.blend[i].src_rgb), bfac(k.blend[i].dst_rgb), bop(k.blend[i].eq_rgb),
                                                       bfac(k.blend[i].src_a), bfac(k.blend[i].dst_a), bop(k.blend[i].eq_a), k.blend[i].mask};
         ncb = (uint32_t)i + 1;
     }
-    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .logicOpEnable = k.logic ? VK_TRUE : VK_FALSE,
-        .logicOp = (VkLogicOp)(k.logic & 0xf), .attachmentCount = ncb, .pAttachments = cb};
+    b->cbs = (VkPipelineColorBlendStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .logicOpEnable = k.logic ? VK_TRUE : VK_FALSE,
+        .logicOp = (VkLogicOp)(k.logic & 0xf), .attachmentCount = ncb, .pAttachments = b->cb};
     static const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_CULL_MODE,
         VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
         VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
         VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_LINE_WIDTH};
-    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = sizeof dyn / sizeof *dyn, .pDynamicStates = dyn};
-    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = (uint32_t)S.pass_fmt.ncolor,
-        .pColorAttachmentFormats = k.color, .depthAttachmentFormat = k.depth, .stencilAttachmentFormat = k.stencil};
-    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = (uint32_t)nst, .pStages = st,
-        .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
-        .pDepthStencilState = &ds, .pColorBlendState = &cbs, .pDynamicState = &dy, .layout = lay};
+    b->dy = (VkPipelineDynamicStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = sizeof dyn / sizeof *dyn, .pDynamicStates = dyn};
+    b->ri = (VkPipelineRenderingCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = (uint32_t)S.pass_fmt.ncolor,
+        .pColorAttachmentFormats = b->k.color, .depthAttachmentFormat = k.depth, .stencilAttachmentFormat = k.stencil};
+    b->ci = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &b->ri, .stageCount = (uint32_t)nst, .pStages = b->st,
+        .pVertexInputState = &b->vi, .pInputAssemblyState = &b->ia, .pViewportState = &b->vp, .pRasterizationState = &b->rs, .pMultisampleState = &b->ms,
+        .pDepthStencilState = &b->ds, .pColorBlendState = &b->cbs, .pDynamicState = &b->dy, .layout = lay};
+    if (async_shaders()) {   /* built on a worker; the draws that need it are left out until it is there */
+        pthread_mutex_lock(&g_pipes_mu);
+        nvn_hm_put(&g_pipes, &k, PIPE_BUILDING);
+        b->next = NULL; if (g_pq_tail) g_pq_tail->next = b; else g_pq_head = b; g_pq_tail = b;
+        pthread_cond_signal(&g_pipes_cv);
+        pthread_mutex_unlock(&g_pipes_mu);
+        return VK_NULL_HANDLE;
+    }
     uint64_t t0 = pal_now_ns();
-    VkResult r = vkCreateGraphicsPipelines(vk_dev, vk_pcache, 1, &ci, NULL, &p);
-    if (r != VK_SUCCESS) { VLOG("pipeline for %s + %s not created (%d)", vs->name, fs ? fs->name : "-", (int)r); p = VK_NULL_HANDLE; }
+    p = pipe_build(b);
     vk_ns_pipe += pal_now_ns() - t0;
-    nvn_hm_put(&g_pipes, &k, p ? (void *)p : (void *)1);   /* 1 = failed: not tried again */
-    if (++g_pipe_n <= 4 || g_pipe_n % 500 == 0) VLOG("%llu pipelines (last one %.1f ms)", (unsigned long long)g_pipe_n, (pal_now_ns() - t0) / 1e6);
     return p;
 }
 
@@ -736,6 +799,7 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     int prim = dw ? dw->prim : di->prim;
     VkPipelineLayout lay = layout_of(vs->dsl, fs ? fs->dsl : VK_NULL_HANDLE);
     VkPipeline p = graphics_pipeline(vs, fs, prim, lay);
+    if (!p && async_shaders()) { g_waiting_pipe++; vd_note_drop("pipeline being built"); return; }
     if (!p || p == (VkPipeline)1) { g_skipped[3]++; vd_note_drop("no pipeline"); return; }
     void vx_note_draw(void); vx_note_draw();
     { extern int vk_passlog_on; if (vk_passlog_on) VLOG("[pass]  draw %s + %s prim %d vp %g,%g %gx%g sc %d %d,%d %dx%d cull %d dt %d blend_en %#x mask %#x raster_discard %d",
@@ -830,12 +894,21 @@ static void pcache_init(void) {
     else if (data) VLOG("pipeline cache: %.1f MiB read", size / 1048576.0);
     free(data);
 }
-void vd_pcache_save(void) {
+static void *pcache_write(void *unused);
+void vd_pcache_save(void) {   /* at most once a minute, when pipelines were made: written by a thread of its own (several MiB) */
+    static _Atomic int busy;
     uint64_t made = g_pipe_n + g_cpipe_n, now = pal_now_ns();
-    if (!vk_pcache || made == g_pc_seen || now - g_pc_last < 60000000000ull) return;
+    if (!vk_pcache || made == g_pc_seen || now - g_pc_last < 60000000000ull || busy) return;
     g_pc_last = now; g_pc_seen = made;
+    busy = 1;
+    pthread_t t;
+    if (pthread_create(&t, NULL, pcache_write, (void *)&busy)) { busy = 0; return; }
+    pthread_detach(t);
+}
+static void *pcache_write(void *arg) {
+    _Atomic int *busy = arg;
     size_t n = 0;
-    if (vkGetPipelineCacheData(vk_dev, vk_pcache, &n, NULL) != VK_SUCCESS || !n) return;
+    if (vkGetPipelineCacheData(vk_dev, vk_pcache, &n, NULL) != VK_SUCCESS || !n) { *busy = 0; return NULL; }
     void *data = malloc(n);
     if (data && vkGetPipelineCacheData(vk_dev, vk_pcache, &n, data) == VK_SUCCESS) {
         char tmp[1110]; snprintf(tmp, sizeof tmp, "%s.tmp", g_pc_path);
@@ -845,10 +918,13 @@ void vd_pcache_save(void) {
         if (ok && pal_rename_replace(tmp, g_pc_path)) VLOG("pipeline cache: could not replace %s", g_pc_path);
     }
     free(data);
+    *busy = 0;
+    return NULL;
 }
 
 void vd_init(void) {
     pcache_init();
+    if (async_shaders()) for (int i = 0; i < 2; i++) { pthread_t t; if (pthread_create(&t, NULL, pipe_worker, NULL)) die("Vulkan: pipeline worker"); pthread_detach(t); }
     VkPhysicalDeviceFeatures f; vkGetPhysicalDeviceFeatures(vk_phys, &f);
     g_logic_op = f.logicOp;
     g_divisor = vk_divisor;

@@ -74,6 +74,15 @@ static void update_pad(void) {
         p.ry = larger(p.ry, -axis(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY)));
     }
     host_input_set_pad(&p);
+    /* the left stick's direction as the game gets it, when it changes (the first 400: a stick that "stays held" on the
+       Steam Deck shows here as a missing return to the middle) */
+    static int last_dir = -1, logged;
+    int dir = abs(p.lx) < 16000 && abs(p.ly) < 16000 ? 0 : abs(p.lx) > abs(p.ly) ? (p.lx > 0 ? 1 : 2) : (p.ly > 0 ? 3 : 4);
+    if (dir != last_dir && logged < 400) {
+        static const char *const names[] = {"middle", "right", "left", "up", "down"};
+        LOG("[input] left stick %s (%d, %d) at %.3f s", names[dir], p.lx, p.ly, SDL_GetTicksNS() / 1e9); logged++;
+    }
+    last_dir = dir;
 }
 
 int fe_init(const char *title) {
@@ -104,8 +113,9 @@ static void pad_removed(SDL_JoystickID id) {
 
 void fe_run(void) {
     for (;;) {
+        /* every 8 ms at least, not only when an event comes: the controller's state is read again each time */
         SDL_Event e;
-        if (!SDL_WaitEvent(&e)) continue;
+        if (!SDL_WaitEventTimeout(&e, 8)) { update_pad(); continue; }
         do {
             switch (e.type) {
             case SDL_EVENT_QUIT: case SDL_EVENT_WINDOW_CLOSE_REQUESTED: return;

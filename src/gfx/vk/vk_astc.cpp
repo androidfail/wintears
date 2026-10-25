@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -26,6 +28,44 @@ astcenc_context *get(unsigned bw, unsigned bh, int srgb) {
     g_ctx.push_back({bw, bh, srgb, c});
     return c;
 }
+
+/* Helper threads made once (starting threads is slow under Wine: big textures used to start up to 8 each): job k of n
+   runs on helper k - 1, job 0 on the caller. */
+std::mutex g_pool_mu;
+std::condition_variable g_pool_cv, g_pool_done;
+std::function<void(unsigned)> g_job;
+unsigned g_job_gen, g_job_n, g_job_left;
+std::vector<std::thread> g_helpers;
+void helper(unsigned k, unsigned seen) {   /* seen: the job number when it was made (it waits for the next) */
+    for (;;) {
+        std::function<void(unsigned)> job;
+        {
+            std::unique_lock<std::mutex> l(g_pool_mu);
+            g_pool_cv.wait(l, [&] { return g_job_gen != seen; });
+            seen = g_job_gen;
+            if (k >= g_job_n) continue;
+            job = g_job;
+        }
+        job(k);
+        std::lock_guard<std::mutex> l(g_pool_mu);
+        if (--g_job_left == 0) g_pool_done.notify_all();
+    }
+}
+void run_on(unsigned n, const std::function<void(unsigned)> &f) {
+    while (g_helpers.size() + 1 < n) {
+        unsigned k = (unsigned)g_helpers.size() + 1, gen;
+        { std::lock_guard<std::mutex> l(g_pool_mu); gen = g_job_gen; }
+        g_helpers.emplace_back(helper, k, gen); g_helpers.back().detach();
+    }
+    {
+        std::lock_guard<std::mutex> l(g_pool_mu);
+        g_job = f; g_job_n = n; g_job_left = n - 1; g_job_gen++;
+    }
+    g_pool_cv.notify_all();
+    f(0);
+    std::unique_lock<std::mutex> l(g_pool_mu);
+    g_pool_done.wait(l, [] { return g_job_left == 0; });
+}
 }
 
 // src: the blocks of one 2D slice (row by row), dst: w x h RGBA8 texels. 0 = decoded.
@@ -41,10 +81,8 @@ extern "C" int vk_astc_decode(const uint8_t *src, size_t n, unsigned bw, unsigne
     astcenc_error err = ASTCENC_SUCCESS;
     if (nt == 1) err = astcenc_decompress_image(c, src, n, &img, &swz, 0);
     else {
-        std::vector<std::thread> t;
         std::vector<astcenc_error> e(nt, ASTCENC_SUCCESS);
-        for (unsigned i = 0; i < nt; i++) t.emplace_back([&, i] { e[i] = astcenc_decompress_image(c, src, n, &img, &swz, i); });
-        for (auto &x : t) x.join();
+        run_on(nt, [&](unsigned i) { e[i] = astcenc_decompress_image(c, src, n, &img, &swz, i); });
         for (auto x : e) if (x != ASTCENC_SUCCESS) err = x;
     }
     astcenc_decompress_reset(c);

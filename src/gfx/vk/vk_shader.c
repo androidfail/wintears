@@ -255,7 +255,7 @@ static vk_shader *load_variant(const char *variant, int stage, const uint8_t *c1
     for (int i = 0; i < s->nb && nl < 96; i++) lb[nl++] = (VkDescriptorSetLayoutBinding){s->b[i].binding, DESC[s->b[i].type], s->b[i].count, sf, NULL};
     VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = (uint32_t)nl, .pBindings = lb};
     VKC(vkCreateDescriptorSetLayout(vk_dev, &li, NULL, &s->dsl));
-    c1_place(s, c1, c1n);
+    if (c1) c1_place(s, c1, c1n);   /* NULL: the caller places it (it records into the current submission: the replay only) */
     return s;
 }
 
@@ -289,38 +289,109 @@ static shader_key *key_get(const char *hex) {
     return k;
 }
 
-static vk_shader *translate(stage_t *t, int st, const answers *a) {
+/* A translation, with copies of everything it needs: it may run on the translation worker (async_shaders, vk_draw.c)
+   after the program is gone. */
+typedef struct xjob { struct xjob *next; shader_key *k; int st, worker; char key[65], variant[112]; uint8_t *code; uint32_t length, c1o, local[3]; char *ans; vk_shader *out; } xjob;
+static pthread_mutex_t g_svc_mu = PTHREAD_MUTEX_INITIALIZER;   /* one request at a time to the translation service */
+static xjob *xjob_make(stage_t *t, int st, const answers *a) {
+    xjob *j = calloc(1, sizeof *j);
+    if (!j) die("shader translation job");
     sbuf ans = {0}; answers_json(a, &ans);
     host_sha256 h; char md[65]; host_sha256_begin(&h); host_sha256_update(&h, ans.p, ans.n); host_sha256_hex(&h, md);
-    char variant[112]; snprintf(variant, sizeof variant, "%s-%.12s", t->key, md);
+    snprintf(j->variant, sizeof j->variant, "%s-%.12s", t->key, md);
+    memcpy(j->key, t->key, 65); j->k = t->k; j->st = st; j->ans = ans.p;
+    j->length = t->length; j->c1o = t->c1o; memcpy(j->local, t->local, sizeof j->local);
+    j->code = malloc(t->length ? t->length : 1);
+    if (!j->code) die("shader translation job");
+    memcpy(j->code, t->code, t->length);
+    return j;
+}
+static void xjob_free(xjob *j) { free(j->code); free(j->ans); free(j); }
+static vk_shader *xjob_run(xjob *j) {
+    int st = j->st; const char *variant = j->variant;
     const char *stn = st == 0 ? "vs" : st == 1 ? "ps" : "cs";
     size_t skip = st == 5 ? 0 : 0x30;   /* graphics code drops the 0x30-byte NVN header (upstream) */
     char code_path[1300]; snprintf(code_path, sizeof code_path, "%s/%s.code", g_dir, variant);
-    if (write_all(code_path, t->code + skip, t->length - skip, 0)) die("write shader code %s", code_path);
+    if (write_all(code_path, j->code + skip, j->length - skip, 0)) die("write shader code %s", code_path);
     sbuf rq = {0};
     sb_add(&rq, "{\"variant\": \"%s\", \"stage\": \"%s\", \"code\": ", variant, stn); json_path(&rq, code_path);
     sb_add(&rq, ", \"c1\": \"");
-    for (uint32_t i = t->c1o; i < t->length; i++) sb_add(&rq, "%02x", t->code[i]);
-    sb_add(&rq, "\", %s", ans.p);
-    if (st == 5) sb_add(&rq, ", \"local\": [%u, %u, %u]", t->local[0], t->local[1], t->local[2]);
+    for (uint32_t i = j->c1o; i < j->length; i++) sb_add(&rq, "%02x", j->code[i]);
+    sb_add(&rq, "\", %s", j->ans);
+    if (st == 5) sb_add(&rq, ", \"local\": [%u, %u, %u]", j->local[0], j->local[1], j->local[2]);
     if (vk_sb_align != 16) sb_add(&rq, ", \"sb_align\": %u", vk_sb_align);
     sb_add(&rq, ", \"depth_minus_w\": %s}\n", totk_depth_near_minus_w() ? "true" : "false");
+    pthread_mutex_lock(&g_svc_mu);
     service_start();
     uint64_t t0 = pal_now_ns();
     svc_write(rq.p);
     char reply[2048]; svc_line(reply, sizeof reply);
+    pthread_mutex_unlock(&g_svc_mu);
     remove(code_path);   /* the translator has read it */
-    free(rq.p); free(ans.p);
+    free(rq.p);
     if (!strstr(reply, "\"ok\": true")) { VLOG("shader %s (%s) not translated: %s", variant, stn, reply); return NULL; }
     vk_ns_xlate += pal_now_ns() - t0;
-    vk_shader *s = load_variant(variant, st, t->code + t->c1o, t->length - t->c1o);
+    vk_shader *s = load_variant(variant, st, j->worker ? NULL : j->code + j->c1o, j->length - j->c1o);
     if (!s) { VLOG("shader %s: translation output unreadable", variant); return NULL; }
-    shader_key *k = t->k;
+    shader_key *k = j->k;
     char line[120]; snprintf(line, sizeof line, "%s\n", variant);
     char path[1200]; snprintf(path, sizeof path, "%s/%s.variants", g_dir, k->key);
     write_all(path, line, strlen(line), 1);
     if (++g_translated <= 8 || g_translated % 100 == 0) VLOG("translated %llu: %s %s in %.1f ms", (unsigned long long)g_translated, stn, variant, (pal_now_ns() - t0) / 1e6);
     return s;
+}
+static vk_shader *translate(stage_t *t, int st, const answers *a) { xjob *j = xjob_make(t, st, a); vk_shader *s = xjob_run(j); xjob_free(j); return s; }
+
+/* Graphics translations on a worker (async_shaders): jobs by variant name, so one is asked for once; finished ones
+   are added to their key's variants by the replay (vs_stage), which alone reads and grows those lists. */
+int async_shaders(void);
+static pthread_mutex_t g_xq_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_xq_cv = PTHREAD_COND_INITIALIZER;
+static xjob *g_xq_head, *g_xq_tail, *g_xdone;
+static nvn_hmap g_xpending = {.klen = 112};   /* variant -> job (queued, running or done but not yet added) */
+static void *xlate_worker(void *unused) {
+    (void)unused;
+    pal_thread_set_name("vk shader translation");
+    for (;;) {
+        pthread_mutex_lock(&g_xq_mu);
+        while (!g_xq_head) pthread_cond_wait(&g_xq_cv, &g_xq_mu);
+        xjob *j = g_xq_head; g_xq_head = j->next; if (!g_xq_head) g_xq_tail = NULL;
+        pthread_mutex_unlock(&g_xq_mu);
+        j->worker = 1; j->out = xjob_run(j);
+        pthread_mutex_lock(&g_xq_mu);
+        j->next = g_xdone; g_xdone = j;
+        pthread_mutex_unlock(&g_xq_mu);
+    }
+    return NULL;
+}
+static void xlate_collect(void) {   /* the replay: finished translations into their keys' variant lists */
+    if (!g_xdone) return;
+    pthread_mutex_lock(&g_xq_mu);
+    xjob *d = g_xdone; g_xdone = NULL;
+    pthread_mutex_unlock(&g_xq_mu);
+    for (xjob *j = d, *n; j; j = n) {
+        n = j->next;
+        if (j->out) {
+            c1_place(j->out, j->code + j->c1o, j->length - j->c1o);
+            shader_key *k = j->k;
+            if (k->nvar == k->cvar) { k->cvar = k->cvar ? k->cvar * 2 : 4; k->var = realloc(k->var, (size_t)k->cvar * sizeof *k->var); }
+            k->var[k->nvar++] = j->out;
+            pthread_mutex_lock(&g_xq_mu); nvn_hm_del(&g_xpending, j->variant); pthread_mutex_unlock(&g_xq_mu);
+            xjob_free(j);
+        }   /* a failed one stays pending: not asked for again */
+    }
+}
+static void xlate_ask(stage_t *t, int st, const answers *a) {
+    static int started;
+    if (!started) { started = 1; pthread_t th; if (pthread_create(&th, NULL, xlate_worker, NULL)) die("shader translation worker"); pthread_detach(th); }
+    xjob *j = xjob_make(t, st, a);
+    pthread_mutex_lock(&g_xq_mu);
+    if (nvn_hm_get(&g_xpending, j->variant)) { pthread_mutex_unlock(&g_xq_mu); xjob_free(j); return; }
+    nvn_hm_put(&g_xpending, j->variant, j);
+    if (g_xq_tail) g_xq_tail->next = j; else g_xq_head = j;
+    g_xq_tail = j;
+    pthread_cond_signal(&g_xq_cv);
+    pthread_mutex_unlock(&g_xq_mu);
 }
 
 vk_prog *vs_prog(const prog_t *p) {
@@ -353,6 +424,7 @@ vk_shader *vs_stage(vk_prog *pr, int st) {
     uint64_t sig = answers_sig(&a);
     for (int i = 0; i < t->nlast; i++) if (t->last[i].sig == sig) return t->last[i].s;
     shader_key *k = t->k;
+    xlate_collect();
     vk_shader *found = NULL;
     for (int i = 0; i < k->nvar && !found; i++) if (deps_match(k->var[i], &a)) found = k->var[i];
     if (!found && !k->loaded) {   /* the cached variants of this shader, loaded on first need */
@@ -365,6 +437,7 @@ vk_shader *vs_stage(vk_prog *pr, int st) {
             if (!found && deps_match(s, &a)) found = s;
         }
     }
+    if (!found && st != 5 && async_shaders()) { xlate_ask(t, st, &a); return NULL; }   /* the draw waits for it (compute never does) */
     if (!found && (found = translate(t, st, &a))) {
         if (k->nvar == k->cvar) { k->cvar = k->cvar ? k->cvar * 2 : 4; k->var = realloc(k->var, (size_t)k->cvar * sizeof *k->var); }
         k->var[k->nvar++] = found;
