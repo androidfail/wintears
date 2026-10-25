@@ -229,6 +229,12 @@ static void upload(vtex *e, const tex_t *t) {
                 int is_int = (t->d.format >= 0x1B && t->d.format <= 0x1C) || (t->d.format >= 0x20 && t->d.format <= 0x21) || (t->d.format >= 0x23 && t->d.format <= 0x24);
                 expand_rgb(dst, lin, (size_t)w * h * d, (unsigned)bpb / 3, is_int);
             } else memcpy(dst, lin, n);
+            { static int texlog = -1, nlog;   /* TOTK_TEXLOG=1: the mean colour of what is uploaded (4-byte texels), to see what a texture holds without looking */
+              if (texlog < 0) { const char *e = pal_getenv("TOTK_TEXLOG"); texlog = e && *e == '1'; }
+              if (texlog && lv == 0 && ly == 0 && out_n == (size_t)w * h * 4 && nlog < 400) { nlog++;
+                  uint64_t sum[4] = {0, 0, 0, 0}; for (size_t i = 0; i < (size_t)w * h; i++) for (int c = 0; c < 4; c++) sum[c] += dst[i * 4 + c];
+                  double nn = (double)w * h * 255.0;
+                  VLOG("[tex] upload %ux%u NVN format %#x (Vulkan %d) mean rgba %.3f %.3f %.3f %.3f", w, h, (unsigned)t->d.format, (int)e->fmt, sum[0] / nn, sum[1] / nn, sum[2] / nn, sum[3] / nn); } }
             free(lin);
             VkBufferImageCopy r = {.bufferOffset = so, .imageSubresource = {e->aspect & ~VK_IMAGE_ASPECT_STENCIL_BIT, lv, ly, 1},
                                    .imageExtent = {w, h, d}};
