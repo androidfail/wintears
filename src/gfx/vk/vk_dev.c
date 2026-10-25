@@ -243,6 +243,8 @@ static void pool_add(const void *mem, uint64_t size) {
     nvn_dirty_add_range(mem, (size_t)size);
 }
 
+int runtime_core_away(void);
+void runtime_core_back(int *away);
 static void free_import(void *arg) { import_t *im = arg; vkDestroyBuffer(vk_dev, im->buf, NULL); vkFreeMemory(vk_dev, im->mem, NULL); free(im); }
 static void pool_del(const void *mem) {
     nvn_dirty_remove_range(mem);
@@ -263,9 +265,15 @@ static void pool_del(const void *mem) {
     if (hi > lo) {
         pthread_mutex_lock(&vk_mu);
         vt_pool_gone(lo, hi);
-        vk_open(); vk_after(free_import, im);   /* once the GPU is done with it */
-        vk_flush(NULL, NULL);
+        uint64_t f = vk_flush(NULL, NULL);
         pthread_mutex_unlock(&vk_mu);
+        /* The import goes before this returns, once the GPU is done with it: the game frees the memory as soon as
+           Finalize returns, and RADV puts every allocation in every submission, so a submission in between named
+           user pages that were gone and the Steam Deck lost the device (while loading, when pools come and go). */
+        int away = runtime_core_away();
+        vk_wait_done(f);
+        runtime_core_back(&away);
+        free_import(im);
     }
 }
 
