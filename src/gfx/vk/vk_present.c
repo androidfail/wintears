@@ -1,6 +1,7 @@
 /* The window's swapchain: each NVN present blits the game's swapchain texture into the window, scaled to fit with
    black bars (16:9 kept), in submission order after the work that drew it. Mailbox when the GPU offers it (no tearing,
    no wait: the game paces itself, nvn.c), else FIFO. */
+#include <stdatomic.h>
 #include "gfx/vk/vk.h"
 
 #include "frontend/frontend.h"
@@ -109,11 +110,14 @@ static void write_shot(void *arg) {   /* completion thread: the copy is done */
     free(s);
 }
 
+_Atomic uint64_t vp_ns_acquire, vp_ns_present, vp_n_present;   /* the 10-second log */
 uint64_t vp_present(const tex_t *t, const int crop[4]) {
     if (g_stale || !g_sc) { vkDeviceWaitIdle(vk_dev); g_stale = 0; if (!create_swapchain()) return 0; }
     VkSemaphore acq = g_acquired[g_next++ % 9];
     uint32_t idx;
+    uint64_t ta = pal_now_ns();
     VkResult r = vkAcquireNextImageKHR(vk_dev, g_sc, UINT64_MAX, acq, VK_NULL_HANDLE, &idx);
+    atomic_fetch_add(&vp_ns_acquire, pal_now_ns() - ta); atomic_fetch_add(&vp_n_present, 1);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { g_stale = 1; return 0; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) die("Vulkan: vkAcquireNextImageKHR failed (%d)", (int)r);
     vtex *e = vt_get(t);
@@ -153,7 +157,9 @@ uint64_t vp_present(const tex_t *t, const int crop[4]) {
     uint64_t f = vk_flush(&w, &s);
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_drawn[idx],
                            .swapchainCount = 1, .pSwapchains = &g_sc, .pImageIndices = &idx};
+    uint64_t tp = pal_now_ns();
     r = vkQueuePresentKHR(vk_q, &pi);
+    atomic_fetch_add(&vp_ns_present, pal_now_ns() - tp);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g_stale = 1;
     else if (r != VK_SUCCESS) die("Vulkan: vkQueuePresentKHR failed (%d)", (int)r);
     if (!g_presents++) VLOG("first frame in the window (game texture %s)", e ? "found" : "not drawn yet");

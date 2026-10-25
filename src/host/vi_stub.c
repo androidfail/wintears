@@ -3,6 +3,7 @@
    five functions: Initialize, OpenDefaultDisplay, CreateLayer, GetNativeWindow and GetDisplayVsyncEvent. The display,
    the layer and the native window are tokens in guest memory the game only passes back; the vsync event is a real
    SystemEvent, signalled 60 times a second by a host thread, as the window's display link does upstream. */
+#include <stdatomic.h>
 #include <pthread.h>
 
 #include "host/hos.h"
@@ -16,6 +17,7 @@ static uint64_t display_token(void) { return host_object_page(); }
 static uint64_t layer_token(void) { return host_object_page() + 0x40; }
 static uint64_t window_token(void) { return host_object_page() + 0x80; }
 
+_Atomic unsigned long long vi_n_vsync;   /* vsync signals (the 10-second log) */
 static void *vsync_thread(void *unused) {
     (void)unused;
     uint64_t next = pal_now_ns();
@@ -30,6 +32,7 @@ static void *vsync_thread(void *unused) {
         memcpy(ev, vsync_events, sizeof ev);
         pthread_mutex_unlock(&vsync_lock);
         for (int i = 0; i < n; i++) hle_signal_system_event(ev[i]);
+        { extern _Atomic unsigned long long vi_n_vsync; vi_n_vsync++; }
     }
     return NULL;
 }

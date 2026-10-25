@@ -535,7 +535,12 @@ static uint64_t submit(const uint64_t *handles, int n) {
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
         vk_log_memory();
         { static uint64_t lastf; uint64_t f = pal_fault_total(); char cpu[600]; pal_thread_cpu_report(cpu, sizeof cpu);
-          VLOG("cpu (last 10 s, %% of one core): %s; %llu memory faults", cpu, (unsigned long long)(f - lastf)); lastf = f; }
+          VLOG("cpu (last 10 s, %% of one core): %s; %llu memory faults", cpu, (unsigned long long)(f - lastf)); lastf = f;
+          void runtime_wait_report(char *out, size_t cap); char w[400]; runtime_wait_report(w, sizeof w);
+          extern _Atomic uint64_t vp_ns_acquire, vp_ns_present, vp_n_present; extern _Atomic unsigned long long vi_n_vsync;
+          VLOG("waits (last 10 s): %s; %llu presents, acquiring images %.0f ms, presenting %.0f ms; %llu vsync signals", w,
+               (unsigned long long)atomic_exchange(&vp_n_present, 0), atomic_exchange(&vp_ns_acquire, 0) / 1e6, atomic_exchange(&vp_ns_present, 0) / 1e6,
+               (unsigned long long)atomic_exchange(&vi_n_vsync, 0)); }
         vd_pcache_save();
         g_sh_bytes = 0; g_sub_max = vk_ns_xlate = vk_ns_pipe = vk_ns_tex = vk_n_pass = vk_n_ubo = vk_n_ubflush = vk_n_barrier = 0;
     }
