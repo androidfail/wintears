@@ -318,15 +318,16 @@ static uint64_t alias_map(int unmap, uint64_t addr, uint64_t size) {
     if (!unmap) for (uint64_t i = 0; i < count; i++) if (!alias_pages[first + i]) fresh += 4096;
     /* LimitReached (132), which the SDK turns into its recoverable out-of-memory result */
     if (!unmap && fresh + alias_bytes + heap_size + image_bytes() > APP_POOL) { pal_mutex_unlock(&memory_lock); return 0x10801; }
-    if (unmap && g_alias_unmap) {   /* the GPU lets go of these pages first (outside the lock: it waits for the GPU) */
-        pal_mutex_unlock(&memory_lock); g_alias_unmap(addr, addr + size); pal_mutex_lock(&memory_lock);
-    }
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
             if (overlaps(addr, size, stack_maps[i].src, stack_maps[i].size)) { pal_mutex_unlock(&memory_lock); return 0xdc01; }
         uint64_t released = 0;
         for (uint64_t i = 0; i < count; i++) if (alias_pages[first + i]) { alias_pages[first + i] = 0; released += 4096; }
         alias_bytes -= released;
+        /* The GPU lets go of these pages before they go (outside the lock: it waits for the GPU). They are marked
+           unmapped first, so no new GPU window can be made over them meanwhile: a window over decommitted pages lost
+           the device at the next submission on the Steam Deck. */
+        if (g_alias_unmap) { pal_mutex_unlock(&memory_lock); g_alias_unmap(addr, addr + size); pal_mutex_lock(&memory_lock); }
         if (pal_decommit((uintptr_t)addr, (size_t)size)) die("decommit physical alias pages");
     } else if (fresh) {
         if (pal_commit((uintptr_t)addr, (size_t)size, PAL_PROT_READ | PAL_PROT_WRITE)) die("commit physical alias pages");
@@ -441,11 +442,17 @@ int memory_svc(unsigned num, uint64_t *r) {
     case 0x01: {   /* SetHeapSize(x1 size) */
         uint64_t size = r[1];
         if (size > HEAP_CAP || size % 0x200000 || size + image_bytes() > APP_POOL) { r[0] = 0xd401; return 1; }
-        if (size < heap_size && g_heap_shrink) g_heap_shrink(heap + size, heap + heap_size);   /* the GPU lets go of it first */
+        /* Shrinking: the heap ends at the new size first (no new GPU window past it), then the GPU lets go of the rest
+           (outside the lock: it waits for the GPU), then it is decommitted. */
         pal_mutex_lock(&memory_lock);
-        if (size > heap_size && pal_commit((uintptr_t)(heap + heap_size), (size_t)(size - heap_size), PAL_PROT_READ | PAL_PROT_WRITE))
+        uint64_t old = heap_size;
+        if (size < old) heap_size = size;
+        pal_mutex_unlock(&memory_lock);
+        if (size < old && g_heap_shrink) g_heap_shrink(heap + size, heap + old);
+        pal_mutex_lock(&memory_lock);
+        if (size > old && pal_commit((uintptr_t)(heap + old), (size_t)(size - old), PAL_PROT_READ | PAL_PROT_WRITE))
             die("commit heap");
-        if (size < heap_size && pal_decommit((uintptr_t)(heap + size), (size_t)(heap_size - size))) die("decommit heap");
+        if (size < old && pal_decommit((uintptr_t)(heap + size), (size_t)(old - size))) die("decommit heap");
         heap_size = size;
         pal_mutex_unlock(&memory_lock);
         r[0] = 0;

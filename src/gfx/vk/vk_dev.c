@@ -100,6 +100,34 @@ static int pick_device(void) {
 }
 
 static VkDeviceSize g_host_align = 4096;
+static int g_fault;   /* VK_EXT_device_fault */
+static uint64_t g_import_bytes, g_import_all;   /* every import alive (pools, windows), for the 10-second line */
+static int g_aw_live;   /* windows over physical (alias) memory */
+
+/* Before dying of a lost device: what the driver says went wrong (page faults with their GPU addresses, or nothing for
+   a hang) and what was given to the GPU. */
+void vk_lost(int r) {
+    if (r != VK_ERROR_DEVICE_LOST) return;
+    static _Atomic int once; if (once++) return;
+    VLOG("device lost: %llu imports alive (%.0f MiB), %d windows over physical memory", (unsigned long long)g_import_all, g_import_bytes / 1048576.0, g_aw_live);
+    if (!g_fault) { VLOG("device lost: no fault report (VK_EXT_device_fault unavailable)"); return; }
+    VkDeviceFaultCountsEXT c = {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    VkResult q = vkGetDeviceFaultInfoEXT(vk_dev, &c, NULL);
+    if (q != VK_SUCCESS && q != VK_INCOMPLETE) { VLOG("device lost: fault report failed (%d)", (int)q); return; }
+    c.vendorBinarySize = 0;
+    VkDeviceFaultAddressInfoEXT *ai = calloc(c.addressInfoCount + 1, sizeof *ai);
+    VkDeviceFaultVendorInfoEXT *vi = calloc(c.vendorInfoCount + 1, sizeof *vi);
+    VkDeviceFaultInfoEXT fi = {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT, .pAddressInfos = ai, .pVendorInfos = vi};
+    q = vkGetDeviceFaultInfoEXT(vk_dev, &c, &fi);
+    VLOG("device lost: %s (%d addresses, %d vendor records; result %d)", fi.description, (int)c.addressInfoCount, (int)c.vendorInfoCount, (int)q);
+    static const char *const kind[] = {"none", "read", "write", "execute", "instruction pointer unknown", "instruction pointer invalid", "instruction pointer fault"};
+    for (uint32_t i = 0; ai && i < c.addressInfoCount; i++)
+        VLOG("device lost: %s at GPU address %#llx (+-%#llx)", ai[i].addressType < 7 ? kind[ai[i].addressType] : "?",
+             (unsigned long long)ai[i].reportedAddress, (unsigned long long)ai[i].addressPrecision);
+    for (uint32_t i = 0; vi && i < c.vendorInfoCount; i++)
+        VLOG("device lost: %s (code %#llx, data %#llx)", vi[i].description, (unsigned long long)vi[i].vendorFaultCode, (unsigned long long)vi[i].vendorFaultData);
+    free(ai); free(vi);
+}
 
 static int create_device(void) {
     /* Every feature the GPU has, except the robustness ones (bounds checks the game does not need, and they cost). */
@@ -110,16 +138,23 @@ static int create_device(void) {
     uint32_t nex = 0; vkEnumerateDeviceExtensionProperties(vk_phys, NULL, &nex, NULL);
     VkExtensionProperties *ex = malloc((nex ? nex : 1) * sizeof *ex); vkEnumerateDeviceExtensionProperties(vk_phys, NULL, &nex, ex);
     int has_div = has_ext(ex, nex, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME), has_budget = has_ext(ex, nex, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    int has_fault = has_ext(ex, nex, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     free(ex);
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dvf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     if (has_div) f13.pNext = &dvf;
     VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
+    VkPhysicalDeviceFaultFeaturesEXT flt = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (has_fault) { flt.pNext = f.pNext; f.pNext = &flt; }
     vkGetPhysicalDeviceFeatures2(vk_phys, &f);
+    flt.deviceFaultVendorBinary = VK_FALSE;
+    g_fault = has_fault && flt.deviceFault;
     vk_divisor = has_div && dvf.vertexAttributeInstanceRateDivisor;
-    const char *dev_ext[NDEV_EXT + 2]; memcpy(dev_ext, DEV_EXT, sizeof DEV_EXT);
+    const char *dev_ext[NDEV_EXT + 3]; memcpy(dev_ext, DEV_EXT, sizeof DEV_EXT);
     uint32_t ndev_ext = NDEV_EXT;
     if (vk_divisor) dev_ext[ndev_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
-    if (has_budget) dev_ext[ndev_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;   /* the 10-second memory line: what the driver says is used and available */
+    if (has_budget) dev_ext[ndev_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
+    if (has_fault) dev_ext[ndev_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;   /* why the device was lost (vk_lost) */
+    VLOG("device fault reports: %s", g_fault ? "on" : has_fault ? "the driver has the extension but not the feature" : "the driver lacks VK_EXT_device_fault");   /* the 10-second memory line: what the driver says is used and available */
     /* TOTK_VK_ROBUST=1 keeps the GPU's bounds checks (diagnosis: AMD turns an out-of-range access into a lost device) */
     { const char *e = pal_getenv("TOTK_VK_ROBUST"); int rob = e && *e == '1';
       if (!rob) { f.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE; }
@@ -176,7 +211,6 @@ void host_on_heap_shrink(void (*fn)(uint64_t lo, uint64_t hi));
 void host_alias_region(uint64_t *base, uint64_t *size);
 int host_alias_run(uint64_t a, uint64_t b, uint64_t lim_lo, uint64_t lim_hi, uint64_t *lo, uint64_t *hi);
 void host_on_alias_unmap(void (*fn)(uint64_t lo, uint64_t hi));
-static uint64_t g_import_bytes, g_import_all;   /* every import alive (pools, windows), for the 10-second line */
 static pidx g_imports;               /* sorted by address, key = import_t * */
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_pool_n, g_import_n;
@@ -279,6 +313,7 @@ static import_t *window_of(const import_t *pool, uintptr_t a, uintptr_t b) { ret
 enum { AW_GRAIN_PAGES = HEAP_GRAIN / 4096, AW_MAX = 1 << 20 };
 static int32_t *g_aw_page[(64ull << 30) / HEAP_GRAIN];   /* alias page -> window number (0 = none) */
 static import_t **g_aw; static int32_t g_aw_n = 1, g_aw_cap;   /* window number -> window (NULL once dropped) */
+static import_t **g_aw_old; static int g_aw_old_n, g_aw_old_cap;   /* windows replaced by larger ones, to free (vk_flush) */
 static int32_t *aw_slot(uint64_t page) {
     uint64_t g = page / AW_GRAIN_PAGES;
     if (g >= sizeof g_aw_page / sizeof *g_aw_page) return NULL;
@@ -296,8 +331,22 @@ static import_t *alias_window(uint64_t a, uint64_t b) {   /* g_pool_mu held */
     if (!w) return NULL;
     if (g_aw_n >= g_aw_cap) { g_aw_cap = g_aw_cap ? g_aw_cap * 2 : 256; g_aw = realloc(g_aw, (size_t)g_aw_cap * sizeof *g_aw); if (!g_aw) die("Vulkan: alias windows"); }
     int32_t id = g_aw_n++; g_aw[id] = w;
-    for (uint64_t p = (lo - base) / 4096; p < (hi - base) / 4096; p++) { int32_t *s = aw_slot(p); if (s) *s = id; }
-    g_win_n++; g_win_bytes += hi - lo;
+    g_win_n++; g_win_bytes += hi - lo; g_aw_live++;
+    /* The game's physical-memory heaps grow by mapping next to what they have, so each new run holds the older
+       windows: those go once the GPU is done with them (vk_flush). Every import alive is named in every submission
+       (1,100 of them on Great Sky Island: 15 ms per submission). */
+    for (uint64_t p = (lo - base) / 4096; p < (hi - base) / 4096; p++) {
+        int32_t *s = aw_slot(p);
+        if (!s) continue;
+        import_t *o = *s && *s != id ? g_aw[*s] : NULL;
+        if (o && o->lo >= lo && o->hi <= hi) {
+            if (g_aw_old_n == g_aw_old_cap && !(g_aw_old = realloc(g_aw_old, (size_t)(g_aw_old_cap = g_aw_old_cap ? g_aw_old_cap * 2 : 64) * sizeof *g_aw_old)))
+                die("Vulkan: alias windows");
+            g_aw_old[g_aw_old_n++] = o; g_aw[*s] = NULL;
+            g_win_n--; g_win_bytes -= o->hi - o->lo; g_aw_live--;
+        }
+        *s = id;
+    }
     { static int n; if (n++ < 4) VLOG("alias memory given to the GPU in windows: %p..%p", (void *)lo, (void *)hi); }
     return w;
 }
@@ -356,7 +405,7 @@ static void alias_unmapping(uint64_t lo, uint64_t hi) {   /* UnmapPhysicalMemory
     if (!w) die("Vulkan: alias windows");
     pthread_mutex_lock(&g_pool_mu);
     for (int32_t i = 1; i < g_aw_n && n < MAXW; i++)
-        if (g_aw[i] && g_aw[i]->lo < hi && g_aw[i]->hi > lo) { w[n++] = g_aw[i]; g_win_n--; g_win_bytes -= g_aw[i]->hi - g_aw[i]->lo; g_aw[i] = NULL; }
+        if (g_aw[i] && g_aw[i]->lo < hi && g_aw[i]->hi > lo) { w[n++] = g_aw[i]; g_win_n--; g_win_bytes -= g_aw[i]->hi - g_aw[i]->lo; g_aw_live--; g_aw[i] = NULL; }
     pthread_mutex_unlock(&g_pool_mu);
     if (n) {
         pthread_mutex_lock(&vk_mu); uint64_t f = vk_flush(NULL, NULL); pthread_mutex_unlock(&vk_mu);
@@ -637,7 +686,7 @@ static void *submit_thread(void *unused) {
             VkResult r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
             atomic_fetch_add(&vk_ns_qsubmit, pal_now_ns() - tq);
             if (n++ < 3) VLOG("submission %llu: %s", (unsigned long long)it->sig[0].value, r == VK_SUCCESS ? "accepted" : "refused");
-            if (r != VK_SUCCESS) die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
+            if (r != VK_SUCCESS) vk_lost(r), die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
         }
         free(it);
         pthread_mutex_lock(&g_q_mu);
@@ -651,7 +700,11 @@ static void *submit_thread(void *unused) {
 uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo *signal) {
     vk_open();
     sub *s = g_cur;
-    VkMemoryBarrier2 hb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+    pthread_mutex_lock(&g_pool_mu);   /* replaced alias windows: freed when this submission is done (it may name them) */
+    for (int i = 0; i < g_aw_old_n; i++) vk_after(free_import, g_aw_old[i]);
+    g_aw_old_n = 0;
+    pthread_mutex_unlock(&g_pool_mu);
+    VkMemoryBarrier2 hb ={VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
                            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
     VkDependencyInfo hd = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &hb};
     vkCmdPipelineBarrier2(s->main, &hd);   /* the CPU reads what the GPU wrote into pool memory once the fence is done */
@@ -685,7 +738,7 @@ static void *done_thread(void *unused) {
         pthread_mutex_unlock(&g_done_mu);
         VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_tl, .pValues = &s->fence};
         VkResult r = vkWaitSemaphores(vk_dev, &wi, UINT64_MAX);
-        if (r != VK_SUCCESS) die("Vulkan: waiting for the GPU failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
+        if (r != VK_SUCCESS) vk_lost(r), die("Vulkan: waiting for the GPU failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
         lat_note(pal_now_ns() - s->t_submit);
         for (int i = 0; i < s->nact; i++) s->acts[i].fn(s->acts[i].arg);
         s->nact = 0;
@@ -788,8 +841,8 @@ static uint64_t submit(const uint64_t *handles, int n) {
     if (now - last >= 10000000000ull) {
         last = now;
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
-        { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu imports alive (%.0f MiB), of them %llu windows (%.0f MiB)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6,
-                                     (unsigned long long)g_import_all, g_import_bytes / 1048576.0, (unsigned long long)g_win_n, g_win_bytes / 1048576.0); vk_ns_hash = 0; }
+        { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu imports alive (%.0f MiB), of them %llu windows (%.0f MiB, %d over physical memory)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6,
+                                     (unsigned long long)g_import_all, g_import_bytes / 1048576.0, (unsigned long long)g_win_n, g_win_bytes / 1048576.0, g_aw_live); vk_ns_hash = 0; }
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
         vk_log_memory();

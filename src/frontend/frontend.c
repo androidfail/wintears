@@ -74,12 +74,13 @@ static void update_pad(void) {
         p.ry = larger(p.ry, -axis(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY)));
     }
     host_input_set_pad(&p);
-    /* the left stick's direction as the game gets it, when it changes (the first 400: a stick that "stays held" on the
-       Steam Deck shows here as a missing return to the middle) */
+    /* the left stick's zone as the game gets it, when it changes (the first 1000: a stick that "stays held" on the
+       Steam Deck shows here as "part way" with no return to the middle) */
     static int last_dir = -1, logged;
-    int dir = abs(p.lx) < 16000 && abs(p.ly) < 16000 ? 0 : abs(p.lx) > abs(p.ly) ? (p.lx > 0 ? 1 : 2) : (p.ly > 0 ? 3 : 4);
-    if (dir != last_dir && logged < 400) {
-        static const char *const names[] = {"middle", "right", "left", "up", "down"};
+    int dir = abs(p.lx) < 4000 && abs(p.ly) < 4000 ? 0 : abs(p.lx) < 16000 && abs(p.ly) < 16000 ? 5
+            : abs(p.lx) > abs(p.ly) ? (p.lx > 0 ? 1 : 2) : (p.ly > 0 ? 3 : 4);
+    if (dir != last_dir && logged < 1000) {
+        static const char *const names[] = {"middle", "right", "left", "up", "down", "part way"};
         LOG("[input] left stick %s (%d, %d) at %.3f s", names[dir], p.lx, p.ly, SDL_GetTicksNS() / 1e9); logged++;
     }
     last_dir = dir;
@@ -100,7 +101,10 @@ void fe_drawable_size(int *w, int *h) { if (!g_win || !SDL_GetWindowSizeInPixels
 static void pad_added(SDL_JoystickID id) {
     for (int i = 0; i < 8; i++) if (!g_pads[i]) {
         g_pads[i] = SDL_OpenGamepad(id);
-        if (g_pads[i]) LOG("[frontend] controller connected: %s", SDL_GetGamepadName(g_pads[i]));
+        if (g_pads[i]) {   /* the path names SDL's input backend (XInput#n, a HID path for raw input / HIDAPI, ...) */
+            const char *path = SDL_GetGamepadPath(g_pads[i]);
+            LOG("[frontend] controller connected: %s (%s)", SDL_GetGamepadName(g_pads[i]), path ? path : "no path");
+        }
         return;
     }
 }

@@ -157,7 +157,7 @@ void vp_do_present(void) {   /* the submission thread, after the frame's blit wa
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .waitSemaphoreInfoCount = 1, .pWaitSemaphoreInfos = &w, .commandBufferInfoCount = 1,
                         .pCommandBufferInfos = &cb, .signalSemaphoreInfoCount = 1, .pSignalSemaphoreInfos = &s};
     r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
-    if (r != VK_SUCCESS) die("Vulkan: vkQueueSubmit2 (present copy) failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
+    if (r != VK_SUCCESS) vk_lost(r), die("Vulkan: vkQueueSubmit2 (present copy) failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &g_drawn[idx],
                            .swapchainCount = 1, .pSwapchains = &g_sc, .pImageIndices = &idx};
     uint64_t tp = pal_now_ns();
