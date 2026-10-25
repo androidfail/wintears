@@ -166,6 +166,10 @@ void nvn_dirty_remove_range(const void *mem) {
 }
 int nvn_dirty_tracked(const void *addr, size_t len) { range_t *r = find((uintptr_t)addr); return r && (uintptr_t)addr + len <= r->end; }
 void nvn_dirty_protect(const void *addr, size_t len) {
+    /* TOTK_DIRTY_PROTECT=0: pages are never made read-only (diagnosis: an AMD driver under Proton may refuse imported
+       memory with read-only pages). Textures then never see later CPU writes. */
+    static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_DIRTY_PROTECT"); on = !(e && *e == '0'); if (!on) LOG("dirty tracking: off (TOTK_DIRTY_PROTECT=0)"); }
+    if (!on) return;
     if (!len || !nvn_dirty_tracked(addr, len)) return;
     range_t *r = find((uintptr_t)addr);
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift, run = 0;

@@ -120,7 +120,10 @@ static int create_device(void) {
     uint32_t ndev_ext = NDEV_EXT;
     if (vk_divisor) dev_ext[ndev_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     if (has_budget) dev_ext[ndev_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;   /* the 10-second memory line: what the driver says is used and available */
-    f.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE;
+    /* TOTK_VK_ROBUST=1 keeps the GPU's bounds checks (diagnosis: AMD turns an out-of-range access into a lost device) */
+    { const char *e = pal_getenv("TOTK_VK_ROBUST"); int rob = e && *e == '1';
+      if (!rob) { f.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE; }
+      VLOG("bounds checks: %s (TOTK_VK_ROBUST)", rob ? "on" : "off"); }
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) { VLOG("the GPU lacks dynamic rendering / synchronization2 / timeline semaphores"); return -1; }
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = vk_qfam, .queueCount = 1, .pQueuePriorities = &prio};
