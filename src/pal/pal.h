@@ -158,7 +158,13 @@ size_t pal_exe_dir(char *out, size_t cap);
 const char *pal_getenv(const char *name);       /* UTF-8; pointer valid until the next call on this thread */
 void pal_debug_write(const char *text);
 /* This process's memory: resident (working set) and private committed bytes. 0 on success. */
-int pal_process_memory(uint64_t *resident, uint64_t *committed);         /* stderr + debugger output */
+int pal_process_memory(uint64_t *resident, uint64_t *committed);
+/* Running under Wine / Proton (the Steam Deck). */
+int pal_under_wine(void);
+/* Access violations seen by the fault handler since the start (each is slow under Wine). */
+uint64_t pal_fault_total(void);
+/* The busiest threads since the last call: "name 87%, name 40%, ..." (percent of one core). */
+void pal_thread_cpu_report(char *out, size_t cap);         /* stderr + debugger output */
 
 #ifdef __cplusplus
 }

@@ -36,6 +36,7 @@ struct vtex {
         struct { uint64_t mem; uint32_t w, h, fmt; } in[8];
     } prov;
     uint64_t stamp, checked_sub, used_sub;
+    uint64_t hash, hashed_sub;   /* content check (no write protection, the Steam Deck): what was uploaded, and when last compared */
     view_ent *views; int nviews, cviews;
 };
 static nvn_hmap g_by_stor = {.klen = sizeof(stor_key)};
@@ -384,6 +385,29 @@ void vt_copy_linear(vtex *e, const tex_t *t, uint32_t level, uint32_t layer0, ui
     free(lin);
 }
 
+/* Content check, used when pages are not write-protected (Wine / Proton; nvn_dirty.c). Textures up to 1 MiB (font
+   atlases, UI) are hashed whole at each submission that uses them; larger ones are sampled (64 bytes of every 4 KiB:
+   a texture the game loads or rewrites changes everywhere) and at most every 8th submission.
+   shortcut: a partial CPU rewrite of a large texture that misses every sampled line is not seen; upgrade to Linux
+   soft-dirty bits (/proc/self/pagemap) if that shows up. */
+int nvn_dirty_protecting(void);
+static uint64_t content_hash(const uint8_t *p, uint64_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n, v;
+    if (n <= (1u << 20)) {
+        uint64_t i = 0;
+        for (; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 29; }
+        for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+        return h;
+    }
+    for (uint64_t at = 0; at + 64 <= n; at += 4096)
+        for (int k = 0; k < 64; k += 8) { memcpy(&v, p + at + k, 8); h = (h ^ v) * 0xff51afd7ed558ccdull; h ^= h >> 29; }
+    return h;
+}
+static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
+    if (t->L.size > (1u << 20) && e->hashed_sub && sub - e->hashed_sub < 8) return 0;
+    e->hashed_sub = sub;
+    return content_hash(t->mem, t->L.size) != e->hash;
+}
 static void upload(vtex *e, const tex_t *t) {
     uint64_t t0 = pal_now_ns();
     g_uploads++; g_upload_bytes += t->L.size; if (e->uploaded) g_reuploads++;
@@ -391,6 +415,7 @@ static void upload(vtex *e, const tex_t *t) {
     e->stamp = nvn_dirty_now();
     snprintf(e->writer, sizeof e->writer, "upload from pool memory (submission %llu)", (unsigned long long)vk_sub_serial());
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* before copying: a write from here on is seen at the next check */
+    if (!nvn_dirty_protecting()) { e->hash = content_hash(t->mem, t->L.size); e->hashed_sub = vk_sub_serial(); }
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     VkCommandBuffer c = vk_pre();
     for (unsigned lv = 0; lv < e->levels; lv++) {
@@ -435,7 +460,7 @@ vtex *vt_get(const tex_t *t) {
       else if (memcmp(held, &e->k, sizeof *held)) *held = e->k; }
     if (e->mirrored && !e->owned && e->checked_sub != sub) {
         e->checked_sub = sub;
-        if (!e->uploaded || nvn_dirty_since(t->mem, (size_t)t->L.size, e->stamp)) upload(e, t);
+        if (!e->uploaded || (nvn_dirty_protecting() ? nvn_dirty_since(t->mem, (size_t)t->L.size, e->stamp) : content_changed(e, t, sub))) upload(e, t);
     }
     return e;
 }

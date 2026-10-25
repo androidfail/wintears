@@ -212,6 +212,8 @@ void pal_flush_icache(const void *addr, size_t size) { FlushInstructionCache(Get
 #define MAX_FAULT_HANDLERS 8
 static struct { pal_fault_fn fn; void *user; } fault_handlers[MAX_FAULT_HANDLERS];
 static volatile LONG fault_count;
+static volatile LONG64 fault_total;
+uint64_t pal_fault_total(void) { return (uint64_t)fault_total; }
 static INIT_ONCE veh_once = INIT_ONCE_STATIC_INIT;
 
 /* pal_win_x64.S */
@@ -220,6 +222,7 @@ extern char pal_guarded_copy_insn[], pal_guarded_copy_fault[];
 static LONG CALLBACK veh(EXCEPTION_POINTERS *e) {
     EXCEPTION_RECORD *r = e->ExceptionRecord;
     if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedIncrement64(&fault_total);
     ULONG_PTR op = r->ExceptionInformation[0];
     int kind = op == 1 ? PAL_FAULT_WRITE : op == 8 ? PAL_FAULT_EXEC : PAL_FAULT_READ;
     uintptr_t addr = (uintptr_t)r->ExceptionInformation[1];
@@ -707,6 +710,57 @@ int pal_tee_stdio(const char *path_utf8) {
     if (!g_tee_thread) return -1;
     atexit(pal_tee_flush);
     return 0;
+}
+
+int pal_under_wine(void) {
+    static int w = -1;
+    if (w < 0) { HMODULE h = GetModuleHandleA("ntdll.dll"); w = h && GetProcAddress(h, "wine_get_version") != NULL; }
+    return w;
+}
+
+#include <tlhelp32.h>
+void pal_thread_cpu_report(char *out, size_t cap) {
+    enum { MAXT = 256 };
+    static struct { DWORD id; uint64_t cpu; } prev[MAXT]; static int nprev; static uint64_t prev_wall;
+    struct { DWORD id; uint64_t cpu, used; char name[48]; } cur[MAXT]; int ncur = 0;
+    uint64_t wall = pal_now_ns();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    out[0] = 0;
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te = {.dwSize = sizeof te};
+    for (BOOL ok = Thread32First(snap, &te); ok && ncur < MAXT; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+        HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!th) continue;
+        FILETIME c, x, k, u;
+        if (GetThreadTimes(th, &c, &x, &k, &u)) {
+            uint64_t t = (((uint64_t)k.dwHighDateTime << 32 | k.dwLowDateTime) + ((uint64_t)u.dwHighDateTime << 32 | u.dwLowDateTime)) * 100;   /* ns */
+            cur[ncur].id = te.th32ThreadID; cur[ncur].cpu = t; cur[ncur].used = t;
+            for (int i = 0; i < nprev; i++) if (prev[i].id == te.th32ThreadID) { cur[ncur].used = t - prev[i].cpu; break; }
+            snprintf(cur[ncur].name, sizeof cur[ncur].name, "%lu", (unsigned long)te.th32ThreadID);
+            typedef HRESULT (WINAPI *gtd_t)(HANDLE, PWSTR *);
+            static gtd_t gtd; static int looked;
+            if (!looked) { looked = 1; gtd = (gtd_t)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription"); }
+            PWSTR d = NULL;
+            if (gtd && SUCCEEDED(gtd(th, &d)) && d) { if (d[0]) WideCharToMultiByte(CP_UTF8, 0, d, -1, cur[ncur].name, sizeof cur[ncur].name, NULL, NULL); LocalFree(d); }
+            ncur++;
+        }
+        CloseHandle(th);
+    }
+    CloseHandle(snap);
+    uint64_t span = prev_wall ? wall - prev_wall : 0;
+    nprev = ncur; for (int i = 0; i < ncur; i++) { prev[i].id = cur[i].id; prev[i].cpu = cur[i].cpu; }
+    prev_wall = wall;
+    if (!span) { snprintf(out, cap, "(first sample)"); return; }
+    size_t at = 0;
+    for (int shown = 0; shown < 10; shown++) {   /* the busiest first */
+        int best = -1;
+        for (int i = 0; i < ncur; i++) if (cur[i].used && (best < 0 || cur[i].used > cur[best].used)) best = i;
+        if (best < 0 || cur[best].used * 100 < span) break;   /* under 1 % */
+        at += (size_t)snprintf(out + at, at < cap ? cap - at : 0, "%s%s %.0f%%", shown ? ", " : "", cur[best].name, cur[best].used * 100.0 / span);
+        cur[best].used = 0;
+        if (at >= cap) break;
+    }
 }
 
 int pal_process_memory(uint64_t *resident, uint64_t *committed) {

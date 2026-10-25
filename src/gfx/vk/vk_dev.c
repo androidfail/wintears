@@ -232,7 +232,7 @@ static void pool_add(const void *mem, uint64_t size) {
         uint64_t hb, hs; host_heap_range(&hb, &hs);
         /* TOTK_IMPORT_HEAP=0: each pool is imported on its own instead of the whole heap at once (diagnosis: Linux GPU
            drivers want an imported range inside one memory mapping; protection changes split the heap's) */
-        static int whole = -1; if (whole < 0) { const char *e = pal_getenv("TOTK_IMPORT_HEAP"); whole = !(e && *e == '0'); if (!whole) VLOG("pools in the heap are imported one by one (TOTK_IMPORT_HEAP=0)"); }
+        static int whole = -1; if (whole < 0) { const char *e = pal_getenv("TOTK_IMPORT_HEAP"); whole = e ? *e != '0' : !pal_under_wine(); if (!whole) VLOG("pools in the heap are imported one by one (%s)", e ? "TOTK_IMPORT_HEAP=0" : "Wine / Proton"); }
         if (whole && a >= hb && b <= hb + hs) im = import_range((uintptr_t)hb, (uintptr_t)(hb + hs));
         if (!im) im = import_range(lo, hi);
         if (!im) VK_ONCE("memory pool %p+%#llx cannot be imported: the GPU does not see it (first case)", mem, (unsigned long long)size);
@@ -534,6 +534,8 @@ static uint64_t submit(const uint64_t *handles, int n) {
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
         vk_log_memory();
+        { static uint64_t lastf; uint64_t f = pal_fault_total(); char cpu[600]; pal_thread_cpu_report(cpu, sizeof cpu);
+          VLOG("cpu (last 10 s, %% of one core): %s; %llu memory faults", cpu, (unsigned long long)(f - lastf)); lastf = f; }
         vd_pcache_save();
         g_sh_bytes = 0; g_sub_max = vk_ns_xlate = vk_ns_pipe = vk_ns_tex = vk_n_pass = vk_n_ubo = vk_n_ubflush = vk_n_barrier = 0;
     }
