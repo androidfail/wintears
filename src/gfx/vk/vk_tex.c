@@ -447,7 +447,15 @@ VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int mode, VkImageV
     if (k.base_layer + k.layers > e->layers) k.layers = e->layers - k.base_layer;
     if (attachment) {
         k.type = e->type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : k.layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : e->type == VK_IMAGE_TYPE_1D ? VK_IMAGE_VIEW_TYPE_1D : VK_IMAGE_VIEW_TYPE_2D;
-        if (e->type == VK_IMAGE_TYPE_3D) { k.base_layer = 0; k.layers = 1; }   /* slices of a 3D target: shortcut, slice 0 only */
+        if (e->type == VK_IMAGE_TYPE_3D) {   /* slices of a 3D target: a 2D array view of them (the image is 2D_ARRAY_COMPATIBLE).
+               Slice 0 only made a colour-grading LUT rendered slice by slice (one target per slice) hold its last slice in
+               slice 0: black graded to bright blue behind every menu. */
+            uint32_t dz = mip(e->d, k.base_level), z0 = v && v->set_layers ? v->min_layer : 0;
+            if (z0 >= dz) z0 = dz - 1;
+            uint32_t nz = v && v->set_layers && v->nlayers ? v->nlayers : dz - z0;
+            if (z0 + nz > dz) nz = dz - z0;
+            k.base_layer = z0; k.layers = nz;
+        }
         for (int i = 0; i < 4; i++) k.swz[i] = VK_COMPONENT_SWIZZLE_IDENTITY;
         k.aspect = e->aspect;
     } else {
