@@ -64,11 +64,17 @@ static void do_counter(void *arg) {
 }
 
 /* ---------- TOTK_PASSLOG=<present>: one line per pass and copy of the submissions between that present and the next */
-static int g_plog = -1; int vk_passlog_on;
+static int g_plog = -1, g_plogs[8], g_nplog; int vk_passlog_on;   /* TOTK_PASSLOG=<present>[,<present>...] (up to 8) */
 uint64_t vk_present_count(void);
 static int plog(void) {
-    if (g_plog < 0) { const char *e = pal_getenv("TOTK_PASSLOG"); g_plog = e ? atoi(e) : 0; }
-    return vk_passlog_on = g_plog && vk_present_count() == (uint64_t)g_plog;
+    if (g_plog < 0) {
+        const char *e = pal_getenv("TOTK_PASSLOG");
+        for (char *q; e && *e && g_nplog < 8; e = *q == ',' ? q + 1 : q) { g_plogs[g_nplog] = (int)strtol(e, &q, 10); if (q == e) break; g_nplog++; }
+        g_plog = g_nplog > 0;
+    }
+    vk_passlog_on = 0;
+    for (int i = 0; i < g_nplog; i++) if (vk_present_count() == (uint64_t)g_plogs[i]) vk_passlog_on = 1;
+    return vk_passlog_on;
 }
 static int g_pass_draws, g_pass_clears;
 /* GPU time of each pass of the logged frame (timestamps) */
@@ -123,27 +129,39 @@ static int texel(VkFormat f, const uint8_t *p, float o[4]) {   /* bytes per texe
 static void pout_log(void *arg) {
     pout *o = arg; double s[4] = {0, 0, 0, 0}; float t[4];
     for (uint32_t i = 0; i < o->n; i++) { texel(o->fmt, o->src + (size_t)i * (size_t)o->bpp, t); for (int c = 0; c < 4; c++) s[c] += t[c]; }
-    VLOG("[pass]   wrote (%s): rgba %.3f %.3f %.3f %.3f", o->what, s[0] / o->n, s[1] / o->n, s[2] / o->n, s[3] / o->n);
+    VLOG("[pass]   (%s): rgba %.3f %.3f %.3f %.3f", o->what, s[0] / o->n, s[1] / o->n, s[2] / o->n, s[3] / o->n);
     free(o);
 }
-static void pass_output_sample(void) {   /* after vkCmdEndRendering */
-    if (!g_pc0.ok) return;
-    g_pc0.ok = 0;
-    float probe[4]; uint8_t z[16] = {0}; int bpp = texel(g_pc0.fmt, z, probe);
-    if (!bpp) { VLOG("[pass]   wrote: format %d not decoded", (int)g_pc0.fmt); return; }
-    uint32_t pw = g_pc0.w < 8 ? g_pc0.w : 8, ph = g_pc0.h < 8 ? g_pc0.h : 8, nr = 0;
+static void sample_image(VkImage img, VkFormat fmt, uint32_t lv, uint32_t layer, uint32_t w, uint32_t h, const char *label) {   /* outside a pass */
+    float probe[4]; uint8_t z[16] = {0}; int bpp = texel(fmt, z, probe);
+    if (!bpp) { VLOG("[pass]   %s: format %d not decoded", label, (int)fmt); return; }
+    uint32_t pw = w < 8 ? w : 8, ph = h < 8 ? h : 8, nr = 0;
     VkBuffer sb; VkDeviceSize so; const uint8_t *p = vk_stage((VkDeviceSize)9 * pw * ph * (uint32_t)bpp, 16, &sb, &so);
     VkBufferImageCopy r[9];
     for (uint32_t gy = 0; gy < 3; gy++) for (uint32_t gx = 0; gx < 3; gx++, nr++)
-        r[nr] = (VkBufferImageCopy){.bufferOffset = so + (VkDeviceSize)nr * pw * ph * (uint32_t)bpp, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, g_pc0.lv, g_pc0.layer, 1},
-            .imageOffset = {(int32_t)((g_pc0.w - pw) * (1 + 2 * gx) / 6), (int32_t)((g_pc0.h - ph) * (1 + 2 * gy) / 6), 0}, .imageExtent = {pw, ph, 1}};
+        r[nr] = (VkBufferImageCopy){.bufferOffset = so + (VkDeviceSize)nr * pw * ph * (uint32_t)bpp, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
+            .imageOffset = {(int32_t)((w - pw) * (1 + 2 * gx) / 6), (int32_t)((h - ph) * (1 + 2 * gy) / 6), 0}, .imageExtent = {pw, ph, 1}};
     vk_barrier(vk_cmd());
-    vkCmdCopyImageToBuffer(vk_cmd(), g_pc0.img, VK_IMAGE_LAYOUT_GENERAL, sb, nr, r);
+    vkCmdCopyImageToBuffer(vk_cmd(), img, VK_IMAGE_LAYOUT_GENERAL, sb, nr, r);
     pout *o = malloc(sizeof *o);
     if (!o) return;
-    o->fmt = g_pc0.fmt; o->src = p; o->n = 9 * pw * ph; o->bpp = bpp;
-    snprintf(o->what, sizeof o->what, "%ux%u format %d", g_pc0.w, g_pc0.h, (int)g_pc0.fmt);
+    o->fmt = fmt; o->src = p; o->n = 9 * pw * ph; o->bpp = bpp;
+    snprintf(o->what, sizeof o->what, "%s %ux%u format %d", label, w, h, (int)fmt);
     vk_after(pout_log, o);   /* staging memory lives until the submission is done */
+}
+/* textures the logged pass sampled: their contents are logged after it (the pass only read them) */
+static struct { VkImage img; VkFormat fmt; uint32_t w, h; } g_samp[32]; static int g_nsamp;
+void vx_note_sampled(VkImage img, VkFormat fmt, uint32_t w, uint32_t h) {
+    if (!vk_passlog_on) return;
+    for (int i = 0; i < g_nsamp; i++) if (g_samp[i].img == img) return;
+    if (g_nsamp < 32) g_samp[g_nsamp++] = (typeof(g_samp[0])){img, fmt, w, h};
+}
+static void pass_output_sample(void) {   /* after vkCmdEndRendering */
+    for (int i = 0; i < g_nsamp; i++) if (!vk_fmt_block_compressed(g_samp[i].fmt)) sample_image(g_samp[i].img, g_samp[i].fmt, 0, 0, g_samp[i].w, g_samp[i].h, "sampled");
+    g_nsamp = 0;
+    if (!g_pc0.ok) return;
+    g_pc0.ok = 0;
+    sample_image(g_pc0.img, g_pc0.fmt, g_pc0.lv, g_pc0.layer, g_pc0.w, g_pc0.h, "wrote");
 }
 
 /* ---------- render passes ---------- */

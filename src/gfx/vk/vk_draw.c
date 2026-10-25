@@ -405,7 +405,8 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                     VkImageView v = e ? vt_view(e, &s.t, s.has_v ? &s.v : NULL, VT_SAMPLED, (VkImageViewType)b->view) : VK_NULL_HANDLE;
                     if (v) d.imageView = v;
                     extern int vk_passlog_on;
-                    if (vk_passlog_on) VLOG("[pass]     tex %ux%ux%u levels %u fmt %#x target %d flags %#x", s.t.d.width, s.t.d.height, s.t.d.depth, s.t.d.levels, s.t.d.format, s.t.d.target, s.t.d.flags);
+                    if (vk_passlog_on) { VLOG("[pass]     tex %ux%ux%u levels %u fmt %#x target %d flags %#x", s.t.d.width, s.t.d.height, s.t.d.depth, s.t.d.levels, s.t.d.format, s.t.d.target, s.t.d.flags);
+                        if (e) { uint32_t w, h, d; vt_size(e, 0, &w, &h, &d); vx_note_sampled(vt_image(e), vt_vkformat(e), w, h); } }
                 }
                 int sid = (int)((b->sreg >= 0 && b->sreg < 128 ? S.samp[st][b->sreg] : h) >> 20) & 0xfff;
                 samp_par sp; if (sid && vt_slot_samp(sid, &sp)) d.sampler = vt_sampler(&sp);
