@@ -37,6 +37,8 @@ enum jit_exception_kind {
 
 typedef struct jit_monitor jit_monitor;   /* the global exclusive monitor for LDXR/STXR, shared by all cores */
 jit_monitor *jit_monitor_create(size_t cores);
+/* Blocks compiled (all cores) and instruction slabs allocated rather than reused, since the start. */
+void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs);
 void jit_monitor_destroy(jit_monitor *m);
 
 typedef struct jit_core jit_core;

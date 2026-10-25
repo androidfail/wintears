@@ -7,11 +7,69 @@
 #include <dynarmic/interface/A64/a64.h>
 #include <dynarmic/interface/A64/config.h>
 #include <dynarmic/interface/exclusive_monitor.h>
+#include "dynarmic/common/memory_pool.h"
+
+#include <cstdlib>
+#include <mutex>
+#include <vector>
 
 #include "pal.h"
 
 using Dynarmic::A64::Vector;
 using VAddr = Dynarmic::A64::VAddr;
+
+/* Dynarmic's IR instruction pool, replaced at link time (this file always links before libdynarmic, so its
+   memory_pool.cpp is never pulled in). Upstream mallocs a fresh 4096-instruction slab (416 KiB) for every block it
+   compiles and frees it after; under Wine / Proton that size is decommitted on free and committed again on the next
+   block, page faults included, and it showed up in the samples of every compiling core on the Steam Deck. Freed slabs
+   are kept here and reused instead. */
+namespace {
+std::mutex g_slab_mu;
+std::vector<std::pair<size_t, char *>> g_slab_spare;
+std::atomic<uint64_t> g_pools{0}, g_slabs_new{0};
+char *slab_take(size_t bytes) {
+    {
+        std::lock_guard<std::mutex> l(g_slab_mu);
+        for (size_t i = g_slab_spare.size(); i-- > 0;)
+            if (g_slab_spare[i].first == bytes) { char *p = g_slab_spare[i].second; g_slab_spare.erase(g_slab_spare.begin() + (std::ptrdiff_t)i); return p; }
+    }
+    g_slabs_new.fetch_add(1, std::memory_order_relaxed);
+    char *p = static_cast<char *>(std::malloc(bytes));
+    if (!p) std::abort();
+    return p;
+}
+void slab_give(char *p, size_t bytes) {
+    if (!p) return;
+    {
+        std::lock_guard<std::mutex> l(g_slab_mu);
+        if (g_slab_spare.size() < 32) { g_slab_spare.emplace_back(bytes, p); return; }
+    }
+    std::free(p);
+}
+}  // namespace
+
+namespace Dynarmic::Common {
+Pool::Pool(size_t object_size, size_t initial_pool_size) : object_size(object_size), slab_size(initial_pool_size) {
+    g_pools.fetch_add(1, std::memory_order_relaxed);
+    AllocateNewSlab();
+}
+Pool::~Pool() {
+    slab_give(current_slab, object_size * slab_size);
+    for (char *s : slabs) slab_give(s, object_size * slab_size);
+}
+void *Pool::Alloc() {
+    if (remaining == 0) { slabs.push_back(current_slab); AllocateNewSlab(); }
+    void *ret = current_ptr;
+    current_ptr += object_size;
+    remaining--;
+    return ret;
+}
+void Pool::AllocateNewSlab() {
+    current_slab = slab_take(object_size * slab_size);
+    current_ptr = current_slab;
+    remaining = slab_size;
+}
+}  // namespace Dynarmic::Common
 
 struct jit_monitor {
     explicit jit_monitor(size_t n) : m(n) {}
@@ -108,6 +166,7 @@ struct jit_core final : Dynarmic::A64::UserCallbacks {
 extern "C" {
 
 jit_monitor *jit_monitor_create(size_t cores) { return new jit_monitor(cores); }
+void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs) { *blocks = g_pools.load(); *new_slabs = g_slabs_new.load(); }
 void jit_monitor_destroy(jit_monitor *m) { delete m; }
 
 jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id) {

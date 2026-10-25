@@ -195,6 +195,12 @@ int main() {
     test_halt_and_undefined(core);
     jit_core_destroy(core);
     jit_monitor_destroy(monitor);
+    {   /* jit.cpp's slab-reusing Dynarmic::Common::Pool is the one linked (not libdynarmic's): it counted the blocks */
+        uint64_t blocks = 0, slabs = 0;
+        jit_compile_stats(&blocks, &slabs);
+        CHECK(blocks > 1);
+        CHECK(slabs < blocks);
+    }
     std::printf("jit_test: %d checks, %d failures\n", checks, failures);
     return failures != 0;
 }

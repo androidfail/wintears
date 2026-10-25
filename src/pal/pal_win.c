@@ -892,6 +892,27 @@ static int rdfile(const char *path, char *buf, int cap) {
     CloseHandle(f); buf[tot] = 0;
     return (int)tot;
 }
+/* This process in Linux's /proc. Through Wine, /proc/self is not always this process (it read as a 17 MiB one on the
+   Steam Deck), so the process is found by name: the largest "wintears..." process. */
+static char g_proc[48];
+static const char *proc_dir(void) {
+    if (g_proc[0]) return g_proc;
+    snprintf(g_proc, sizeof g_proc, "Z:\\proc\\self");
+    WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA("Z:\\proc\\*", &fd); long long best = -1;
+    if (fh == INVALID_HANDLE_VALUE) return g_proc;
+    do {
+        int pid = atoi(fd.cFileName); if (pid <= 0) continue;
+        char path[64], b[1024]; snprintf(path, sizeof path, "Z:\\proc\\%d\\stat", pid);
+        if (rdfile(path, b, sizeof b) <= 0) continue;
+        char *lp = strchr(b, '('), *rp = strrchr(b, ')'); if (!lp || !rp || _strnicmp(lp + 1, "wintears", 8)) continue;
+        int f = 2; long long rss = 0;
+        for (char *q = rp + 1; *q; q++) if (*q == ' ' && ++f == 24) { rss = atoll(q + 1); break; }
+        if (rss > best) { best = rss; snprintf(g_proc, sizeof g_proc, "Z:\\proc\\%d", pid); }
+    } while (FindNextFileA(fh, &fd));
+    FindClose(fh);
+    return g_proc;
+}
+static int rdproc(const char *name, char *buf, int cap) { char path[96]; snprintf(path, sizeof path, "%s\\%s", proc_dir(), name); return rdfile(path, buf, cap); }
 static void chomp(char *s) { size_t n = strlen(s); while (n && (s[n - 1] == '\n' || s[n - 1] == ' ')) s[--n] = 0; }
 static long long field_after(const char *buf, const char *key) {   /* "Key:   123 kB" -> 123 */
     const char *p = strstr(buf, key); if (!p) return -1;
@@ -900,7 +921,7 @@ static long long field_after(const char *buf, const char *key) {   /* "Key:   12
 }
 static void cgroup_dir(char *out, size_t cap) {
     char b[512]; out[0] = 0;
-    if (rdfile("Z:\\proc\\self\\cgroup", b, sizeof b) <= 0) return;
+    if (rdproc("cgroup", b, sizeof b) <= 0) return;
     char *p = strstr(b, "0::"); if (!p) return;
     p += 3; chomp(p); char *nl = strchr(p, '\n'); if (nl) *nl = 0;
     snprintf(out, cap, "Z:\\sys\\fs\\cgroup%s", p);
@@ -910,6 +931,8 @@ static void cgroup_dir(char *out, size_t cap) {
 
 void pal_diag_boot(char *out, size_t cap) {
     size_t at = 0; out[0] = 0;
+    ULONG lfh = 2;   /* also a setting, not only a report: the low-fragmentation heap (Windows' default) */
+    APPEND("low-fragmentation heap %s; ", HeapSetInformation(GetProcessHeap(), HeapCompatibilityInformation, &lfh, sizeof lfh) ? "on" : "refused");
     HMODULE nt = GetModuleHandleA("ntdll.dll");
     typedef const char *(CDECL *wv_t)(void); typedef void (CDECL *wh_t)(const char **, const char **);
     wv_t wv = nt ? (wv_t)(void *)GetProcAddress(nt, "wine_get_version") : NULL, wb = nt ? (wv_t)(void *)GetProcAddress(nt, "wine_get_build_id") : NULL;
@@ -927,6 +950,7 @@ void pal_diag_boot(char *out, size_t cap) {
     for (size_t i = 0; i < sizeof envs / sizeof *envs; i++) { const char *v = getenv(envs[i]); if (v) APPEND(", %s=%.60s", envs[i], v); }
     if (!wv) return;
     char b[8192];
+    APPEND("; linux process %s", proc_dir() + 3);
     if (rdfile("Z:\\proc\\cpuinfo", b, sizeof b) > 0) { char *p = strstr(b, "model name"); if (p) { p = strchr(p, ':'); char *nl = p ? strchr(p, '\n') : NULL; if (nl) *nl = 0; if (p) APPEND("; cpu%s", p + 1); } }
     if (rdfile("Z:\\sys\\devices\\system\\cpu\\cpu0\\cpufreq\\scaling_governor", b, sizeof b) > 0) { chomp(b); APPEND(", governor %s", b); }
     if (rdfile("Z:\\sys\\devices\\system\\cpu\\cpu0\\cpufreq\\scaling_max_freq", b, sizeof b) > 0) APPEND(", max %lld MHz", atoll(b) / 1000);
@@ -938,12 +962,12 @@ void pal_diag_boot(char *out, size_t cap) {
                field_after(b, "SwapTotal") / 1024, field_after(b, "SwapFree") / 1024);
     if (rdfile("Z:\\proc\\sys\\vm\\swappiness", b, sizeof b) > 0) { chomp(b); APPEND(", swappiness %s", b); }
     if (rdfile("Z:\\sys\\kernel\\mm\\transparent_hugepage\\enabled", b, sizeof b) > 0) { chomp(b); APPEND(", THP %s", b); }
-    if (rdfile("Z:\\proc\\self\\stat", b, sizeof b) > 0) {
+    if (rdproc("stat", b, sizeof b) > 0) {
         char *p = strrchr(b, ')'); int f = 2; long long nice = 0;
         for (char *q = p; q && *q; q++) if (*q == ' ' && ++f == 19) { nice = atoll(q + 1); break; }
         APPEND("; nice %lld", nice);
     }
-    if (rdfile("Z:\\proc\\self\\limits", b, sizeof b) > 0) { char *p = strstr(b, "Max realtime priority"); if (p) { char *nl = strchr(p, '\n'); if (nl) *nl = 0; APPEND(", %s", p); } }
+    if (rdproc("limits", b, sizeof b) > 0) { char *p = strstr(b, "Max realtime priority"); if (p) { char *nl = strchr(p, '\n'); if (nl) *nl = 0; APPEND(", %s", p); } }
     char cg[600]; cgroup_dir(cg, sizeof cg);
     if (cg[0]) {
         char path[700]; APPEND("; cgroup %s", cg + 17);
@@ -964,12 +988,12 @@ void pal_linux_report(char *out, size_t cap) {
     struct { int tid; uint64_t cpu, wait, majf; char st, comm[20]; int on; } top[MAXT]; int ntop = 0;
     uint64_t wall = pal_now_ns(), span = pwall ? wall - pwall : 0; pwall = wall;
     uint64_t tcpu = 0, twait = 0, tminf = 0, tmajf = 0; int nst[4] = {0};   /* R S D other */
-    char b[4096], path[96];
-    WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA("Z:\\proc\\self\\task\\*", &fd);
+    char b[4096], path[128], pat[64];
+    WIN32_FIND_DATAA fd; HANDLE fh = (snprintf(pat, sizeof pat, "%s\\task\\*", proc_dir()), FindFirstFileA(pat, &fd));
     if (fh == INVALID_HANDLE_VALUE) { APPEND("no /proc access"); return; }
     do {
         int tid = atoi(fd.cFileName); if (tid <= 0 || ncur >= MAXT) continue;
-        snprintf(path, sizeof path, "Z:\\proc\\self\\task\\%d\\stat", tid);
+        snprintf(path, sizeof path, "%s\\task\\%d\\stat", proc_dir(), tid);
         if (rdfile(path, b, sizeof b) <= 0) continue;
         char *lp = strchr(b, '('), *rp = strrchr(b, ')'); if (!lp || !rp) continue;
         task t = {.tid = tid}; char st = rp[2], comm[20]; int on = -1;
@@ -982,7 +1006,7 @@ void pal_linux_report(char *out, size_t cap) {
             else if (f == 39) { on = atoi(q + 1); break; }
         }
         t.cpu = (ut + sy) * 10000000ull;   /* USER_HZ = 100 */
-        snprintf(path, sizeof path, "Z:\\proc\\self\\task\\%d\\schedstat", tid);
+        snprintf(path, sizeof path, "%s\\task\\%d\\schedstat", proc_dir(), tid);
         if (rdfile(path, b, sizeof b) > 0) { char *e; t.cpu = strtoull(b, &e, 10); t.wait = strtoull(e, NULL, 10); }
         cur[ncur++] = t;
         nst[st == 'R' ? 0 : st == 'S' ? 1 : st == 'D' ? 2 : 3]++;
@@ -1004,7 +1028,7 @@ void pal_linux_report(char *out, size_t cap) {
     for (int shown = 0; shown < 12; shown++) {
         int best = -1; for (int i = 0; i < ntop; i++) if (top[i].tid && (best < 0 || top[i].cpu + top[i].wait > top[best].cpu + top[best].wait)) best = i;
         if (best < 0) break;
-        char wch[64] = ""; snprintf(path, sizeof path, "Z:\\proc\\self\\task\\%d\\wchan", top[best].tid);
+        char wch[64] = ""; snprintf(path, sizeof path, "%s\\task\\%d\\wchan", proc_dir(), top[best].tid);
         if (rdfile(path, wch, sizeof wch) > 0) chomp(wch);
         APPEND(" %s/%d cpu %.0f%% runq %.0f%% %c cpu%d%s%s", top[best].comm, top[best].tid, top[best].cpu * 100.0 / span, top[best].wait * 100.0 / span,
                top[best].st, top[best].on, wch[0] && strcmp(wch, "0") ? " in " : "", wch[0] && strcmp(wch, "0") ? wch : "");
@@ -1042,7 +1066,7 @@ void pal_linux_report(char *out, size_t cap) {
     }
     if (rdfile("Z:\\proc\\meminfo", b, sizeof b) > 0)
         APPEND("; available %lld MiB, swap used %lld MiB", field_after(b, "MemAvailable") / 1024, (field_after(b, "SwapTotal") - field_after(b, "SwapFree")) / 1024);
-    if (rdfile("Z:\\proc\\self\\status", b, sizeof b) > 0)
+    if (rdproc("status", b, sizeof b) > 0)
         APPEND("; this process %lld MiB resident, %lld MiB swapped, %lld switches voluntary / %lld involuntary (main thread)", field_after(b, "VmRSS") / 1024,
                field_after(b, "VmSwap") / 1024, field_after(b, "voluntary_ctxt_switches"), field_after(b, "nonvoluntary_ctxt_switches"));
     char cg[600]; cgroup_dir(cg, sizeof cg);

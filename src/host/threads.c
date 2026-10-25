@@ -393,15 +393,15 @@ static void stab_add(const char *k, void *u) {
     s->e[i].n++; s->total++;
 }
 static void stab_log(stab *s, const char *what, int show) {
-    char out[4096]; size_t at = 0;
+    char out[4096]; size_t at = 0; int part = 0;
     for (int shown = 0; shown < show; shown++) {
         int b = -1; for (int i = 0; i < s->n; i++) if (s->e[i].n && (b < 0 || s->e[i].n > s->e[b].n)) b = i;
-        if (b < 0) break;
-        at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0, "%s%.1f%% %s", shown ? " | " : "", s->e[b].n * 100.0 / s->total, s->e[b].k);
+        if (b < 0 || s->e[b].n * 1000 < (unsigned)s->total) break;   /* under 0.1 % */
+        at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0, "%s%.1f%% %s", at ? " | " : "", s->e[b].n * 100.0 / s->total, s->e[b].k);
         s->e[b].n = 0;
-        if (at >= sizeof out) break;
+        if (at >= 3000) { LOG("%s (%d samples, part %d): %s", what, s->total, part++, out); at = 0; out[0] = 0; }
     }
-    LOG("%s (%d samples): %s", what, s->total, s->total ? out : "-");
+    if (at || !part) LOG("%s (%d samples%s): %s", what, s->total, part ? ", last part" : "", at ? out : "-");
     s->n = 0; s->total = 0;
 }
 static void log_calls(void) {   /* the svcs and host functions guest code spent the most time in */
@@ -416,9 +416,11 @@ static void log_calls(void) {   /* the svcs and host functions guest code spent 
         ns[b] = 0;
         if (at >= sizeof out) break;
     }
-    LOG("[calls] guest code ran %llu times between stops (%llu halts for preemption, %llu WFE waits), %llu calls; most time in: %s",
+    static uint64_t lb, ls; uint64_t b, sl; jit_compile_stats(&b, &sl);
+    LOG("[calls] guest code ran %llu times between stops (%llu halts for preemption, %llu WFE waits), %llu blocks compiled (%llu new slabs), %llu calls; most time in: %s",
         (unsigned long long)atomic_exchange(&g_n_run, 0), (unsigned long long)atomic_exchange(&g_n_stop_halt, 0),
-        (unsigned long long)atomic_exchange(&g_n_stop_wait, 0), (unsigned long long)tn, out);
+        (unsigned long long)atomic_exchange(&g_n_stop_wait, 0), (unsigned long long)(b - lb), (unsigned long long)(sl - ls), (unsigned long long)tn, out);
+    lb = b; ls = sl;
 }
 static void log_threads(void) {   /* every guest thread: priority, what it is doing, its last svc */
     static const char *wk[] = {"", "lock", "condvar", "address", "sync"};
@@ -443,7 +445,7 @@ static void log_threads(void) {   /* every guest thread: priority, what it is do
 static void *sampler(void *unused) {
     (void)unused;
     pal_thread_set_name("sampler");
-    static stab cores, others;
+    static stab cores, others, coarse;
     uint64_t last = pal_now_ns(), last_dump = last; unsigned tick = 0;
     { char b[3000]; pal_linux_report(b, sizeof b); }   /* baselines */
     for (;;) {
@@ -456,7 +458,11 @@ static void *sampler(void *unused) {
             char k[260];
             if (!hs[c]) { stab_add("(core free)", &cores); continue; }
             ids[nids++] = pal_thread_id_of(hs[c]);
-            if (pal_thread_sample(hs[c], k, sizeof k)) stab_add(k, &cores);
+            if (pal_thread_sample(hs[c], k, sizeof k)) {
+                stab_add(k, &cores);
+                char *second = strstr(k, " < "); if (second) second = strstr(second + 3, " < "); if (second) *second = 0;
+                stab_add(k, &coarse);
+            }
         }
         if (tick % 20 == 0) pal_sample_busy_threads(ids, nids, stab_add, &others);   /* 5 times a second */
         uint64_t now = pal_now_ns();
@@ -470,6 +476,7 @@ static void *sampler(void *unused) {
         pal_linux_report(b, sizeof b); LOG("[linux] %s", b);
         pal_exception_report(b, sizeof b); LOG("[exceptions] %s", b);
         if (now - last_dump >= 30000000000ull) { last_dump = now; log_threads(); }
+        if (tick >= 6000) { tick = 0; stab_log(&coarse, "[cores minute] every place the core owners were in the last minute", 600); }
     }
     return NULL;
 }
