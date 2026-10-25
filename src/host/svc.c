@@ -27,6 +27,7 @@ _Noreturn void host_fail(const char *fmt, ...) {
     fputc('\n', stderr);
     fflush(stderr);
     va_end(a);
+    pal_tee_flush();   /* the log file gets the failure too */
     _Exit(1);   /* other guest threads may be running: end the process here */
 }
 

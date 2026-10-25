@@ -143,8 +143,22 @@ static void *boot_thread(void *arg) {
     exit(rc);
 }
 
+/* The run's whole output goes to <profile>/logs/last.log too (the previous run's is kept as previous.log). */
+static void log_to_file(void) {
+    char dir[1100], logs[1200], last[1300], prev[1300];
+    const char *p = pal_getenv("TOTK_PROFILE_DIR");
+    if (p) snprintf(dir, sizeof dir, "%s", p);
+    else if (!pal_user_data_dir("totk", dir, sizeof dir)) return;
+    snprintf(logs, sizeof logs, "%s/logs", dir);
+    if (pal_mkdirs(logs)) return;
+    snprintf(last, sizeof last, "%s/last.log", logs); snprintf(prev, sizeof prev, "%s/previous.log", logs);
+    pal_rename_replace(last, prev);
+    if (pal_tee_stdio(last) == 0) LOG("this run's log: %s", last);
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && !strcmp(argv[1], "boot")) {
+        log_to_file();
         int trace = 0, window = 1;
         for (int i = 3; i < argc; i++) {
             if (!strcmp(argv[i], "--trace")) trace = 1;

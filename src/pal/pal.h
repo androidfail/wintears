@@ -147,6 +147,10 @@ int pal_rename_replace(const char *from, const char *to);   /* atomic replace on
 int pal_path_exists(const char *path_utf8);
 /* %LOCALAPPDATA%\WinTears\<app> (created). Returns the length written, 0 on failure. */
 size_t pal_user_data_dir(const char *app, char *out, size_t cap);
+/* Everything written to stdout / stderr also goes to the file at path (still shown on the console); pal_tee_flush
+   before a process ends without exit handlers (_Exit) so the last lines reach the file. 0 on success. */
+int pal_tee_stdio(const char *path_utf8);
+void pal_tee_flush(void);
 size_t pal_exe_dir(char *out, size_t cap);
 
 /* ---- misc ------------------------------------------------------------------------------------------------------ */

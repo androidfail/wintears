@@ -664,6 +664,50 @@ const char *pal_getenv(const char *name) {
     return buf;
 }
 
+/* ---- the run's log file: stdout and stderr go through a pipe; a thread writes everything both to the console and to
+   the file, so the whole run is in the file once the game closes (or fails) ---- */
+#include <fcntl.h>
+#include <io.h>
+static HANDLE g_tee_console = INVALID_HANDLE_VALUE, g_tee_file = INVALID_HANDLE_VALUE, g_tee_thread;
+static DWORD WINAPI tee_run(LPVOID arg) {
+    HANDLE rd = (HANDLE)arg; char buf[8192]; DWORD n, w;
+    while (ReadFile(rd, buf, sizeof buf, &n, NULL) && n) {
+        if (g_tee_console != INVALID_HANDLE_VALUE) WriteFile(g_tee_console, buf, n, &w, NULL);
+        WriteFile(g_tee_file, buf, n, &w, NULL);
+    }
+    return 0;
+}
+void pal_tee_flush(void) {   /* before the process ends: the pipe is closed and the thread writes what is left */
+    if (!g_tee_thread) return;
+    fflush(stdout); fflush(stderr);
+    _close(1); _close(2);   /* the last write ends of the pipe: the reader sees its end */
+    WaitForSingleObject(g_tee_thread, 3000);
+    FlushFileBuffers(g_tee_file);
+    g_tee_thread = NULL;
+}
+int pal_tee_stdio(const char *path_utf8) {
+    wchar_t *wp = wide(path_utf8);
+    if (!wp) return -1;
+    g_tee_file = CreateFileW(wp, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wp);
+    if (g_tee_file == INVALID_HANDLE_VALUE) return -1;
+    HANDLE con = GetStdHandle(STD_ERROR_HANDLE);
+    if (con && con != INVALID_HANDLE_VALUE) DuplicateHandle(GetCurrentProcess(), con, GetCurrentProcess(), &g_tee_console, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    HANDLE rd, wr;
+    if (!CreatePipe(&rd, &wr, NULL, 1 << 16)) return -1;
+    int fd = _open_osfhandle((intptr_t)wr, _O_WRONLY | _O_BINARY);
+    if (fd < 0) return -1;
+    fflush(stdout); fflush(stderr);
+    if (_dup2(fd, 1) || _dup2(fd, 2)) return -1;
+    _close(fd);
+    SetStdHandle(STD_OUTPUT_HANDLE, (HANDLE)_get_osfhandle(1)); SetStdHandle(STD_ERROR_HANDLE, (HANDLE)_get_osfhandle(2));
+    setvbuf(stdout, NULL, _IONBF, 0); setvbuf(stderr, NULL, _IONBF, 0);
+    g_tee_thread = CreateThread(NULL, 0, tee_run, rd, 0, NULL);
+    if (!g_tee_thread) return -1;
+    atexit(pal_tee_flush);
+    return 0;
+}
+
 void pal_debug_write(const char *text) {
     fputs(text, stderr);
     fflush(stderr);
