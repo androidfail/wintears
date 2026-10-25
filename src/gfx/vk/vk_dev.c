@@ -523,6 +523,11 @@ void vk_log_memory(void) {
 }
 static uint64_t submit(const uint64_t *handles, int n) {
     uint64_t t0 = pal_now_ns();
+    {   /* the sampler profiles this thread while it replays (threads.c, the [replay] line) */
+        extern void *volatile runtime_replay_thread; static unsigned long id; static void *h;
+        if (pal_thread_id() != id) { id = (unsigned long)pal_thread_id(); h = pal_thread_handle_self(); }
+        runtime_replay_thread = h;
+    }
     pthread_mutex_lock(&vk_mu);
     vk_open();
     for (int i = 0; i < n; i++) vx_run((const uint8_t *)(uintptr_t)handles[i]);
@@ -532,6 +537,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
     atomic_store(&g_game_fence, f);
     vt_end_submission();
     pthread_mutex_unlock(&vk_mu);
+    { extern void *volatile runtime_replay_thread; runtime_replay_thread = NULL; }
     uint64_t dt = pal_now_ns() - t0; if (dt > g_sub_max) g_sub_max = dt;
     atomic_fetch_add(&g_sub_ns, dt); atomic_fetch_add(&g_sub_n, 1);
     static uint64_t last; uint64_t now = pal_now_ns();
@@ -539,6 +545,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
     if (now - last >= 10000000000ull) {
         last = now;
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
+        { extern uint64_t vk_ns_hash; VLOG("texture content checks (no write protection): %.0f ms of the replay", vk_ns_hash / 1e6); vk_ns_hash = 0; }
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
         vk_log_memory();

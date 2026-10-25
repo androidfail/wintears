@@ -371,6 +371,7 @@ static void thread_exit(thr_t *t) {
 }
 
 static void *sampler(void *unused);
+void *volatile runtime_replay_thread;   /* set by the Vulkan backend while it replays a submission */
 void threads_init(void) {
     if (pthread_key_create(&g_keythr, NULL)) die("thread key");
     for (int i = 0; i < 8; i++) if (pthread_key_create(&runtime_keys[i], NULL)) die("runtime key");
@@ -445,7 +446,7 @@ static void log_threads(void) {   /* every guest thread: priority, what it is do
 static void *sampler(void *unused) {
     (void)unused;
     pal_thread_set_name("sampler");
-    static stab cores, others, coarse;
+    static stab cores, others, coarse, replay;
     uint64_t last = pal_now_ns(), last_dump = last; unsigned tick = 0;
     { char b[3000]; pal_linux_report(b, sizeof b); }   /* baselines */
     for (;;) {
@@ -465,12 +466,14 @@ static void *sampler(void *unused) {
             }
         }
         if (tick % 20 == 0) pal_sample_busy_threads(ids, nids, stab_add, &others);   /* 5 times a second */
+        { void *r = runtime_replay_thread; char k[260]; if (r && pal_thread_sample(r, k, sizeof k)) stab_add(k, &replay); }
         uint64_t now = pal_now_ns();
         if (now - last < 10000000000ull) continue;
         if (now - last > 13000000000ull) LOG("[cores] the sampler itself was late by %.1f s", (now - last) / 1e9 - 10);
         last = now;
         stab_log(&cores, "[cores] where the core owners are", 16);
         stab_log(&others, "[other threads] where the other busy threads are", 16);
+        stab_log(&replay, "[replay] where the thread replaying a submission is", 30);
         log_calls();
         char b[6000];
         pal_linux_report(b, sizeof b); LOG("[linux] %s", b);

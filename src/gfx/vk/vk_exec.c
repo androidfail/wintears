@@ -241,8 +241,10 @@ static int targets(vtex **col, VkImageView *cv, VkFormat *cf, vtex **dep, VkImag
 /* Before a pass opens (and before a draw builds its descriptor sets): the first passes into a 480x270 RGB10A2 target
    are logged whole, inputs and their writers included (the menus' blue background; diagnostics). */
 void vx_target_log_check(void) {
-    static int seen;   /* the menus' scene snapshot: 1920x1080 RGB10A2 in a virtual pool; the rest of its frame and the next are logged whole */
-    if (g_pass || vk_passlog_on || seen >= 2 || !S.has_rt || S.rt.n < 1 || !S.rt.color[0]) return;
+    static int seen, on = -1;   /* the menus' scene snapshot: 1920x1080 RGB10A2 in a virtual pool; the rest of its frame and the next are logged whole */
+    /* TOTK_MENU_SNAPSHOT=1 only: on by default it froze the Steam Deck for 6-10 s at the save list and the first talk */
+    if (on < 0) { const char *e = pal_getenv("TOTK_MENU_SNAPSHOT"); on = e && *e == '1'; }
+    if (!on || g_pass || vk_passlog_on || seen >= 2 || !S.has_rt || S.rt.n < 1 || !S.rt.color[0]) return;
     const tex_t *t = S.rt.color[0];
     if (t->d.width != 1920 || t->d.height != 1080 || t->d.format != 0x3d || !t->pool || !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return;
     seen++; g_frames_log_to = vk_present_count() + 1; vk_passlog_on = 1;

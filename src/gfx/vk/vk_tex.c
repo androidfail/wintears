@@ -387,14 +387,15 @@ void vt_copy_linear(vtex *e, const tex_t *t, uint32_t level, uint32_t layer0, ui
     free(lin);
 }
 
-/* Content check, used when pages are not write-protected (Wine / Proton; nvn_dirty.c). Hashing every used texture
-   whole at every submission cost the Steam Deck about 25 ms a frame (replay 27 ms per submission against 2.3 on the
-   PC), so the whole hash is kept for the textures where partial rewrites happen and are small: up to 64 KiB, and
-   rewritten ("hot") ones up to 1 MiB (font atlases, UI). Other textures up to 1 MiB are sampled (64 bytes of every
-   4 KiB) at each submission and hashed whole every 16th; larger ones are sampled every 8th submission, or at each
-   one once hot.
-   shortcut: a partial CPU rewrite that misses every sampled line is seen up to 16 submissions late (up to 1 MiB) or
-   not at all (larger); upgrade to Linux soft-dirty bits (/proc/self/pagemap) if that shows up. */
+/* Content check, used when pages are not write-protected (Wine / Proton; nvn_dirty.c). Every texture used by a
+   submission is compared with what was uploaded: whole (a fast four-lane hash) when it is up to 256 KiB or was
+   rewritten lately ("hot": the game's font atlases get glyphs written into them a few at a time, and sampling missed
+   those: blank and clipped dialogue on the Steam Deck); otherwise sampled (64 bytes of every 4 KiB) with a whole
+   hash every 8th submission (every 32nd above 1 MiB), at a phase of its own so that they do not all come at once.
+   A texture stays hot for 64 unchanged checks. vk_ns_hash (the 10-second line) is the time spent here.
+   shortcut: the first partial rewrite of a large, cold texture is seen up to 8 or 32 submissions late; upgrade to
+   Linux soft-dirty bits (/proc/self/pagemap) if that shows up. */
+uint64_t vk_ns_hash;
 int nvn_dirty_protecting(void);
 static uint64_t hash_whole(const uint8_t *p, uint64_t n) {   /* four independent lanes: about four times the speed of one */
     const uint64_t K = 0xff51afd7ed558ccdull;
@@ -414,23 +415,19 @@ static uint64_t hash_sampled(const uint8_t *p, uint64_t n) {
     return h;
 }
 static void content_note(vtex *e, const tex_t *t, uint64_t sub) {   /* at upload */
-    uint64_t n = t->L.size;
-    e->hash = n <= (1u << 20) ? hash_whole(t->mem, n) : 0;
-    e->shash = hash_sampled(t->mem, n);
+    uint64_t t0 = pal_now_ns();
+    e->hash = hash_whole(t->mem, t->L.size);
+    e->shash = hash_sampled(t->mem, t->L.size);
     e->hashed_sub = e->sampled_sub = sub;
+    vk_ns_hash += pal_now_ns() - t0;
 }
 static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
-    const uint8_t *p = t->mem; uint64_t n = t->L.size; int changed;
-    if (n <= (64u << 10) || (e->hot && n <= (1u << 20))) changed = hash_whole(p, n) != e->hash;
-    else if (n > (1u << 20)) {
-        if (!e->hot && sub - e->sampled_sub < 8) return 0;
-        e->sampled_sub = sub;
-        changed = hash_sampled(p, n) != e->shash;
-    } else {
-        changed = hash_sampled(p, n) != e->shash;
-        if (!changed && sub - e->hashed_sub >= 16) { e->hashed_sub = sub; changed = hash_whole(p, n) != e->hash; }
-    }
-    if (changed) e->hot = 1;   /* a texture the game rewrites: from now on compared more closely */
+    uint64_t t0 = pal_now_ns(), n = t->L.size;
+    unsigned every = n > (1u << 20) ? 32 : 8, phase = (unsigned)((uintptr_t)e >> 6);
+    int whole = n <= (256u << 10) || e->hot || (sub + phase) % every == 0;
+    int changed = whole ? hash_whole(t->mem, n) != e->hash : hash_sampled(t->mem, n) != e->shash;
+    if (changed) e->hot = 64; else if (e->hot) e->hot--;
+    vk_ns_hash += pal_now_ns() - t0;
     return changed;
 }
 static void upload(vtex *e, const tex_t *t) {
