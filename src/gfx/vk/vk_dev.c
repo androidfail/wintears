@@ -172,6 +172,11 @@ static int create_device(void) {
    thousand pools alive, more than the allocation limit of some drivers (4096), so pools inside the guest heap share one
    import of the whole heap; other pools (the alias region) get their own. */
 typedef struct { uintptr_t lo, hi; VkDeviceMemory mem; VkBuffer buf; int refs, windowed; } import_t;   /* windowed: see vk_buf */
+void host_on_heap_shrink(void (*fn)(uint64_t lo, uint64_t hi));
+void host_alias_region(uint64_t *base, uint64_t *size);
+int host_alias_run(uint64_t a, uint64_t b, uint64_t lim_lo, uint64_t lim_hi, uint64_t *lo, uint64_t *hi);
+void host_on_alias_unmap(void (*fn)(uint64_t lo, uint64_t hi));
+static uint64_t g_import_bytes, g_import_all;   /* every import alive (pools, windows), for the 10-second line */
 static pidx g_imports;               /* sorted by address, key = import_t * */
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_pool_n, g_import_n;
@@ -222,6 +227,7 @@ static import_t *import_range_in(uintptr_t lo, uintptr_t hi, int listed) {
     if (bind != VK_SUCCESS) { vkFreeMemory(vk_dev, mem, NULL); vkDestroyBuffer(vk_dev, buf, NULL); return import_fail(lo, hi, "bind", (int)bind); }
     import_t *im_ = calloc(1, sizeof *im_);
     *im_ = (import_t){lo, hi, mem, buf, 0};
+    __atomic_add_fetch(&g_import_bytes, hi - lo, __ATOMIC_RELAXED); g_import_all++;
     if (g_nimp_log < 64) g_imp_log[g_nimp_log++] = (typeof(g_imp_log[0])){lo, hi};
     if (!listed) return im_;
     { static int n; if (n++ < 24) VLOG("imported %p..%p (%.1f MiB) for the GPU", (void *)lo, (void *)hi, (hi - lo) / 1048576.0); }
@@ -243,24 +249,69 @@ static import_t *import_range(uintptr_t lo, uintptr_t hi) { return import_range_
 #include "nvn_hmap.h"
 static nvn_hmap g_win = {.klen = 16};   /* {lo, hi} -> import_t *, g_pool_mu */
 static uint64_t g_win_n, g_win_bytes;
-static import_t *window_of(const import_t *pool, uintptr_t a, uintptr_t b) {   /* g_pool_mu held */
-    uintptr_t k[2] = {a & ~(uintptr_t)(WIN_GRAIN - 1), (b + WIN_GRAIN - 1) & ~(uintptr_t)(WIN_GRAIN - 1)};
-    if (k[0] < pool->lo) k[0] = pool->lo;
-    if (k[1] > pool->hi) k[1] = pool->hi;
+static import_t *window_in(uintptr_t rlo, uintptr_t rhi, uintptr_t a, uintptr_t b, uintptr_t grain) {   /* g_pool_mu held */
+    uintptr_t k[2] = {a & ~(grain - 1), (b + grain - 1) & ~(grain - 1)};
+    if (k[0] < rlo) k[0] = rlo;
+    if (k[1] > rhi) k[1] = rhi;
     import_t *w = nvn_hm_get(&g_win, k);
     if (w) return w;
     w = import_range_in(k[0], k[1], 0);
     if (!w) return NULL;
     nvn_hm_put(&g_win, k, w);
     g_win_n++; g_win_bytes += k[1] - k[0];
-    { static int n; if (n++ < 4) VLOG("pool %p..%p (%.0f MiB) given to the GPU in windows: first %p..%p", (void *)pool->lo, (void *)pool->hi,
-                                      (pool->hi - pool->lo) / 1048576.0, (void *)k[0], (void *)k[1]); }
+    { static int n; if (n++ < 4) VLOG("memory %p..%p (%.0f MiB) given to the GPU in windows: first %p..%p", (void *)rlo, (void *)rhi,
+                                      (rhi - rlo) / 1048576.0, (void *)k[0], (void *)k[1]); }
     return w;
 }
-static void windows_drop(uintptr_t lo, uintptr_t hi, import_t **out, int *n, int cap) {   /* g_pool_mu held: take a pool's windows out */
+static import_t *window_of(const import_t *pool, uintptr_t a, uintptr_t b) { return window_in(pool->lo, pool->hi, a, b, WIN_GRAIN); }
+
+/* The guest heap under Wine (TOTK_IMPORT_HEAP=0). RADV names every allocation in every submission and the kernel does
+   a fixed amount of work per imported range at each one: the game keeps thousands of small pools in its heap, one
+   import each, and submissions took 70-100 ms on the Steam Deck even with large pools windowed. Pools in the heap are
+   not imported at all now; the heap is one committed, never protected range, and the GPU is given 16 MiB-aligned
+   windows of it on demand (at most about 130), shared by all pools in them. They go when the heap shrinks below them
+   (host_on_heap_shrink), else with the process. Creating or finalizing a pool in the heap costs nothing then. */
+#define HEAP_GRAIN (16u << 20)
+/* The alias region (MapPhysicalMemory) under Wine, likewise: the game keeps hundreds of small pools there (565 of the
+   597 imports left with heap windows). Only mapped pages may be imported, so a window is the run of mapped pages
+   around the range, within its 16 MiB grain; a page table (per 16 MiB grain, allocated when used) names the window
+   each page was last given to. Windows go before their pages are unmapped (host_on_alias_unmap). */
+enum { AW_GRAIN_PAGES = HEAP_GRAIN / 4096, AW_MAX = 1 << 20 };
+static int32_t *g_aw_page[(64ull << 30) / HEAP_GRAIN];   /* alias page -> window number (0 = none) */
+static import_t **g_aw; static int32_t g_aw_n = 1, g_aw_cap;   /* window number -> window (NULL once dropped) */
+static int32_t *aw_slot(uint64_t page) {
+    uint64_t g = page / AW_GRAIN_PAGES;
+    if (g >= sizeof g_aw_page / sizeof *g_aw_page) return NULL;
+    if (!g_aw_page[g] && !(g_aw_page[g] = calloc(AW_GRAIN_PAGES, sizeof(int32_t)))) die("Vulkan: alias windows");
+    return &g_aw_page[g][page % AW_GRAIN_PAGES];
+}
+static import_t *alias_window(uint64_t a, uint64_t b) {   /* g_pool_mu held */
+    uint64_t base, size; host_alias_region(&base, &size);
+    if (a < base || b > base + size || b <= a) return NULL;
+    int32_t *sa = aw_slot((a - base) / 4096), *sb = aw_slot((b - 1 - base) / 4096);
+    if (sa && sb && *sa && *sa == *sb) { import_t *w = g_aw[*sa]; if (w && a >= w->lo && b <= w->hi) return w; }
+    uint64_t lo, hi;
+    if (!host_alias_run(a, b, a & ~(uint64_t)(HEAP_GRAIN - 1), (b + HEAP_GRAIN - 1) & ~(uint64_t)(HEAP_GRAIN - 1), &lo, &hi)) return NULL;
+    import_t *w = import_range_in((uintptr_t)lo, (uintptr_t)hi, 0);
+    if (!w) return NULL;
+    if (g_aw_n >= g_aw_cap) { g_aw_cap = g_aw_cap ? g_aw_cap * 2 : 256; g_aw = realloc(g_aw, (size_t)g_aw_cap * sizeof *g_aw); if (!g_aw) die("Vulkan: alias windows"); }
+    int32_t id = g_aw_n++; g_aw[id] = w;
+    for (uint64_t p = (lo - base) / 4096; p < (hi - base) / 4096; p++) { int32_t *s = aw_slot(p); if (s) *s = id; }
+    g_win_n++; g_win_bytes += hi - lo;
+    { static int n; if (n++ < 4) VLOG("alias memory given to the GPU in windows: %p..%p", (void *)lo, (void *)hi); }
+    return w;
+}
+static int in_alias(uint64_t a, uint64_t b) { uint64_t base, size; host_alias_region(&base, &size); return a >= base && b <= base + size; }
+static int heap_whole(void) {
+    static int whole = -1;
+    if (whole < 0) { const char *e = pal_getenv("TOTK_IMPORT_HEAP"); whole = e ? *e != '0' : !pal_under_wine();
+                     if (!whole) VLOG("the heap's pools are given to the GPU in 16 MiB windows of the heap (%s)", e ? "TOTK_IMPORT_HEAP=0" : "Wine / Proton"); }
+    return whole;
+}
+static void windows_drop(uintptr_t lo, uintptr_t hi, import_t **out, int *n, int cap, int overlapping) {   /* g_pool_mu held: take windows out */
     for (uint32_t i = 0; i < g_win.cap && *n < cap; i++) {
         import_t *w = g_win.vals ? g_win.vals[i] : NULL;
-        if (!w || w->lo < lo || w->hi > hi) continue;
+        if (!w || (overlapping ? (w->hi <= lo || w->lo >= hi) : (w->lo < lo || w->hi > hi))) continue;
         uintptr_t k[2] = {w->lo, w->hi}; nvn_hm_del(&g_win, k);
         g_win_n--; g_win_bytes -= w->hi - w->lo;
         out[(*n)++] = w; i = (uint32_t)-1;   /* deletion shifts entries: rescan */
@@ -277,8 +328,9 @@ static void pool_add(const void *mem, uint64_t size) {
         uint64_t hb, hs; host_heap_range(&hb, &hs);
         /* TOTK_IMPORT_HEAP=0: each pool is imported on its own instead of the whole heap at once (diagnosis: Linux GPU
            drivers want an imported range inside one memory mapping; protection changes split the heap's) */
-        static int whole = -1; if (whole < 0) { const char *e = pal_getenv("TOTK_IMPORT_HEAP"); whole = e ? *e != '0' : !pal_under_wine(); if (!whole) VLOG("pools in the heap are imported one by one (%s)", e ? "TOTK_IMPORT_HEAP=0" : "Wine / Proton"); }
-        if (whole && a >= hb && b <= hb + hs) im = import_range((uintptr_t)hb, (uintptr_t)(hb + hs));
+        int whole = heap_whole(), in_heap = a >= hb && b <= hb + hs;
+        if (whole && in_heap) im = import_range((uintptr_t)hb, (uintptr_t)(hb + hs));
+        if (!whole && (in_heap || in_alias(a, b))) { g_pool_n++; pthread_mutex_unlock(&g_pool_mu); nvn_dirty_add_range(mem, (size_t)size); return; }   /* heap / alias windows (vk_buf) */
         if (!im && !whole && hi - lo >= WIN_POOL_MIN) {   /* windowed: imported in pieces by vk_buf */
             im = calloc(1, sizeof *im);
             if (!im) die("Vulkan: pool table");
@@ -298,7 +350,34 @@ static void pool_add(const void *mem, uint64_t size) {
 
 int runtime_core_away(void);
 void runtime_core_back(int *away);
-static void free_import(void *arg) { import_t *im = arg; vkDestroyBuffer(vk_dev, im->buf, NULL); vkFreeMemory(vk_dev, im->mem, NULL); free(im); }
+static void free_import(void *arg);
+static void alias_unmapping(uint64_t lo, uint64_t hi) {   /* UnmapPhysicalMemory: the alias windows over [lo, hi) go first */
+    enum { MAXW = 4096 }; import_t **w = malloc(MAXW * sizeof *w); int n = 0;
+    if (!w) die("Vulkan: alias windows");
+    pthread_mutex_lock(&g_pool_mu);
+    for (int32_t i = 1; i < g_aw_n && n < MAXW; i++)
+        if (g_aw[i] && g_aw[i]->lo < hi && g_aw[i]->hi > lo) { w[n++] = g_aw[i]; g_win_n--; g_win_bytes -= g_aw[i]->hi - g_aw[i]->lo; g_aw[i] = NULL; }
+    pthread_mutex_unlock(&g_pool_mu);
+    if (n) {
+        pthread_mutex_lock(&vk_mu); uint64_t f = vk_flush(NULL, NULL); pthread_mutex_unlock(&vk_mu);
+        int away = runtime_core_away(); vk_wait_done(f); runtime_core_back(&away);
+        for (int i = 0; i < n; i++) free_import(w[i]);
+    }
+    free(w);
+}
+static void heap_shrinking(uint64_t lo, uint64_t hi) {   /* SetHeapSize smaller: the windows over [lo, hi) go first */
+    enum { MAXW = 4096 }; import_t **w = malloc(MAXW * sizeof *w); int n = 0;
+    if (!w) die("Vulkan: heap windows");
+    pthread_mutex_lock(&g_pool_mu); windows_drop((uintptr_t)lo, (uintptr_t)hi, w, &n, MAXW, 1); pthread_mutex_unlock(&g_pool_mu);
+    if (n) {
+        pthread_mutex_lock(&vk_mu); uint64_t f = vk_flush(NULL, NULL); pthread_mutex_unlock(&vk_mu);
+        int away = runtime_core_away(); vk_wait_done(f); runtime_core_back(&away);
+        for (int i = 0; i < n; i++) free_import(w[i]);
+    }
+    free(w);
+}
+static void free_import(void *arg) { import_t *im = arg; __atomic_sub_fetch(&g_import_bytes, im->hi - im->lo, __ATOMIC_RELAXED); __atomic_sub_fetch(&g_import_all, 1, __ATOMIC_RELAXED);
+                                     vkDestroyBuffer(vk_dev, im->buf, NULL); vkFreeMemory(vk_dev, im->mem, NULL); free(im); }
 static void pool_del(const void *mem) {
     nvn_dirty_remove_range(mem);
     pthread_mutex_lock(&g_pool_mu);
@@ -322,7 +401,7 @@ static void pool_del(const void *mem) {
         pthread_mutex_unlock(&vk_mu);
         enum { MAXW = 4096 }; import_t **wins = im->windowed ? malloc(MAXW * sizeof *wins) : NULL; int nw = 0;
         if (im->windowed && !wins) die("Vulkan: pool windows");
-        if (im->windowed) { pthread_mutex_lock(&g_pool_mu); windows_drop(lo, hi, wins, &nw, MAXW); pthread_mutex_unlock(&g_pool_mu); }
+        if (im->windowed) { pthread_mutex_lock(&g_pool_mu); windows_drop(lo, hi, wins, &nw, MAXW, 0); pthread_mutex_unlock(&g_pool_mu); }
         /* The import goes before this returns, once the GPU is done with it: the game frees the memory as soon as
            Finalize returns, and RADV puts every allocation in every submission, so a submission in between named
            user pages that were gone and the Steam Deck lost the device (while loading, when pools come and go). */
@@ -372,6 +451,12 @@ int vk_buf(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     const pidx_ent *e = pidx_find(&g_imports, (uintptr_t)addr, len ? len : 1);
     const import_t *im0 = e ? e->buf : NULL;
     if (im0 && im0->windowed) im0 = window_of(im0, (uintptr_t)addr, (uintptr_t)(addr + (len ? len : 1)));
+    if (!e && !heap_whole()) {   /* the heap's windows */
+        uint64_t hb, hs; host_heap_range(&hb, &hs);
+        if (addr >= hb && addr + (len ? len : 1) <= hb + hs) im0 = window_in((uintptr_t)hb, (uintptr_t)(hb + hs), (uintptr_t)addr, (uintptr_t)(addr + (len ? len : 1)), HEAP_GRAIN);
+        else im0 = alias_window(addr, addr + (len ? len : 1));
+        if (im0) { *buf = im0->buf; *off = addr - im0->lo; pthread_mutex_unlock(&g_pool_mu); return 1; }
+    }
     if (im0) { *buf = im0->buf; *off = addr - im0->lo; }
     pthread_mutex_unlock(&g_pool_mu);
     if (e) return im0 != NULL;
@@ -640,6 +725,8 @@ static int init(void) {
     if (pthread_create(&t, NULL, done_thread, NULL)) die("Vulkan: completion thread");
     pthread_detach(t);
     if (pthread_create(&t, NULL, submit_thread, NULL)) die("Vulkan: submission thread");
+    host_on_heap_shrink(heap_shrinking);
+    host_on_alias_unmap(alias_unmapping);
     pthread_detach(t);
     vt_init(); vs_init(); vd_init();
     if (vp_init()) return -1;
@@ -701,7 +788,8 @@ static uint64_t submit(const uint64_t *handles, int n) {
     if (now - last >= 10000000000ull) {
         last = now;
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
-        { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu pool windows (%.0f MiB)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6, (unsigned long long)g_win_n, g_win_bytes / 1048576.0); vk_ns_hash = 0; }
+        { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu imports alive (%.0f MiB), of them %llu windows (%.0f MiB)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6,
+                                     (unsigned long long)g_import_all, g_import_bytes / 1048576.0, (unsigned long long)g_win_n, g_win_bytes / 1048576.0); vk_ns_hash = 0; }
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
         vk_log_memory();

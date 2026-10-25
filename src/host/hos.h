@@ -44,7 +44,14 @@ uint64_t host_return_trap(void);                  /* svc #HOST_RETURN_SVC */
 uint64_t host_main_stack(uint64_t *size);
 uint64_t host_object_page(void);                  /* a guest page for host tokens the game only passes back (vi Display, Layer) */
 void *host_guest_alloc(size_t size);              /* zeroed guest-visible memory for host data the game reads; never freed */
-void host_heap_range(uint64_t *base, uint64_t *size);   /* the guest heap now (SetHeapSize): one committed range */
+void host_heap_range(uint64_t *base, uint64_t *size);
+/* fn(lo, hi) runs before the heap gives back [lo, hi) (SetHeapSize smaller); the GPU backend drops its windows there */
+void host_on_heap_shrink(void (*fn)(uint64_t lo, uint64_t hi));
+/* The alias region (MapPhysicalMemory): its range, the mapped run around [a, b) within [lim_lo, lim_hi) (0 when a page
+   of [a, b) is not mapped), and fn(lo, hi) run before pages there are unmapped. */
+void host_alias_region(uint64_t *base, uint64_t *size);
+int host_alias_run(uint64_t a, uint64_t b, uint64_t lim_lo, uint64_t lim_hi, uint64_t *lo, uint64_t *hi);
+void host_on_alias_unmap(void (*fn)(uint64_t lo, uint64_t hi));   /* the guest heap now (SetHeapSize): one committed range */
 #define HOST_RETURN_SVC 0xfffeu
 
 /* threads.c */

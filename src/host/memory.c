@@ -56,6 +56,27 @@ static unsigned char alias_pages[ALIAS_SIZE_MAX / 4096];
 static unsigned char tls_used[TLS_COUNT];
 
 #define ALIAS_START alias_start
+static void (*g_heap_shrink)(uint64_t lo, uint64_t hi), (*g_alias_unmap)(uint64_t lo, uint64_t hi);
+void host_on_alias_unmap(void (*fn)(uint64_t lo, uint64_t hi)) { g_alias_unmap = fn; }
+void host_alias_region(uint64_t *base, uint64_t *size) { *base = ALIAS_START; *size = alias_size; }
+/* The run of mapped alias pages around [a, b), within [lim_lo, lim_hi): 0 if a page of [a, b) is not mapped. */
+int host_alias_run(uint64_t a, uint64_t b, uint64_t lim_lo, uint64_t lim_hi, uint64_t *lo, uint64_t *hi) {
+    if (a < ALIAS_START || b > alias_start + alias_size || b <= a) return 0;
+    if (lim_lo < ALIAS_START) lim_lo = ALIAS_START;
+    if (lim_hi > alias_start + alias_size) lim_hi = alias_start + alias_size;
+    uint64_t p0 = (a - ALIAS_START) / 4096, p1 = (b - 1 - ALIAS_START) / 4096, q0 = (lim_lo - ALIAS_START) / 4096, q1 = (lim_hi - ALIAS_START) / 4096;
+    pal_mutex_lock(&memory_lock);
+    int ok = 1;
+    for (uint64_t p = p0; ok && p <= p1; p++) ok = alias_pages[p] != 0;
+    if (ok) {
+        while (p0 > q0 && alias_pages[p0 - 1]) p0--;
+        while (p1 + 1 < q1 && alias_pages[p1 + 1]) p1++;
+        *lo = ALIAS_START + p0 * 4096; *hi = ALIAS_START + (p1 + 1) * 4096;
+    }
+    pal_mutex_unlock(&memory_lock);
+    return ok;
+}
+void host_on_heap_shrink(void (*fn)(uint64_t lo, uint64_t hi)) { g_heap_shrink = fn; }
 void host_heap_range(uint64_t *base, uint64_t *size) {
     pal_mutex_lock(&memory_lock); *base = heap; *size = heap_size; pal_mutex_unlock(&memory_lock);
 }
@@ -297,6 +318,9 @@ static uint64_t alias_map(int unmap, uint64_t addr, uint64_t size) {
     if (!unmap) for (uint64_t i = 0; i < count; i++) if (!alias_pages[first + i]) fresh += 4096;
     /* LimitReached (132), which the SDK turns into its recoverable out-of-memory result */
     if (!unmap && fresh + alias_bytes + heap_size + image_bytes() > APP_POOL) { pal_mutex_unlock(&memory_lock); return 0x10801; }
+    if (unmap && g_alias_unmap) {   /* the GPU lets go of these pages first (outside the lock: it waits for the GPU) */
+        pal_mutex_unlock(&memory_lock); g_alias_unmap(addr, addr + size); pal_mutex_lock(&memory_lock);
+    }
     if (unmap) {
         for (unsigned i = 0; i < nstack_maps; i++)
             if (overlaps(addr, size, stack_maps[i].src, stack_maps[i].size)) { pal_mutex_unlock(&memory_lock); return 0xdc01; }
@@ -417,6 +441,7 @@ int memory_svc(unsigned num, uint64_t *r) {
     case 0x01: {   /* SetHeapSize(x1 size) */
         uint64_t size = r[1];
         if (size > HEAP_CAP || size % 0x200000 || size + image_bytes() > APP_POOL) { r[0] = 0xd401; return 1; }
+        if (size < heap_size && g_heap_shrink) g_heap_shrink(heap + size, heap + heap_size);   /* the GPU lets go of it first */
         pal_mutex_lock(&memory_lock);
         if (size > heap_size && pal_commit((uintptr_t)(heap + heap_size), (size_t)(size - heap_size), PAL_PROT_READ | PAL_PROT_WRITE))
             die("commit heap");

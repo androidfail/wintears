@@ -15,13 +15,17 @@ GPU driver accepts. Each rule below cost at least one broken Deck run. Code chec
   - no importing of section views (`CreateFileMapping` / `MapViewOfFile`, shared mappings): the NVN virtual and
     physical pools get device memory in their place (`vk_dev.c`, `standin_make`), which is right only because TOTK's
     physical pools are CPU_NO_ACCESS;
-  - the whole guest heap is not one import (its pages change protection); each pool is imported on its own
-    (`TOTK_IMPORT_HEAP`).
+  - nothing may change the protection of guest heap or alias pages while they can be imported (the windows below
+    rely on it).
 - **The kernel checks every page of every imported range a submission uses, at each `vkQueueSubmit2`** (about 10 ms a
   submission on the Deck, 40 ms on Great Sky Island where the pools cover most of the 2 GiB heap). So:
-  - pools of 8 MiB and more are imported in 1 MiB-aligned windows on demand, around each range the GPU is given
-    (`vk_buf`), so a submission names only the windows its draws use; callers must pass the real length of the range
-    (a window ends near it: no `VK_WHOLE_SIZE` over a lookup of 1 byte);
+  - the cost is per imported range more than per page, and RADV names every allocation in every submission: with
+    one import per pool (thousands of small pools) submissions took 70-100 ms. Pools in the guest heap and in the alias
+    region are not imported at all; the GPU gets 16 MiB windows of those regions on demand (`vk_buf`: heap windows,
+    alias windows over mapped pages only), about 26 imports at the title. They go before the heap shrinks or alias
+    pages are unmapped (`host_on_heap_shrink`, `host_on_alias_unmap`). Other pools of 8 MiB and more get 1 MiB
+    windows of their own. Callers must pass the real length of the range they give the GPU (a window ends near it:
+    no `VK_WHOLE_SIZE` over a lookup of 1 byte);
   - submissions and presents run on their own thread (`vk_dev.c`, submission thread);
   - no device feature that makes RADV put every allocation in every submission is enabled (buffer device address,
     update-after-bind descriptors).
