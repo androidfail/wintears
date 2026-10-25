@@ -39,7 +39,11 @@ extern VkPhysicalDeviceProperties vk_props;
 /* texel buffer views (Vulkan 1.3 texelBufferAlignment): offset alignment in bytes, and whether a texel's own size is enough, for uniform [0] / storage [1] */
 extern uint32_t vk_texel_align[2], vk_texel_single[2];
 extern VkPipelineCache vk_pcache;   /* vk_draw.c: kept in the profile between runs */
-extern int vk_divisor;   /* VK_EXT_vertex_attribute_divisor is enabled: instance divisors above 1 */
+extern int vk_divisor;
+extern int vk_integrated;        /* the GPU shares system RAM */
+extern uint64_t vk_local_heap;   /* bytes of the largest device-local heap */
+void vk_log_memory(void);
+void vt_memory(uint64_t out[4]);   /* image bytes: decoded ASTC, other uploaded, GPU-written, saved by the mip drop */   /* VK_EXT_vertex_attribute_divisor is enabled: instance divisors above 1 */
 extern uint32_t vk_sb_align;   /* storage buffers are bound at their address rounded down to this; the translated shaders add the rest */
 extern VkSurfaceKHR vk_surface;
 

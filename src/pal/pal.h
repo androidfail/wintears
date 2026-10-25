@@ -156,7 +156,9 @@ size_t pal_exe_dir(char *out, size_t cap);
 /* ---- misc ------------------------------------------------------------------------------------------------------ */
 
 const char *pal_getenv(const char *name);       /* UTF-8; pointer valid until the next call on this thread */
-void pal_debug_write(const char *text);         /* stderr + debugger output */
+void pal_debug_write(const char *text);
+/* This process's memory: resident (working set) and private committed bytes. 0 on success. */
+int pal_process_memory(uint64_t *resident, uint64_t *committed);         /* stderr + debugger output */
 
 #ifdef __cplusplus
 }

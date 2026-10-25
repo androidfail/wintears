@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <psapi.h>
 #include <knownfolders.h>
 #include <process.h>
 #include <shlobj.h>
@@ -705,6 +706,13 @@ int pal_tee_stdio(const char *path_utf8) {
     g_tee_thread = CreateThread(NULL, 0, tee_run, rd, 0, NULL);
     if (!g_tee_thread) return -1;
     atexit(pal_tee_flush);
+    return 0;
+}
+
+int pal_process_memory(uint64_t *resident, uint64_t *committed) {
+    PROCESS_MEMORY_COUNTERS_EX m = {.cb = sizeof m};
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m)) return -1;
+    *resident = m.WorkingSetSize; *committed = m.PrivateUsage;
     return 0;
 }
 

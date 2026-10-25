@@ -27,6 +27,8 @@ struct vtex {
     VkImage img; VmaAllocation al; VkFormat fmt; vk_fmt f; VkImageAspectFlags aspect; VkImageCreateFlags flags;
     uint32_t w, h, d, layers, levels, tsize; VkImageType type;   /* tsize: bytes per texel (block) in the image's own format */
     int mirrored, owned, uploaded;
+    unsigned drop;         /* top mip levels left out (TOTK_MIP_DROP): image level l is the game's level l + drop */
+    int kind; uint64_t bytes;   /* the memory line: 0 decoded ASTC, 1 other uploaded, 2 GPU-written; allocation size */
     char writer[128];   /* what last wrote it (diagnostics: the pass log prints it for sampled textures) */
     struct {   /* the write's inputs, so F9 can follow a sampled texture back to its sources (diagnostics) */
         uint64_t present; int ndraws, nsh, nin, ndrop; char drop[96];
@@ -53,6 +55,7 @@ void vt_size(const vtex *e, unsigned level, uint32_t *w, uint32_t *h, uint32_t *
 char vt_writer[96];
 void vt_written(vtex *e) {
     if (!e) return;
+    if (e->drop) VK_ONCE("a texture uploaded without its top mip level is written by the GPU (%s): it may look wrong; TOTK_MIP_DROP=0 avoids it", vt_writer);
     e->owned = 1;
     snprintf(e->writer, sizeof e->writer, "%s (submission %llu)", vt_writer[0] ? vt_writer : "?", (unsigned long long)vk_sub_serial());
     memset(&e->prov, 0, sizeof e->prov);
@@ -214,6 +217,22 @@ static void init_layout(vtex *e) {   /* UNDEFINED -> GENERAL, in the uploads com
     vk_barrier(vk_pre());
 }
 
+/* Large uploaded textures may leave out their top mip level (upstream does this on iPhone, nvn_mtl.m mip_drop_of): a
+   quarter of the memory. The game samples them with normalised coordinates, so a texture one level smaller is drawn from
+   what was its level 1. Only textures uploaded from pool memory, decoded from ASTC (the GPU never renders into those),
+   2D / array / cube, with at least two levels and both sides >= TOTK_MIP_DROP_MIN (512). TOTK_MIP_DROP=0 off, =1 on;
+   default on when the GPU shares system RAM or has under 6 GiB of its own (the Steam Deck, laptops). */
+static uint64_t g_kind_bytes[3], g_drop_saved;
+static unsigned mip_drop_of(const tex_t *t, const vk_fmt *f) {
+    static int on = -1; static unsigned minside;
+    if (on < 0) { const char *e = pal_getenv("TOTK_MIP_DROP"), *m = pal_getenv("TOTK_MIP_DROP_MIN");
+        on = e ? atoi(e) != 0 : vk_integrated || vk_local_heap < (6ull << 30); minside = m ? (unsigned)atoi(m) : 512;
+        VLOG("large decoded ASTC textures leave out their top mip level: %s (both sides >= %u; TOTK_MIP_DROP=0/1)", on ? "on" : "off", minside); }
+    unsigned g = (unsigned)t->d.target;
+    if (!on || f->convert != 3 || !tex_mirrored(t) || t->d.levels < 2 || t->d.width < minside || t->d.height < minside) return 0;
+    return g == NVN_TEXTURE_TARGET_2D || g == NVN_TEXTURE_TARGET_2D_ARRAY || g == NVN_TEXTURE_TARGET_CUBEMAP || g == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
+}
+void vt_memory(uint64_t out[4]) { out[0] = g_kind_bytes[0]; out[1] = g_kind_bytes[1]; out[2] = g_kind_bytes[2]; out[3] = g_drop_saved; }
 static uint64_t g_images, g_image_bytes, g_uploads, g_upload_bytes, g_upload_ns, g_reuploads, g_untracked;
 static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     vtex *e = calloc(1, sizeof *e);
@@ -221,6 +240,7 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     { int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
       e->tsize = f->convert == 1 || f->convert == 3 ? 4 : f->convert == 2 ? (uint32_t)bpb / 3 * 4 : f->convert == 4 ? 8 : (uint32_t)bpb; }
     shape(t, &e->type, &e->w, &e->h, &e->d, &e->layers);
+    if ((e->drop = mip_drop_of(t, f))) { e->w = e->w >> 1 ? e->w >> 1 : 1; e->h = e->h >> 1 ? e->h >> 1 : 1; e->levels -= 1; }
     e->aspect = f->depth || f->stencil ? (f->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (f->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0) : VK_IMAGE_ASPECT_COLOR_BIT;
     if (e->fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) e->aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     VkFormatFeatureFlags ff = features(e->fmt);
@@ -260,6 +280,9 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
         free(e); return NULL;
     }
     e->mirrored = tex_mirrored(t);
+    { VmaAllocationInfo ai; vmaGetAllocationInfo(vk_vma, e->al, &ai); e->bytes = ai.size;
+      e->kind = f->convert == 3 ? 0 : e->mirrored ? 1 : 2; g_kind_bytes[e->kind] += e->bytes;
+      if (e->drop) g_drop_saved += e->bytes * 3; }   /* the left-out level is about three times the rest */
     { static int near;   /* diagnostic: another layout already lives at this memory (the first 12): on hardware both descriptors read the same bytes */
       for (uint32_t i = 0; near < 12 && i < g_by_stor.cap; i++) {
           const vtex *o = g_by_stor.vals[i];
@@ -275,6 +298,7 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
 
 static void destroy(void *arg) {
     vtex *e = arg;
+    g_kind_bytes[e->kind] -= e->bytes; if (e->drop) g_drop_saved -= e->bytes * 3;
     for (int i = 0; i < e->nviews; i++) vkDestroyImageView(vk_dev, e->views[i].v, NULL);
     free(e->views);
     vmaDestroyImage(vk_vma, e->img, e->al);
@@ -347,6 +371,8 @@ static void put_linear(vtex *e, int format, const uint8_t *lin, size_t slice, ui
 int vt_converted(const vtex *e) { return e->f.convert != 0; }
 uint32_t vt_texel_size(const vtex *e) { return e->tsize; }
 void vt_copy_linear(vtex *e, const tex_t *t, uint32_t level, uint32_t layer0, uint32_t layers, VkOffset3D o, VkExtent3D x, const uint8_t *src, size_t row) {
+    if (level < e->drop) return;   /* a left-out level */
+    level -= e->drop;              /* the image's level of the same size */
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     size_t pitch = (size_t)((x.width + bw - 1) / bw) * bpb, rows = (x.height + bh - 1) / bh, slice = pitch * rows;
     uint8_t *lin = malloc(slice * x.depth);
@@ -374,7 +400,7 @@ static void upload(vtex *e, const tex_t *t) {
             size_t n = slice * d;
             uint8_t *lin = malloc(n);
             if (!lin) die("texture upload: %zu bytes", n);
-            if (nvn_deswizzle(&t->d, lv, ly, t->mem, lin, pitch)) {
+            if (nvn_deswizzle(&t->d, lv + e->drop, ly, t->mem, lin, pitch)) {   /* the game's level lv + drop */
                 VK_ONCE("texture %ux%u format %#x target %d flags %#x: layout not supported for upload", t->d.width, t->d.height, t->d.format, t->d.target, t->d.flags);
                 free(lin); goto done;
             }
@@ -448,7 +474,11 @@ VkImageView vt_view(vtex *e, const tex_t *t, const view_t *v, int mode, VkImageV
     if (!vk_fmt_of(format, &f) || (f.vk != e->fmt && (e->f.depth || e->f.stencil || e->f.convert || f.convert || (vk_fmt_block_compressed(e->fmt) && !blockview)))) f = e->f;
     k.f = f.vk; vt_last_vfmt = f.vk;
     k.base_level = v && v->set_levels ? v->base_level : 0;
-    k.levels = attachment ? 1 : v && v->set_levels && v->nlevels ? v->nlevels : e->levels - k.base_level;
+    k.levels = attachment ? 1 : v && v->set_levels && v->nlevels ? v->nlevels : e->levels + e->drop - k.base_level;
+    if (e->drop) {   /* the game's levels -> the image's: the left-out top level reads as the next one */
+        if (k.base_level >= e->drop) k.base_level -= e->drop;
+        else { if (v && v->set_levels && v->nlevels) k.levels = k.levels > e->drop - k.base_level ? k.levels - (e->drop - k.base_level) : 1; else k.levels = e->levels; k.base_level = 0; }
+    }
     k.base_layer = v && v->set_layers ? v->min_layer : 0;
     k.layers = v && v->set_layers && v->nlayers ? v->nlayers : e->layers - k.base_layer;
     if (mode == VT_STORAGE || blockview) k.levels = 1;

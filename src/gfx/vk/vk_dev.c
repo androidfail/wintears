@@ -109,16 +109,17 @@ static int create_device(void) {
     /* instance divisors above 1 (an extension on a 1.3 device): enabled when the GPU has it */
     uint32_t nex = 0; vkEnumerateDeviceExtensionProperties(vk_phys, NULL, &nex, NULL);
     VkExtensionProperties *ex = malloc((nex ? nex : 1) * sizeof *ex); vkEnumerateDeviceExtensionProperties(vk_phys, NULL, &nex, ex);
-    int has_div = has_ext(ex, nex, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+    int has_div = has_ext(ex, nex, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME), has_budget = has_ext(ex, nex, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     free(ex);
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dvf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     if (has_div) f13.pNext = &dvf;
     VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
     vkGetPhysicalDeviceFeatures2(vk_phys, &f);
     vk_divisor = has_div && dvf.vertexAttributeInstanceRateDivisor;
-    const char *dev_ext[NDEV_EXT + 1]; memcpy(dev_ext, DEV_EXT, sizeof DEV_EXT);
+    const char *dev_ext[NDEV_EXT + 2]; memcpy(dev_ext, DEV_EXT, sizeof DEV_EXT);
     uint32_t ndev_ext = NDEV_EXT;
     if (vk_divisor) dev_ext[ndev_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
+    if (has_budget) dev_ext[ndev_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;   /* the 10-second memory line: what the driver says is used and available */
     f.features.robustBufferAccess = VK_FALSE; f13.robustImageAccess = VK_FALSE;
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) { VLOG("the GPU lacks dynamic rendering / synchronization2 / timeline semaphores"); return -1; }
     float prio = 1.0f;
@@ -143,8 +144,15 @@ static int create_device(void) {
          f.features.textureCompressionBC ? "yes" : "no", f.features.textureCompressionASTC_LDR ? "yes" : "no (decoded on upload)");
     VmaVulkanFunctions vf = {.vkGetInstanceProcAddr = vkGetInstanceProcAddr, .vkGetDeviceProcAddr = vkGetDeviceProcAddr};
     VmaAllocatorCreateInfo ai = {.physicalDevice = vk_phys, .device = vk_dev, .instance = vk_inst, .vulkanApiVersion = VK_API_VERSION_1_3,
-                                 .pVulkanFunctions = &vf};
+                                 .pVulkanFunctions = &vf, .flags = has_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0};
     VKC(vmaCreateAllocator(&ai, &vk_vma));
+    /* GPUs that share system memory (the Steam Deck, laptops' integrated GPUs) or have little of their own: textures
+       there cost RAM, so large uploaded textures leave out their top mip level by default (vk_tex.c, TOTK_MIP_DROP). */
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(vk_phys, &mp);
+    for (uint32_t i = 0; i < mp.memoryHeapCount; i++) if ((mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && mp.memoryHeaps[i].size > vk_local_heap) vk_local_heap = mp.memoryHeaps[i].size;
+    vk_integrated = vk_props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+    VLOG("memory: %s GPU, largest device-local heap %.0f MiB, budget reporting %s", vk_integrated ? "integrated (shares system RAM)" : "discrete",
+         vk_local_heap / 1048576.0, has_budget ? "on" : "off");
     return 0;
 }
 
@@ -256,12 +264,13 @@ typedef struct sub {
     VkCommandPool pool; VkCommandBuffer pre, main;
     uint64_t fence, t_submit; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
 } sub;
-#define CHUNK_SIZE (64ull << 20)
+#define CHUNK_SIZE (16ull << 20)   /* staging: larger requests get a chunk of their own size */
 enum { MAX_IN_FLIGHT = 6 };
 static VkSemaphore g_tl;
 static sub *g_cur, *g_free_subs, *g_fly_head, *g_fly_tail;
 static chunk *g_free_chunks;
 static int g_in_flight, g_free_chunk_n;
+static _Atomic uint64_t g_chunk_bytes;   /* staging memory held (the memory line) */
 static uint64_t g_fence, g_done, g_serial;
 static _Atomic uint64_t g_game_fence;
 static pthread_mutex_t g_done_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -344,7 +353,19 @@ static chunk *new_chunk(VkDeviceSize size) {
                                       VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
     VmaAllocationCreateInfo ac = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT, .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
     VmaAllocationInfo info;
-    VKC(vmaCreateBuffer(vk_vma, &bi, &ac, &c->buf, &c->al, &info));
+    VkResult r = vmaCreateBuffer(vk_vma, &bi, &ac, &c->buf, &c->al, &info);
+    if (r != VK_SUCCESS) {   /* out of memory: let every earlier submission finish and hand its chunks back, drop the spare ones, try again */
+        VLOG("staging: %llu MiB not available (%d): waiting for the GPU and freeing spare staging memory", (unsigned long long)(c->size >> 20), (int)r);
+        vk_wait_done(g_fence);
+        pthread_mutex_lock(&g_done_mu);
+        for (chunk *f = g_free_chunks, *nx; f; f = nx) { nx = f->next; vmaDestroyBuffer(vk_vma, f->buf, f->al); atomic_fetch_sub(&g_chunk_bytes, f->size); free(f); }
+        g_free_chunks = NULL; g_free_chunk_n = 0;
+        pthread_mutex_unlock(&g_done_mu);
+        r = vmaCreateBuffer(vk_vma, &bi, &ac, &c->buf, &c->al, &info);
+        if (r != VK_SUCCESS) { ac.usage = VMA_MEMORY_USAGE_AUTO; ac.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT; r = vmaCreateBuffer(vk_vma, &bi, &ac, &c->buf, &c->al, &info); }
+        if (r != VK_SUCCESS) { vk_log_memory(); die("Vulkan: out of memory for %llu MiB of staging (%d); the memory line above says where it went", (unsigned long long)(c->size >> 20), (int)r); }
+    }
+    atomic_fetch_add(&g_chunk_bytes, c->size);
     c->map = info.pMappedData;
     return c;
 }
@@ -403,7 +424,7 @@ static void *done_thread(void *unused) {
         for (chunk *c = s->chunks, *nx; c; c = nx) {
             nx = c->next;
             if (c->size == CHUNK_SIZE && g_free_chunk_n < 4) { c->next = g_free_chunks; g_free_chunks = c; g_free_chunk_n++; }
-            else { vmaDestroyBuffer(vk_vma, c->buf, c->al); free(c); }
+            else { vmaDestroyBuffer(vk_vma, c->buf, c->al); atomic_fetch_sub(&g_chunk_bytes, c->size); free(c); }
         }
         s->chunks = NULL;
         g_fly_head = s->next; if (!g_fly_head) g_fly_tail = NULL;
@@ -455,6 +476,21 @@ uint32_t vk_sb_align = 16;
 uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_ubflush, vk_n_barrier;
 static uint64_t g_sub_max;
 static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;
+/* Where memory goes (every 10 s, and before an out-of-memory failure). */
+int vk_integrated; uint64_t vk_local_heap;
+void vk_log_memory(void) {
+    uint64_t res = 0, com = 0, hb = 0, hs = 0; pal_process_memory(&res, &com); host_heap_range(&hb, &hs);
+    uint64_t img[4]; vt_memory(img);
+    char heaps[512] = ""; size_t at = 0;
+    VmaBudget b[VK_MAX_MEMORY_HEAPS]; vmaGetHeapBudgets(vk_vma, b);
+    VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(vk_phys, &mp);
+    for (uint32_t i = 0; i < mp.memoryHeapCount && at < sizeof heaps - 80; i++)
+        at += (size_t)snprintf(heaps + at, sizeof heaps - at, "%s heap %u%s %.0f/%.0f MiB", i ? "," : "", i, mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " (GPU)" : "",
+                               b[i].usage / 1048576.0, b[i].budget / 1048576.0);
+    VLOG("memory: process %.0f MiB resident, %.0f MiB committed (game heap %.0f MiB); images %.0f MiB (decoded ASTC %.0f, other uploaded %.0f, GPU-written %.0f; %.0f MiB saved by mip drop); staging %.0f MiB; driver:%s",
+         res / 1048576.0, com / 1048576.0, hs / 1048576.0, (img[0] + img[1] + img[2]) / 1048576.0, img[0] / 1048576.0, img[1] / 1048576.0, img[2] / 1048576.0, img[3] / 1048576.0,
+         atomic_load(&g_chunk_bytes) / 1048576.0, heaps);
+}
 static uint64_t submit(const uint64_t *handles, int n) {
     uint64_t t0 = pal_now_ns();
     pthread_mutex_lock(&vk_mu);
@@ -475,6 +511,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
+        vk_log_memory();
         vd_pcache_save();
         g_sh_bytes = 0; g_sub_max = vk_ns_xlate = vk_ns_pipe = vk_ns_tex = vk_n_pass = vk_n_ubo = vk_n_ubflush = vk_n_barrier = 0;
     }
