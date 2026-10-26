@@ -386,6 +386,14 @@ void threads_init(void) {
     g_monitor = jit_monitor_create(NCORE);
     jit_config cfg = {0};
     cfg.fastmem = 1;
+    /* Each core has its own code cache, and a full one is cleared and everything compiled again: on the Steam Deck all
+       three 128 MiB caches filled within minutes and refilling took 4-10 s of CPU per 10 s. Committed as it fills. */
+    { const char *e = pal_getenv("TOTK_JIT_CACHE_MB"); size_t mb = e ? (size_t)atoi(e) : pal_under_wine() ? 384 : 128;
+      if (mb < 32 || mb > 1024) mb = 128;
+      cfg.code_cache_bytes = mb << 20; }
+    { const char *e = pal_getenv("TOTK_JIT_FAST_NAN"); cfg.fast_nan = !e || *e != '0'; }
+    LOG("JIT: %zu MiB code cache per core (TOTK_JIT_CACHE_MB), NaNs %s (TOTK_JIT_FAST_NAN)", cfg.code_cache_bytes >> 20,
+        cfg.fast_nan ? "not bit-exact" : "bit-exact");
     for (int i = 0; i < NCORE; i++) g_jit[i] = jit_core_create(&cfg, g_monitor, (size_t)i);
     { const char *d = pal_getenv("TOTK_DIAG"); g_diag = d && *d == '1'; }
     const char *e = pal_getenv("TOTK_SAMPLE");

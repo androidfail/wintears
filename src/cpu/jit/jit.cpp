@@ -193,6 +193,10 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
        "stlxr wzr, xzr, [x8]" (status register = data register), executed as the store with the status discarded. */
     uc.define_unpredictable_behaviour = true;
     uc.code_cache_size = c->cfg.code_cache_bytes ? c->cfg.code_cache_bytes : 128u << 20;
+    if (c->cfg.fast_nan) {
+        uc.unsafe_optimizations = true;
+        uc.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
+    }
     if (!cfg || cfg->fastmem) {
         uc.fastmem_pointer = uintptr_t{0};     /* identity mapping: host address == guest address */
         uc.fastmem_address_space_bits = 39;

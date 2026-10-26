@@ -49,6 +49,8 @@ typedef struct {
     void *user;
     size_t code_cache_bytes;    /* 0 = 128 MiB */
     int fastmem;                /* 1 = guest loads/stores compile to direct host accesses (default on) */
+    int fast_nan;               /* 1 = NaN results not made bit-exact (dynarmic Unsafe_InaccurateNaN): fewer checks
+                                   after each floating-point instruction; only NaN payloads differ */
 } jit_config;
 
 jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id);
