@@ -503,7 +503,13 @@ static pthread_cond_t g_done_cv = PTHREAD_COND_INITIALIZER;
 
 uint64_t vk_open_fence(void) { return g_fence + 1; }
 uint64_t vk_gpu_done(void) { uint64_t v = 0; vkGetSemaphoreCounterValue(vk_dev, g_tl, &v); return v; }
+/* A barrier asked for at the end of an operation (a pass, a copy, the game's own barrier) is recorded when the next
+   command is (vk_cmd), so that several in a row are one: a pass end followed by the game's barrier made two, about
+   360 full barriers a frame in all, each one draining the GPU. */
+static int g_bar_lazy;
+void vk_barrier_lazy(void) { if (g_cur) g_bar_lazy = 1; }   /* no open submission: the next one starts with a barrier */
 void vk_barrier(VkCommandBuffer c) {
+    if (g_cur && c == g_cur->main) g_bar_lazy = 0;   /* this one covers a pending one */
     vk_n_barrier++;
     VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
         .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -537,7 +543,7 @@ void vk_open(void) {
     vk_barrier(s->main);   /* after this submission's uploads */
     g_cur = s; g_serial++;
 }
-VkCommandBuffer vk_cmd(void) { vk_open(); return g_cur->main; }
+VkCommandBuffer vk_cmd(void) { vk_open(); if (g_bar_lazy) vk_barrier(g_cur->main); return g_cur->main; }
 VkCommandBuffer vk_pre(void) { vk_open(); return g_cur->pre; }
 uint64_t vk_sub_serial(void) { return g_serial; }
 
@@ -664,6 +670,7 @@ static void *submit_thread(void *unused) {
 uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo *signal) {
     vk_open();
     sub *s = g_cur;
+    if (g_bar_lazy) vk_barrier(s->main);
     VkMemoryBarrier2 hb ={VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
                            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
     VkDependencyInfo hd = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &hb};

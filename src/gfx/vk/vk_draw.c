@@ -204,7 +204,7 @@ static const shadow *shadow_make(uint64_t a, uint64_t n) {
     vx_end_pass();
     VkBufferCopy r = {ho, 0, n};
     vkCmdCopyBuffer(vk_cmd(), hb, x->dev, 1, &r);
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
     shadow *keep = malloc(sizeof *keep); *keep = *x; vk_after(shadow_free, keep);
     return x;
 }
@@ -217,14 +217,14 @@ void vd_shadow_retire(uint64_t lo, uint64_t hi) {
         vx_end_pass();
         VkBufferCopy r = {0, g_sh[i].host_off, g_sh[i].hi - g_sh[i].lo};
         vkCmdCopyBuffer(vk_cmd(), g_sh[i].dev, g_sh[i].host, 1, &r);
-        vk_barrier(vk_cmd());
+        vk_barrier_lazy();
         g_sh[i] = g_sh[--g_nsh];   /* its buffer is freed when the submission completes (shadow_make) */
     }
 }
 void vd_shadows_flush(void) {   /* end of the submission, outside a pass: the GPU's writes back into pool memory */
     shadows_now();
     for (int i = 0; i < g_nsh; i++) { VkBufferCopy r = {0, g_sh[i].host_off, g_sh[i].hi - g_sh[i].lo}; vkCmdCopyBuffer(vk_cmd(), g_sh[i].dev, g_sh[i].host, 1, &r); }
-    if (g_nsh) vk_barrier(vk_cmd());
+    if (g_nsh) vk_barrier_lazy();
     g_nsh = 0;
 }
 /* Inline uniform updates without ending the pass (upstream's renaming, nvn_mtl.m mtl_sub_update). The game updates small
@@ -300,13 +300,13 @@ void vd_ub_flush(void) {   /* the logged updates into memory, on the GPU timelin
             if (vk_buf(g_upd[k].lo, un, &db, &dof)) {
                 memcpy(vk_stage(un, 16, &sb, &so), g_upd[k].data, (size_t)un);
                 VkBufferCopy r = {so, dof, un}; vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
-                vk_barrier(vk_cmd());   /* the next update may overlap this one */
+                vk_barrier_lazy();   /* the next update may overlap this one */
             } else vk_after_write(g_upd[k].lo, g_upd[k].data, (size_t)un, 1);   /* not GPU memory: by the CPU after the submission */
         }
         i = j;
     }
     free(s);
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
     uint64_t f = vk_open_fence();
     if (g_ninf + g_nupd > g_cinf) { g_cinf = (g_ninf + g_nupd) * 2; g_inf = realloc(g_inf, (size_t)g_cinf * sizeof *g_inf); }
     for (int i = 0; i < g_nupd; i++) { g_upd[i].fence = f; g_inf[g_ninf++] = g_upd[i]; }
@@ -357,8 +357,18 @@ static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size, int rw) {
 typedef struct { tex_t t; view_t v; int has_v; } slot_tex;
 static int slot_texture(uint64_t handle, slot_tex *o) { return handle && vt_slot_tex((int)(handle & 0xfffff), &o->t, &o->v, &o->has_v); }
 
+/* Reuse within a submission (its descriptor pool lives until it completes): a set with the same layout and contents as
+   one made earlier is used again, without allocating or writing (under Wine each is a call into the Linux driver), and
+   the driver constants (drv_fill, 2.5 KiB a stage and draw) are uploaded again only when they changed. */
+typedef struct { uint64_t key, serial; VkDescriptorSetLayout dsl; VkDescriptorSet set; } ds_ent;
+static ds_ent g_dsc[4096];
+uint64_t g_ds_reused, g_ds_made;
+typedef struct { uint64_t serial; VkBuffer b; VkDeviceSize o; uint8_t bytes[0xA00]; } drv_ent;
+static drv_ent g_drv[2][6];
+static inline uint64_t mix64(uint64_t h, uint64_t v) { h ^= v; h *= 0x100000001b3ull; h ^= h >> 29; h *= 0xff51afd7ed558ccdull; return h; }
+static uint64_t mix_bytes(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; uint64_t v; for (size_t i = 0; i + 8 <= n; i += 8) { memcpy(&v, b + i, 8); h = mix64(h, v); } for (size_t i = n & ~(size_t)7; i < n; i++) h = mix64(h, b[i]); return h; }
 static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
-    VkDescriptorSet set = dset(sh->dsl);
+    VkDescriptorSet set = VK_NULL_HANDLE;   /* made at the end, unless an equal one is there */
     enum { MAXW = 96, MAXI = 512 };
     VkWriteDescriptorSet w[MAXW]; VkDescriptorBufferInfo bi[MAXI]; VkDescriptorImageInfo ii[MAXI]; VkBufferView bv[MAXI];
     int nw = 0, nb = 0, ni = 0, nv = 0;
@@ -380,10 +390,13 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             case RB_SUPPORT: d = (VkDescriptorBufferInfo){g_support, 0, 1392}; break;
             case RB_C1: d = (VkDescriptorBufferInfo){sh->c1_buf, sh->c1_off, 65536}; break;
             case RB_DRV0: case RB_DRV2: {
-                VkBuffer sb; VkDeviceSize so;
-                uint8_t *p = vk_stage(0xA00, vk_props.limits.minUniformBufferOffsetAlignment, &sb, &so);
-                drv_fill(p, b->kind == RB_DRV2 ? 2 : 0, st);
-                d = (VkDescriptorBufferInfo){sb, so, 0xA00};
+                drv_ent *de = &g_drv[b->kind == RB_DRV2][st == 5 ? 2 : st == 1 ? 1 : 0];
+                uint8_t tmp[0xA00]; drv_fill(tmp, b->kind == RB_DRV2 ? 2 : 0, st);
+                if (de->serial != vk_sub_serial() || memcmp(tmp, de->bytes, sizeof tmp)) {
+                    uint8_t *p = vk_stage(0xA00, vk_props.limits.minUniformBufferOffsetAlignment, &de->b, &de->o);
+                    memcpy(p, tmp, sizeof tmp); memcpy(de->bytes, tmp, sizeof tmp); de->serial = vk_sub_serial();
+                }
+                d = (VkDescriptorBufferInfo){de->b, de->o, 0xA00};
                 break;
             }
             case RB_CBUF: if (b->reg >= 0 && b->reg < 16) d = b->type == DT_UBO ? ubo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size) : ssbo_at(S.ubo[st][b->reg].addr, S.ubo[st][b->reg].size, b->rw); break;
@@ -453,7 +466,23 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             x->pImageInfo = &ii[ni]; ni += (int)cnt;
         }
     }
+    uint64_t key = mix64(0x9E3779B97F4A7C15ull, (uint64_t)(uintptr_t)sh->dsl), sr = vk_sub_serial();
+    for (int i = 0; i < nw; i++) {
+        key = mix64(key, (uint64_t)w[i].dstBinding << 32 | (uint64_t)w[i].descriptorType << 16 | w[i].descriptorCount);
+        if (w[i].pBufferInfo) key = mix_bytes(key, w[i].pBufferInfo, w[i].descriptorCount * sizeof *w[i].pBufferInfo);
+        if (w[i].pImageInfo) for (uint32_t k = 0; k < w[i].descriptorCount; k++)   /* by field: the struct has padding */
+            key = mix64(mix64(mix64(key, (uint64_t)(uintptr_t)w[i].pImageInfo[k].sampler), (uint64_t)(uintptr_t)w[i].pImageInfo[k].imageView), (uint64_t)w[i].pImageInfo[k].imageLayout);
+        if (w[i].pTexelBufferView) key = mix_bytes(key, w[i].pTexelBufferView, w[i].descriptorCount * sizeof *w[i].pTexelBufferView);
+    }
+    static int off = -1;   /* TOTK_DS_REUSE=0: a new set at every draw (as before; A/B) */
+    if (off < 0) { const char *e = pal_getenv("TOTK_DS_REUSE"); off = e && *e == '0'; }
+    ds_ent *c = &g_dsc[key % 4096];
+    if (!off && c->serial == sr && c->key == key && c->dsl == sh->dsl && c->set) { g_ds_reused++; return c->set; }
+    set = dset(sh->dsl);
+    for (int i = 0; i < nw; i++) w[i].dstSet = set;
     vkUpdateDescriptorSets(vk_dev, (uint32_t)nw, w, 0, NULL);
+    g_ds_made++;
+    *c = (ds_ent){key, sr, sh->dsl, set};
     return set;
 }
 
@@ -699,6 +728,7 @@ static struct {
     VkViewport v; VkRect2D sc; int cull, front, topo, dt, dw, dcmp, st, rd, dbe; int sop[2][4]; uint32_t cm[2], wm[2], ref[2]; float bias[3], bc[4];
     uint32_t vb_set; vb_t vb[16];
     VkBuffer ib; VkDeviceSize io; VkIndexType it; int ib_set;
+    VkPipelineLayout lay; VkDescriptorSet sets[2]; int nsets;
 } D;
 static uint64_t g_ds_epoch;
 uint64_t g_ds_calls_saved;
@@ -859,7 +889,8 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     VkCommandBuffer c = vk_cmd();
     bind_pipeline(c, p);
     VkDescriptorSet sets[2] = {s0, s1};
-    vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, fs ? 2 : 1, sets, 0, NULL);
+    if (D.lay == lay && D.sets[0] == s0 && D.sets[1] == s1 && D.nsets == (fs ? 2 : 1)) g_ds_calls_saved++;   /* bind_pipeline ran ds_check */
+    else { vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, lay, 0, fs ? 2 : 1, sets, 0, NULL); D.lay = lay; D.sets[0] = s0; D.sets[1] = s1; D.nsets = fs ? 2 : 1; }
     dynamic_state(c, prim);
     vertex_buffers(c, vs);
     int quads = prim == NVN_DRAW_PRIMITIVE_QUADS;
@@ -892,8 +923,8 @@ static void draw_inner(VkCommandBuffer c, const p_draw *dw, const p_draw_idx *di
         bind_index(c, ib, io, isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     }
     vkCmdDrawIndexed(c, (uint32_t)di->count, inst, 0, di->base_vertex, (uint32_t)di->base_instance);
-    if (g_draws % 200000 == 0) VLOG("%llu draws (%llu state calls left out as unchanged), skipped: no program %llu, no shader %llu, no target %llu, no pipeline %llu, index %llu",
-        (unsigned long long)g_draws, (unsigned long long)g_ds_calls_saved, (unsigned long long)g_skipped[0], (unsigned long long)g_skipped[1], (unsigned long long)g_skipped[2],
+    if (g_draws % 200000 == 0) VLOG("%llu draws (%llu state calls left out as unchanged; descriptor sets %llu made, %llu reused), skipped: no program %llu, no shader %llu, no target %llu, no pipeline %llu, index %llu",
+        (unsigned long long)g_draws, (unsigned long long)g_ds_calls_saved, (unsigned long long)g_ds_made, (unsigned long long)g_ds_reused, (unsigned long long)g_skipped[0], (unsigned long long)g_skipped[1], (unsigned long long)g_skipped[2],
         (unsigned long long)g_skipped[3], (unsigned long long)g_skipped[4]);
 }
 
@@ -924,7 +955,7 @@ void vd_dispatch(const p_dispatch *d) {
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, lay, 0, 1, &s0, 0, NULL);
     vkCmdDispatch(c, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
-    vk_barrier(c);
+    vk_barrier_lazy();
 }
 
 /* ---------- pipeline cache ----------

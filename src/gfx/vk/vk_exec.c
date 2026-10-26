@@ -157,7 +157,7 @@ static void sample_image(VkImage img, VkFormat fmt, uint32_t lv, uint32_t layer,
     for (uint32_t gy = 0; gy < 3; gy++) for (uint32_t gx = 0; gx < 3; gx++, nr++)
         r[nr] = (VkBufferImageCopy){.bufferOffset = so + (VkDeviceSize)nr * pw * ph * (uint32_t)bpp, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
             .imageOffset = {(int32_t)((w - pw) * (1 + 2 * gx) / 6), (int32_t)((h - ph) * (1 + 2 * gy) / 6), 0}, .imageExtent = {pw, ph, 1}};
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
     vkCmdCopyImageToBuffer(vk_cmd(), img, VK_IMAGE_LAYOUT_GENERAL, sb, nr, r);
     pout *o = malloc(sizeof *o);
     if (!o) return;
@@ -195,7 +195,7 @@ void vx_end_pass(void) {
         vk_after(ptime_log, t); g_pass_q = UINT32_MAX;
     }
     g_pass_draws = g_pass_clears = 0;
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
     g_pass = 0; memset(g_pass_col, 0, sizeof g_pass_col);
     if (g_tgt_log) { g_tgt_log = 0; plog(); }
 }
@@ -366,13 +366,13 @@ static void copy_b2b(uint64_t src, uint64_t dst, uint64_t n) {
         vk_stage(n, 16, &tb, &to);
         VkBufferCopy a = {so, to, n}, b = {to, dof, n};
         vkCmdCopyBuffer(vk_cmd(), sb, tb, 1, &a);
-        vk_barrier(vk_cmd());
+        vk_barrier_lazy();
         vkCmdCopyBuffer(vk_cmd(), tb, db, 1, &b);
     } else {
         VkBufferCopy r = {so, dof, n};
         vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
     }
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
 }
 static void update_ub(uint64_t dst, const uint8_t *data, uint64_t n) {
     VkBuffer db; VkDeviceSize off;
@@ -391,7 +391,7 @@ static void update_ub(uint64_t dst, const uint8_t *data, uint64_t n) {
     memcpy(vk_stage(n, 16, &sb, &so), data, (size_t)n);
     VkBufferCopy r = {so, off, n};
     vkCmdCopyBuffer(vk_cmd(), sb, db, 1, &r);
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
 }
 
 static unsigned view_level(const view_t *v, int has) { return has && v->set_levels ? v->base_level : 0; }
@@ -433,7 +433,7 @@ static void copy_b2t(const p_copy_b2t *c) {
         VkBufferImageCopy r = {.bufferOffset = so, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
         vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
     }
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
     snprintf(vt_writer, sizeof vt_writer, "buffer-to-texture copy from %#llx", (unsigned long long)c->src); vt_written(e);
 }
 static void copy_t2b(const p_copy_b2t *c) {   /* the T2B record: tex is the source, src the destination address */
@@ -454,7 +454,7 @@ static void copy_t2b(const p_copy_b2t *c) {   /* the T2B record: tex is the sour
     vx_end_pass();
     VkBufferImageCopy r = {.bufferOffset = dof, .bufferRowLength = row_texels(c->tex, S.copy_stride), .imageSubresource = sub, .imageOffset = o, .imageExtent = x};
     vkCmdCopyImageToBuffer(vk_cmd(), vt_image(e), VK_IMAGE_LAYOUT_GENERAL, db, 1, &r);
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
 }
 /* bytes of one texel as a buffer copy sees it (the depth aspect of a depth image: 2 for D16, else 4); *block = texels per block row */
 static int texel_bytes(const vtex *e, const tex_t *t, int *block, int *bh) {
@@ -529,9 +529,9 @@ static void copy_t2t(const p_copy_t2t *c) {
             VkBufferImageCopy out = {.bufferOffset = so2, .imageSubresource = ss, .imageOffset = so, .imageExtent = sx};
             VkBufferImageCopy in = {.bufferOffset = so2, .imageSubresource = ds, .imageOffset = dof, .imageExtent = dx};
             vkCmdCopyImageToBuffer(vk_cmd(), vt_image(s), VK_IMAGE_LAYOUT_GENERAL, sb, 1, &out);
-            vk_barrier(vk_cmd());
+            vk_barrier_lazy();
             vkCmdCopyBufferToImage(vk_cmd(), sb, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &in);
-            vk_barrier(vk_cmd());
+            vk_barrier_lazy();
             snprintf(vt_writer, sizeof vt_writer, "depth copy from NVN format %#x", c->src->d.format); vt_written(d); vt_prov_copy(d, c->src);
             return;
         }
@@ -568,7 +568,7 @@ static void copy_t2t(const p_copy_t2t *c) {
             if (sf && (st = tmp_image(sf, sx.width, sx.height))) {
                 VkImageCopy cp = {ss, so, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, sx};
                 vkCmdCopyImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, st, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-                vk_barrier(vk_cmd());
+                vk_barrier_lazy();
                 simg = st; r.srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 r.srcOffsets[0] = (VkOffset3D){0, 0, 0}; r.srcOffsets[1] = (VkOffset3D){(int32_t)sx.width, (int32_t)sx.height, 1};
             }
@@ -577,13 +577,13 @@ static void copy_t2t(const p_copy_t2t *c) {
                 r.dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
                 r.dstOffsets[0] = (VkOffset3D){d0.x - dof.x, d0.y - dof.y, 0}; r.dstOffsets[1] = (VkOffset3D){d1.x - dof.x, d1.y - dof.y, 1};
                 vkCmdBlitImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, dt, VK_IMAGE_LAYOUT_GENERAL, 1, &r, filt);
-                vk_barrier(vk_cmd());
+                vk_barrier_lazy();
                 VkImageCopy cp = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, ds, dof, dx};
                 vkCmdCopyImage(vk_cmd(), dt, VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
             } else vkCmdBlitImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r, filt);
         } else vkCmdBlitImage(vk_cmd(), simg, VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r, filt);
     }
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
     snprintf(vt_writer, sizeof vt_writer, "texture copy from %ux%u NVN format %#x (%s)", c->src->d.width, c->src->d.height, c->src->d.format, same && !convert ? "bit for bit" : "converted / scaled");
     vt_written(d); vt_prov_copy(d, c->src);
 }
@@ -602,19 +602,19 @@ static void clear_tex(const p_clear_tex *c) {
     if (ti) {   /* encoded in the texture's own format (only the region), then copied bit for bit into the shared image */
         VkImageSubresourceRange tr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vkCmdClearColorImage(vk_cmd(), ti, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &tr);
-        vk_barrier(vk_cmd());
+        vk_barrier_lazy();
         for (uint32_t l = 0; l < sub.layerCount; l++) {
             VkImageCopy cp = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, lv, sub.baseArrayLayer + l, 1}, o, x};
             vkCmdCopyImage(vk_cmd(), ti, VK_IMAGE_LAYOUT_GENERAL, vt_image(e), VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
         }
-        vk_barrier(vk_cmd());
+        vk_barrier_lazy();
         snprintf(vt_writer, sizeof vt_writer, "texture clear (own format) to %08x %08x %08x %08x", v.uint32[0], v.uint32[1], v.uint32[2], v.uint32[3]); vt_written(e);
         return;
     }
     if (o.x || o.y || x.width < w || x.height < h) VK_ONCE("partial texture clear (%ux%u of %ux%u): the whole level is cleared for now", x.width, x.height, w, h);
     VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, lv, 1, sub.baseArrayLayer, sub.layerCount};
     vkCmdClearColorImage(vk_cmd(), vt_image(e), VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
-    vk_barrier(vk_cmd());
+    vk_barrier_lazy();
     snprintf(vt_writer, sizeof vt_writer, "texture clear to %08x %08x %08x %08x", v.uint32[0], v.uint32[1], v.uint32[2], v.uint32[3]); vt_written(e);
 }
 
@@ -679,7 +679,7 @@ void vx_run(const uint8_t *p) {
         case OP_RENDER_COND: { const p_render_cond *rc = (const p_render_cond *)a; uint64_t x, y; memcpy(&x, (const void *)(uintptr_t)rc->addr, 8); memcpy(&y, (const void *)(uintptr_t)(rc->addr + 16), 8);
             S.render_disabled = !cond_eval(rc);
             snprintf(g_off_why, sizeof g_off_why, "rendering off (conditional mode %d: counters %#llx %#llx at %#llx, read on the CPU)", (int)rc->mode, (unsigned long long)x, (unsigned long long)y, (unsigned long long)rc->addr); break; }
-        case OP_BARRIER: vx_end_pass(); vk_barrier(vk_cmd()); break;
+        case OP_BARRIER: vx_end_pass(); vk_barrier_lazy(); break;
         case OP_DRAW: if (!S.render_disabled) vd_draw((const p_draw *)a, NULL); else vd_note_drop(g_off_why); break;
         case OP_DRAW_IDX: if (!S.render_disabled) vd_draw(NULL, (const p_draw_idx *)a); else vd_note_drop(g_off_why); break;
         case OP_DISPATCH: vd_dispatch((const p_dispatch *)a); break;

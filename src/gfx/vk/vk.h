@@ -68,6 +68,7 @@ void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *
 void vk_after(void (*fn)(void *arg), void *arg);
 void vk_wait_done(uint64_t fence);   /* the CPU-side effects up to fence have run too */
 void vk_lost(int r);
+void vk_barrier_lazy(void);   /* a full barrier before the next command recorded through vk_cmd (several in a row: one) */
 /* VMA usage for what the GPU reads and writes: its own memory, or shared memory on an integrated GPU whose own heap is
    under 1 GiB (a laptop's 256 MiB carve-out filled up and allocations failed; TOTK_PREFER_HOST=1 forces it) */
 VmaMemoryUsage vk_prefer_device(void);   /* VK_ERROR_DEVICE_LOST: logs what the driver says went wrong (then the caller dies) */
