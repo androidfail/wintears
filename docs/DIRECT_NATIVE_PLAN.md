@@ -88,7 +88,7 @@ Alternatives considered:
 
 | Phase | Work | Exit | Estimate |
 |---|---|---|---|
-| 0. Measure | Deck and PC profile: time in guest code, JIT compiling, host. Code sizes, function count, indirect branches | go / no-go with numbers | 1 week |
+| 0. Measure | Deck and PC profile: time in guest code, JIT compiling, host. Code sizes, function count, indirect branches | **done 2026-10-26: go** | 1 week |
 | 1. Recompiler skeleton | dynarmic front end → C for integer and memory instructions; function discovery; subsdk0 compiles and links | a DLL that loads | 3–4 weeks |
 | 2. Hybrid mode | dispatcher, JIT fallback, svc / system registers / exclusives, thread polling | title screen in hybrid, miss log | 3–4 weeks |
 | 3. Full instruction set | FP and NEON helpers; differential tests over every function | all functions pass | 4–6 weeks |
@@ -144,11 +144,30 @@ bursts and about 220 MiB of memory, not raise the frame rate. The decision rests
 slower, Wine makes JIT memory handling dearer, and an earlier Deck log (commit `9f7a9c4`) showed the cores inside
 guest code for 2–3 cores' worth of wall time.
 
-### Run-time split (Steam Deck run still needed)
+### Steam Deck run (2026-10-26, Proton, about 6.5 minutes of the user's own play, `TOTK_DIAG=1`)
+
+- 12–30 fps; the slow stretches (11.8, 13.0, 14.2 fps) are the windows where the cores were busiest.
+- **Guest code took 43% of the three cores' time** (498 of 1,148 core-s after start-up; PC: 12%). JIT compiling was
+  6.2% of it (71 s), guest code alone 37%. In the busiest windows the cores were free only 19% of the time.
+- **Start-up:** 16.6 s of compiling in the first window, then 8.5 s and 4.0 s.
+- **The code caches fill up and start over.** All three 128 MiB caches reached 127/128 MiB. After that, compiling
+  kept coming back in bursts of 4–10 s per 10 s (95,000–219,000 blocks each), 2.2 million blocks in all: dynarmic
+  clears a full cache and compiles everything again.
+- **JIT code caches resident:** about 380 MiB.
+
+### Decision: go
+
+On the Deck, guest code is the largest use of the CPU and the frame rate falls when the cores are full. Direct Native
+removes the compiling outright (6% of the cores, in bursts that line up with stutter) and the 380 MiB of caches, and
+compiled C should run the guest code itself faster than the JIT's block-at-a-time code. Phase 1 starts next.
+
+Found on the way, worth doing now without waiting for Direct Native: a larger JIT code cache (or one that evicts
+part instead of clearing all) would stop the refill bursts on the Deck.
+
+### Run-time split (how it is measured)
 
 The 10-second `waits` line (with `TOTK_DIAG=1`) now also shows **JIT compiling** time and blocks, next to the core-time
-split "guest code (compiling included) / free / handing over / svcs and host calls". Wanted: about 5 minutes of play
-on the PC and on the Steam Deck, title screen and the Great Sky Island, with `TOTK_DIAG=1`. Go / no-go from those:
+split "guest code (compiling included) / free / handing over / svcs and host calls". The go / no-go rule used:
 
 - **Go** if JIT compiling plus guest code is a large share of the cores' busy time on the Deck, or compiling shows up
   as stutter (long 10-second windows with high compile time).
