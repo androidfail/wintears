@@ -2,7 +2,8 @@
 
     python tools/recomp/build_native.py <TOTK_win> [main subsdk0 sdk] [--jobs N] [--keep]
 
-For each module: build/wt_recomp emits C into <TOTK_win>/native/<module>/, gcc -O1 compiles it in parallel (a file
+For each module: build/wt_recomp emits C into <TOTK_win>/native/<module>/, gcc -O1 compiles it (-ffp-contract=off: no
+fused multiply-add the ARM code did not ask for; x86-64-v3: AVX2 and FMA, which the Deck, laptop and PC have) in parallel (a file
 gcc crashes on is retried: MSYS2 GCC sometimes crashes at random), and the objects are linked into
 <TOTK_win>/native/totk_<module>.dll. The C and objects are derived from the game: they stay in that folder and are
 deleted after linking unless --keep. Run the game with TOTK_NATIVE=1 to use the DLLs.
@@ -14,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 
 def compile_one(src, obj, inc):
     for attempt in range(8):
-        r = subprocess.run(['gcc', '-O1', '-w', '--param=min-pagesize=0', '-c', '-I', inc, src, '-o', obj], capture_output=True, text=True)
+        r = subprocess.run(['gcc', '-O1', '-w', '--param=min-pagesize=0', '-ffp-contract=off', '-march=x86-64-v3', '-c', '-I', inc, src, '-o', obj], capture_output=True, text=True)
         if r.returncode == 0: return None
         if 'internal compiler error' not in r.stderr and 'Segmentation fault' not in r.stderr: break
         time.sleep(1 + attempt)

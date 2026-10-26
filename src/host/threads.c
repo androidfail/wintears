@@ -73,6 +73,7 @@ static void G_lock(void) {
     uint64_t t0 = pal_now_ns(); pthread_mutex_lock(&G);
     atomic_fetch_add(&g_ns_lock, pal_now_ns() - t0); atomic_fetch_add(&g_n_lock_slow, 1);
 }
+static jit_core *g_jit[NCORE];   /* the virtual cores (defined below) */
 void runtime_wait_report(char *out, size_t cap) {
     static uint64_t last; uint64_t now = pal_now_ns(), span = last ? now - last : 0; last = now;
     double fr = atomic_exchange(&g_ns_free, 0) / 1e6, ho = atomic_exchange(&g_ns_handoff, 0) / 1e6, jt = atomic_exchange(&g_ns_jit, 0) / 1e6, all = 3 * span / 1e6;
@@ -84,6 +85,15 @@ void runtime_wait_report(char *out, size_t cap) {
              atomic_exchange(&g_ns_lock, 0) / 1e6, (unsigned long long)atomic_exchange(&g_n_lock_slow, 0), atomic_exchange(&g_ns_core, 0) / 1e6,
              (unsigned long long)atomic_exchange(&g_n_core_wait, 0), (unsigned long long)atomic_exchange(&g_n_preempt, 0),
              atomic_exchange(&g_ns_block, 0) / 1e6, (unsigned long long)atomic_exchange(&g_n_block, 0), cm, (unsigned long long)nb, all, jt, fr, ho, all - jt - fr - ho);
+    static uint64_t ln, lm, lf; uint64_t tn = 0, tm = 0, tf = 0, fp = 0;   /* Direct Native hybrid mode */
+    for (int i = 0; i < NCORE; i++) { uint64_t a, b2, f, l; jit_native_stats(g_jit[i], &a, &b2, &f, &l); tn += a; tm += b2; tf += f; if (l) fp = l; }
+    if (tn + tm > ln + lm) {
+        size_t at = strlen(out);
+        snprintf(out + at, at < cap ? cap - at : 0, "; recompiled blocks run %llu, given to the JIT %llu (%.1f%%), with FPCR != 0 %llu (last %#llx)",
+                 (unsigned long long)(tn - ln), (unsigned long long)(tm - lm), 100.0 * (tm - lm) / (double)(tn - ln + tm - lm),
+                 (unsigned long long)(tf - lf), (unsigned long long)fp);
+    }
+    ln = tn; lm = tm; lf = tf;
 }
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];

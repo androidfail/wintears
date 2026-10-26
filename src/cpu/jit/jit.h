@@ -57,6 +57,9 @@ typedef struct {
    made for main, subsdk0 and sdk at bases[0..2]. Returns the blocks loaded (0: JIT only; err says why when a DLL was
    refused). Call before jit_core_create: cores made afterwards run those blocks and give dynarmic the rest. */
 size_t jit_native_load(const char *dir, const uint64_t bases[3], char *err, size_t cap);
+/* Hybrid mode counts since the start: blocks run recompiled, blocks given to dynarmic, blocks seen with FPCR != 0
+   (recompiled blocks assume 0) and the last such FPCR. */
+void jit_native_stats(jit_core *c, uint64_t *native, uint64_t *missed, uint64_t *fpcr_other, uint64_t *last_fpcr);
 jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id);
 void jit_core_destroy(jit_core *c);
 

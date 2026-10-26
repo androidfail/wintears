@@ -18,6 +18,7 @@
 
 #include <array>
 #include <string>
+#include <xmmintrin.h>
 
 using Dynarmic::A64::Vector;
 
@@ -145,6 +146,7 @@ struct jit_core final : Dynarmic::A64::UserCallbacks {
     bool hybrid = false;         /* recompiled blocks loaded: the guest state lives in nc, dynarmic gets it per missed block */
     wt_ctx nc{};
     volatile int halt_req = 0;
+    uint64_t n_native = 0, n_missed = 0, n_fpcr = 0, last_fpcr = 0;   /* blocks run (read racily for the log) */
 
     std::uint8_t MemoryRead8(VAddr a) override { return load<uint8_t>(a); }
     std::uint16_t MemoryRead16(VAddr a) override { return load<uint16_t>(a); }
@@ -329,28 +331,45 @@ int jit_run(jit_core *c) {
     if (!c->hybrid) return stop_of(c, c->jit->Run());
     wt_ctx &n = c->nc;
     const auto stops = kHaltSvc | kHaltException | kHaltExternal;
+    /* Recompiled blocks are the same for every FPCR whose only bits are FZ (24) and DN (25): flush-to-zero is
+       MXCSR FTZ + DAZ while they run (TOTK's threads run with FZ), NaNs are not bit-exact anyway. Other bits
+       (rounding modes, trap enables) go to dynarmic. The host's MXCSR is restored before returning. */
+    const unsigned host_mxcsr = _mm_getcsr();
+    unsigned mx_fpcr = ~0u;
+    int stop;
     for (;;) {
-        if (c->halt_req) { c->halt_req = 0; c->jit->ClearHalt(kHaltExternal); return JIT_STOP_HALT; }
-        wt_block_fn f = n.fpcr == 0 ? nat_find(n.pc) : nullptr;   /* blocks were made for FPCR 0 */
+        if (c->halt_req) { c->halt_req = 0; c->jit->ClearHalt(kHaltExternal); stop = JIT_STOP_HALT; break; }
+        bool ok_fpcr = (n.fpcr & ~0x03000000u) == 0;
+        wt_block_fn f = ok_fpcr ? nat_find(n.pc) : nullptr;
+        if (!ok_fpcr) { c->n_fpcr++; c->last_fpcr = n.fpcr; }   /* counted: FPCR the blocks cannot take */
         if (f) {
+            c->n_native++;
+            if (n.fpcr != mx_fpcr) { mx_fpcr = n.fpcr; _mm_setcsr((host_mxcsr & ~0x8040u) | (n.fpcr & 0x01000000u ? 0x8040u : 0)); }
             n.halt = WT_RUN;
             f(&n);
             if (n.halt == WT_RUN) continue;
-            if (n.halt == WT_HALT_SVC) { c->svc = n.svc; return JIT_STOP_SVC; }
-            if (n.halt == WT_HALT_EXCEPTION) { c->exc_pc = n.exc_pc; c->exc_kind = exc_kind_of(n.exc_kind); return JIT_STOP_EXCEPTION; }
-            c->exc_pc = n.pc; c->exc_kind = JIT_EXC_UNDEFINED; return JIT_STOP_EXCEPTION;   /* Interpret terminal */
+            if (n.halt == WT_HALT_SVC) { c->svc = n.svc; stop = JIT_STOP_SVC; }
+            else if (n.halt == WT_HALT_EXCEPTION) { c->exc_pc = n.exc_pc; c->exc_kind = exc_kind_of(n.exc_kind); stop = JIT_STOP_EXCEPTION; }
+            else { c->exc_pc = n.pc; c->exc_kind = JIT_EXC_UNDEFINED; stop = JIT_STOP_EXCEPTION; }   /* Interpret terminal */
+            break;
         }
+        c->n_missed++;
         to_jit(c);
-        Dynarmic::HaltReason r = c->jit->Run();
+        Dynarmic::HaltReason r = c->jit->Run();   /* dynarmic sets its own MXCSR and puts back the one it found */
         from_jit(c);
-        if ((r & stops) != Dynarmic::HaltReason{}) { int s = stop_of(c, r); if (s == JIT_STOP_HALT) c->halt_req = 0; return s; }
+        if ((r & stops) != Dynarmic::HaltReason{}) { stop = stop_of(c, r); if (stop == JIT_STOP_HALT) c->halt_req = 0; break; }
     }
+    _mm_setcsr(host_mxcsr);
+    return stop;
 }
 int jit_step(jit_core *c) {
     if (!c->hybrid) return stop_of(c, c->jit->Step());
     to_jit(c); int s = stop_of(c, c->jit->Step()); from_jit(c); return s;
 }
 void jit_halt(jit_core *c) { c->halt_req = 1; c->jit->HaltExecution(kHaltExternal); }
+void jit_native_stats(jit_core *c, uint64_t *native, uint64_t *missed, uint64_t *fpcr_other, uint64_t *last_fpcr) {
+    *native = c->n_native; *missed = c->n_missed; *fpcr_other = c->n_fpcr; *last_fpcr = c->last_fpcr;
+}
 
 size_t jit_native_load(const char *dir, const uint64_t bases[3], char *err, size_t cap) {
     std::vector<wt_entry> all;

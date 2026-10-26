@@ -17,6 +17,17 @@
 #include <unordered_set>
 #include <vector>
 
+#include <array>
+#include <csetjmp>
+#include <memory>
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include "wt_native.h"
+#include "dynarmic/interface/A64/a64.h"
+#include "dynarmic/interface/optimization_flags.h"
+#include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/frontend/A64/a64_location_descriptor.h"
 #include "dynarmic/frontend/A64/translate/a64_translate.h"
 #include "dynarmic/interface/A64/config.h"
@@ -54,7 +65,7 @@ bool lz4(const uint8_t *s, size_t n, uint8_t *d, size_t cap) {
 
 struct Module {
     std::string name;
-    uint64_t base = 0, text_lo = 0, text_hi = 0;
+    uint64_t base = 0, text_lo = 0, text_hi = 0, rw_lo = 0;   // rw: .data and .bss, to the end of img
     std::vector<uint8_t> img;
     std::vector<uint64_t> seeds;   // guest addresses
 };
@@ -77,7 +88,7 @@ bool load(const std::string &path, Module &m) {
         if (flags >> k & 1) { if (!lz4(&nso[fo[k]], st[k], &m.img[mo[k]], sz[k])) return false; }
         else memcpy(&m.img[mo[k]], &nso[fo[k]], sz[k]);
     }
-    m.text_lo = mo[0]; m.text_hi = (uint64_t)mo[0] + sz[0];
+    m.text_lo = mo[0]; m.text_hi = (uint64_t)mo[0] + sz[0]; m.rw_lo = mo[2];
     uint32_t symoff = rd32(&nso[0x98]), symsize = rd32(&nso[0x9C]);
     // function starts: dynamic symbols, .eh_frame_hdr, relative relocations, BL targets (as tools/recomp/survey.py)
     const uint8_t *I = m.img.data();
@@ -418,10 +429,31 @@ struct Emitter {
         case O::VectorGetElement32: def("(uint32_t)((" + a(1) + " < 2 ? " + a(0) + ".lo >> (32 * " + a(1) + ") : " + a(0) + ".hi >> (32 * (" + a(1) + " - 2))))"); return true;
         case O::VectorGetElement64: def("(" + a(1) + " ? " + a(0) + ".hi : " + a(0) + ".lo)"); return true;
         case O::VectorZeroUpper: def("wt_v(" + a(0) + ".lo, 0)"); return true;
-        default:
-            why = IR::GetNameOf(in.GetOpcode());
-            return false;
+        case O::VectorTable: {   // TBL tables: up to four registers, unused arguments are Void
+            std::string t = "wt_tbl " + r + " = {{";
+            unsigned k = 0;
+            for (size_t i = 0; i < in.NumArgs(); i++) {
+                if (in.GetArg(i).IsEmpty()) continue;
+                t += (k ? ", " : "") + a(i); k++;
+            }
+            line(t + "}, " + std::to_string(k) + "u};");
+            return true;
         }
+        default: break;
+        }
+        static const std::unordered_set<std::string> helpers = {
+#include "wt_ops_list.inc"
+        };
+        std::string name = IR::GetNameOf(in.GetOpcode());
+        if (!T || !helpers.count(name)) { why = name; return false; }
+        // conversions with a rounding argument: the helpers round to nearest only, which is what FPCR 0 gives
+        if ((name.rfind("FPFixed", 0) == 0 || name == "FPDoubleToSingle") && val(in.GetArg(in.NumArgs() - 1)) != "0u") {
+            why = name + " (rounding mode)"; return false;
+        }
+        std::string call = "wt_op_" + name + "(";
+        for (size_t i = 0; i < in.NumArgs(); i++) call += (i ? ", " : "") + a(i);
+        def(call + ")");
+        return true;
     }
 
     void term(const IR::Terminal &t, int depth) {
@@ -532,9 +564,184 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     return 0;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// difftest: recompiled blocks against dynarmic, one block at a time from the same random state. The modules are
+// mapped at their bases (unrelocated, the same for both sides), registers point into a scratch area whose words point
+// back into it, vectors hold random floats. Compared: x0-x30, sp, pc, NZCV, vectors (lanes that are NaN on both
+// sides count as equal: NaNs are not bit-exact), svc / exception, and a hash of scratch and module .data/.bss.
+
+struct DiffCb final : A64::UserCallbacks {
+    uint64_t tpidr = 0, tpidrro = 0; uint32_t svc = 0; int halted = 0; uint64_t exc_pc = 0; int exc = -1;
+    std::unique_ptr<A64::Jit> jit;
+    template<typename T> static T ld(uint64_t a) { T v; memcpy(&v, (const void *)(uintptr_t)a, sizeof v); return v; }
+    template<typename T> static void st(uint64_t a, T v) { memcpy((void *)(uintptr_t)a, &v, sizeof v); }
+    std::uint8_t MemoryRead8(A64::VAddr a) override { return ld<uint8_t>(a); }
+    std::uint16_t MemoryRead16(A64::VAddr a) override { return ld<uint16_t>(a); }
+    std::uint32_t MemoryRead32(A64::VAddr a) override { return ld<uint32_t>(a); }
+    std::uint64_t MemoryRead64(A64::VAddr a) override { return ld<uint64_t>(a); }
+    A64::Vector MemoryRead128(A64::VAddr a) override { return {ld<uint64_t>(a), ld<uint64_t>(a + 8)}; }
+    void MemoryWrite8(A64::VAddr a, std::uint8_t v) override { st(a, v); }
+    void MemoryWrite16(A64::VAddr a, std::uint16_t v) override { st(a, v); }
+    void MemoryWrite32(A64::VAddr a, std::uint32_t v) override { st(a, v); }
+    void MemoryWrite64(A64::VAddr a, std::uint64_t v) override { st(a, v); }
+    void MemoryWrite128(A64::VAddr a, A64::Vector v) override { st(a, v[0]); st(a + 8, v[1]); }
+    template<typename T> static bool cas(uint64_t a, T v, T e) { return __atomic_compare_exchange_n((T *)(uintptr_t)a, &e, v, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+    bool MemoryWriteExclusive8(A64::VAddr a, std::uint8_t v, std::uint8_t e) override { return cas(a, v, e); }
+    bool MemoryWriteExclusive16(A64::VAddr a, std::uint16_t v, std::uint16_t e) override { return cas(a, v, e); }
+    bool MemoryWriteExclusive32(A64::VAddr a, std::uint32_t v, std::uint32_t e) override { return cas(a, v, e); }
+    bool MemoryWriteExclusive64(A64::VAddr a, std::uint64_t v, std::uint64_t e) override { return cas(a, v, e); }
+    bool MemoryWriteExclusive128(A64::VAddr, A64::Vector, A64::Vector) override { return false; }
+    void InterpreterFallback(A64::VAddr pc, size_t) override { exc_pc = pc; exc = -2; jit->HaltExecution(HaltReason::UserDefined3); }
+    void CallSVC(std::uint32_t imm) override { svc = imm; halted = 1; jit->HaltExecution(HaltReason::UserDefined1); }
+    void ExceptionRaised(A64::VAddr pc, A64::Exception e) override {
+        if (e == A64::Exception::Yield || e == A64::Exception::SendEvent || e == A64::Exception::SendEventLocal) return;
+        exc_pc = pc; exc = static_cast<int>(e); jit->HaltExecution(HaltReason::UserDefined3);
+    }
+    void AddTicks(std::uint64_t) override {}
+    std::uint64_t GetTicksRemaining() override { return 1; }
+    std::uint64_t GetCNTPCT() override { return 123456789; }
+};
+
+uint64_t fixed_cntpct(void *) { return 123456789; }
+
+void *g_fault_jmp[5];   // __builtin_setjmp: no unwinding, which cannot cross the exception handler
+volatile int g_in_test;
+LONG CALLBACK fault_handler(EXCEPTION_POINTERS *e) {
+    if (g_in_test && e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) __builtin_longjmp(g_fault_jmp, 1);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+uint64_t hash_mem(const uint8_t *p, size_t n) { uint64_t h = 1469598103934665603ull; for (size_t i = 0; i + 8 <= n; i += 8) { uint64_t v; memcpy(&v, p + i, 8); h = (h ^ v) * 0x100000001b3ull; } return h; }
+
+int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) {
+    // guest memory: modules at their bases, a 64 MiB scratch area
+    struct Region { uint8_t *at; size_t n; std::vector<uint8_t> snap; };
+    std::vector<Region> rw;
+    for (auto &m : p.mods) {
+        size_t n = (m.img.size() + 0xFFFF) & ~(size_t)0xFFFF;
+        auto *at = static_cast<uint8_t *>(VirtualAlloc((void *)(uintptr_t)m.base, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (at != (uint8_t *)(uintptr_t)m.base) { fprintf(stderr, "cannot map %s at %#llx\n", m.name.c_str(), (unsigned long long)m.base); return 1; }
+        memcpy(at, m.img.data(), m.img.size());
+        rw.push_back({at + m.rw_lo, m.img.size() - m.rw_lo, {}});
+    }
+    const uint64_t scratch = 0x2000000000ull; const size_t scratch_n = 8u << 20;
+    auto *sc = static_cast<uint8_t *>(VirtualAlloc((void *)(uintptr_t)scratch, scratch_n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!sc) { fprintf(stderr, "cannot map scratch\n"); return 1; }
+    uint64_t rng = seed * 0x9E3779B97F4A7C15ull + 1;
+    auto rnd = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+    for (size_t i = 0; i < scratch_n; i += 8) { uint64_t v = scratch + (scratch_n / 4) + (rnd() % (scratch_n / 2) & ~7ull); memcpy(sc + i, &v, 8); }
+    rw.push_back({sc, scratch_n, {}});
+    for (auto &r : rw) r.snap.assign(r.at, r.at + r.n);
+    auto restore = [&]() { for (auto &r : rw) memcpy(r.at, r.snap.data(), r.n); };
+    auto mem_hash = [&]() { uint64_t h = 0; for (auto &r : rw) h = h * 31 + hash_mem(r.at, r.n); return h; };
+
+    HMODULE lib = LoadLibraryA(dll.c_str());
+    if (!lib) { fprintf(stderr, "cannot load %s\n", dll.c_str()); return 1; }
+    auto *cnt = (const unsigned long long *)GetProcAddress(lib, "wt_count");
+    auto *tab = (const wt_entry *)GetProcAddress(lib, "wt_table");
+    if (!cnt || !tab) { fprintf(stderr, "%s: no table\n", dll.c_str()); return 1; }
+    AddVectoredExceptionHandler(1, fault_handler);
+
+    DiffCb cb;
+    A64::UserConfig uc;
+    ExclusiveMonitor monitor{1};
+    uc.callbacks = &cb; uc.tpidr_el0 = &cb.tpidr; uc.tpidrro_el0 = &cb.tpidrro; uc.global_monitor = &monitor;
+    uc.cntfrq_el0 = 19200000; uc.dczid_el0 = 4; uc.ctr_el0 = 0x8444c004;
+    uc.define_unpredictable_behaviour = true; uc.wall_clock_cntpct = true;
+    uc.enable_cycle_counting = true;
+    uc.unsafe_optimizations = true; uc.optimizations |= OptimizationFlag::Unsafe_InaccurateNaN;
+    // exactly one block per Run: no linking, return stack or fast dispatch past the cycle check
+    uc.optimizations &= ~(OptimizationFlag::BlockLinking | OptimizationFlag::ReturnStackBuffer | OptimizationFlag::FastDispatch);
+    cb.jit = std::make_unique<A64::Jit>(uc);
+    A64::UserConfig tc; tc.define_unpredictable_behaviour = true; tc.wall_clock_cntpct = true;
+
+    std::map<std::string, uint64_t> tested_ops, bad_ops;
+    size_t ok = 0, bad = 0, faulted = 0, shown = 0;
+    volatile int no_halt = 0;
+    for (size_t s = 0; s < samples; s++) {
+        const wt_entry &e = tab[rnd() % *cnt];
+        // random state
+        wt_ctx n{};
+        for (int i = 0; i < 31; i++) n.x[i] = (rnd() & 3) ? scratch + scratch_n / 4 + (rnd() % (scratch_n / 2) & ~7ull) : rnd() % 4096;
+        n.sp = scratch + scratch_n / 2;
+        static const float picks[] = {0.0f, -0.0f, 1.0f, -1.5f, 0.5f, 3.25f, 1e-40f, 1e30f, -7.0f, 100.0f};
+        for (int i = 0; i < 32; i++) {
+            float f[4]; for (int k = 0; k < 4; k++) f[k] = (rnd() & 1) ? picks[rnd() % 10] : (float)(int32_t)(rnd() % 20001 - 10000) / 64.0f;
+            memcpy(&n.v[i], f, 16);
+            if (rnd() % 4 == 0) { double d[2] = {(double)(int32_t)(rnd() % 20001 - 10000) / 64.0, (double)picks[rnd() % 10]}; memcpy(&n.v[i], d, 16); }
+        }
+        n.nzcv = (uint32_t)(rnd() & 0xF) << 28; n.pc = e.pc; n.tpidr = scratch + 4096; n.tpidrro = scratch + 8192;
+        n.halt_request = (volatile int *)&no_halt; n.cntpct = fixed_cntpct;
+        wt_ctx start = n;
+        restore();
+        g_in_test = 1;
+        if (__builtin_setjmp(g_fault_jmp)) { g_in_test = 0; faulted++; continue; }
+        e.fn(&n);
+        g_in_test = 0;
+        uint64_t h_native = mem_hash();
+        // dynarmic, one block
+        restore();
+        auto &j = *cb.jit;
+        std::array<uint64_t, 31> regs; memcpy(regs.data(), start.x, sizeof regs); j.SetRegisters(regs);
+        std::array<A64::Vector, 32> vec; for (int i = 0; i < 32; i++) vec[i] = {start.v[i].lo, start.v[i].hi}; j.SetVectors(vec);
+        j.SetSP(start.sp); j.SetPC(start.pc); j.SetFpcr(0); j.SetFpsr(0); j.SetPstate(start.nzcv); j.ClearExclusiveState();
+        cb.tpidr = start.tpidr; cb.tpidrro = start.tpidrro; cb.svc = 0; cb.halted = 0; cb.exc = -1;
+        g_in_test = 1;
+        if (__builtin_setjmp(g_fault_jmp)) { g_in_test = 0; faulted++; cb.jit = std::make_unique<A64::Jit>(uc); continue; }
+        j.Run();
+        g_in_test = 0;
+        j.ClearHalt(HaltReason::UserDefined1); j.ClearHalt(HaltReason::UserDefined3);
+        uint64_t h_jit = mem_hash();
+        // compare
+        std::string diff;
+        auto regs2 = j.GetRegisters();
+        for (int i = 0; i < 31; i++) if (regs2[i] != n.x[i]) { diff += " x" + std::to_string(i); }
+        if (j.GetSP() != n.sp) diff += " sp";
+        if (j.GetPC() != n.pc && n.halt != WT_HALT_EXCEPTION && cb.exc == -1) diff += " pc";
+        if ((j.GetPstate() & 0xF0000000u) != n.nzcv) diff += " nzcv";
+        auto vec2 = j.GetVectors();
+        for (int i = 0; i < 32; i++) {
+            uint64_t a[2] = {vec2[i][0], vec2[i][1]}, b[2] = {n.v[i].lo, n.v[i].hi};
+            if (!memcmp(a, b, 16)) continue;
+            bool nan_only = true;
+            for (int k = 0; k < 4 && nan_only; k++) {
+                uint32_t x = (uint32_t)(a[k / 2] >> (32 * (k & 1))), y = (uint32_t)(b[k / 2] >> (32 * (k & 1)));
+                if (x != y && !((x & 0x7FFFFFFF) > 0x7F800000 && (y & 0x7FFFFFFF) > 0x7F800000)) nan_only = false;
+            }
+            if (!nan_only) {   // or 64-bit lanes NaN on both sides
+                nan_only = true;
+                for (int k = 0; k < 2; k++) if (a[k] != b[k] && !(((a[k] << 1) > (0x7FFull << 53)) && ((b[k] << 1) > (0x7FFull << 53)))) nan_only = false;
+            }
+            if (!nan_only) diff += " v" + std::to_string(i);
+        }
+        if ((n.halt == WT_HALT_SVC) != (cb.halted == 1) || (cb.halted && cb.svc != n.svc)) diff += " svc";
+        if (h_native != h_jit) diff += " memory";
+        IR::Block b = translate(p, e.pc, tc);
+        std::unordered_set<std::string> ops;
+        for (auto &in : b) ops.insert(IR::GetNameOf(in.GetOpcode()));
+        for (auto &o : ops) tested_ops[o]++;
+        if (diff.empty()) { ok++; continue; }
+        bad++;
+        for (auto &o : ops) bad_ops[o]++;
+        if (shown++ < 12) {
+            std::string list; for (auto &o : ops) list += o + " ";
+            printf("mismatch at block %llu of %llu:%s | ops: %s\n", (unsigned long long)(&e - tab), (unsigned long long)*cnt, diff.c_str(), list.c_str());
+        }
+    }
+    printf("%zu blocks: %zu equal, %zu different, %zu faulted (wild addresses, skipped)\n", samples, ok, bad, faulted);
+    std::vector<std::pair<double, std::string>> v;
+    for (auto &[o, nb] : bad_ops) v.emplace_back((double)nb / tested_ops[o], o);
+    std::sort(v.rbegin(), v.rend());
+    for (size_t i = 0; i < v.size() && i < 25; i++)
+        printf("  %-45s in %5.1f%% of the different blocks that use it (%llu of %llu)\n", v[i].second.c_str(), 100 * v[i].first,
+               (unsigned long long)bad_ops[v[i].second], (unsigned long long)tested_ops[v[i].second]);
+    return bad ? 3 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc < 3) { fprintf(stderr, "usage: wt_recomp <TOTK_win> survey | emit <dir> <module|all> [blocks per file]\n"); return 2; }
     Program p;
     uint64_t at = 0x300000000ull;
@@ -548,6 +755,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[2], "survey")) return survey(p);
     if (!strcmp(argv[2], "emit") && argc >= 5) return emit(p, argv[3], argv[4], argc > 5 ? (size_t)atoll(argv[5]) : 2000);
+    if (!strcmp(argv[2], "difftest") && argc >= 5) return difftest(p, argv[3], (size_t)atoll(argv[4]), argc > 5 ? (uint64_t)atoll(argv[5]) : 1);
     fprintf(stderr, "unknown command %s\n", argv[2]);
     return 2;
 }

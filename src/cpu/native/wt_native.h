@@ -90,6 +90,10 @@ static inline uint64_t wt_extr64(uint64_t hi, uint64_t lo, unsigned n) { return 
 static inline uint32_t wt_extr32(uint32_t hi, uint32_t lo, unsigned n) { return n ? lo >> n | hi << (32 - n) : lo; }
 
 /* exclusives: the value read is remembered; the write succeeds (returns 0) if memory still holds it */
+#ifndef __cplusplus   /* the C++ test harness needs only the ABI */
+#include "wt_native_ops.h"
+#endif
+
 #define WT_EXCL_READ(c, T, a, out) do { (c)->excl_addr = (a); (out) = WT_LD(T, a); (c)->excl_val.lo = (uint64_t)(out); (c)->excl_valid = 1; } while (0)
 #define WT_EXCL_WRITE(c, T, a, v, out) do { \
         if (!(c)->excl_valid || (c)->excl_addr != (a)) (out) = 1; \

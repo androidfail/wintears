@@ -66,7 +66,7 @@ if(WINTEARS_JIT)
   # Direct Native recompiler (build-time tool; its output is derived from the game and stays on the player's machine)
   add_executable(wt_recomp tools/recomp/wt_recomp.cpp)
   target_link_libraries(wt_recomp PRIVATE dynarmic fmt::fmt merry::mcl tsl::robin_map)
-  target_include_directories(wt_recomp PRIVATE externals/dynarmic/src)
+  target_include_directories(wt_recomp PRIVATE externals/dynarmic/src src/cpu/native)
   target_link_options(wt_recomp PRIVATE -static)
 
   # ---- guest-to-host bridge ----
