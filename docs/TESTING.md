@@ -56,9 +56,10 @@ nothing to ship; without it CMake warns and the game aborts at the first cutscen
 unpaced, `TOTK_MOVIE_HOST=0` leaves the movies to the SDK.
 
 `build_xlate.py` needs the .NET 10 SDK and the Visual Studio C++ build tools (both are on your PC). The game opens a
-window and draws with Vulkan. Keyboard (as on the Mac version): WASD left stick, arrow keys right stick, J = A,
-K / Space = B, I = X, U = Y, Q = L, E = R, Left Alt = ZL, Left Shift = ZR, Enter = Plus, Tab / Escape = Minus,
-F G H T = d-pad (left, down, right, up), Z / C = left / right stick click, hold Left Ctrl to walk; F11 = fullscreen. A controller works too (Switch layout by position: east = A, south = B).
+window and draws with Vulkan. Keyboard and mouse: WASD move (hold Left Alt to walk), arrow keys camera, Space jump (X),
+Left Shift / Backspace sprint and back (B), E / Enter interact and confirm (A), left click / F attack (Y), right click / V
+bow (ZR), Left Ctrl lock-on and shield (ZL), Q abilities (L), R throw / use (R), C crouch (left stick click), middle
+click / T right stick click, Esc menu (Plus), Tab / M map (Minus), 1 2 3 4 d-pad up, right, down, left; F11 = fullscreen. A controller works too (Switch layout by position: east = A, south = B).
 
 The first start reads the whole 17 GB RomFS image once to check it (a minute or two); later starts skip that while the
 file is unchanged. `prepare_shaders.py` translates every shader the game files hold, in the bind states upstream's

@@ -1,9 +1,11 @@
-/* SDL3 window and input. Keyboard keys follow upstream runtime/input.c (by position on a Mac keyboard: WASD left
-   stick, arrows right stick, J A, K / Space B, I X, U Y, Q L, E R, Left Alt ZL, Left Shift ZR, Z left stick click,
-   C right stick click, Enter Plus, Tab / Escape Minus, F G H T d-pad; Left Ctrl held: walk).
+/* SDL3 window and input. Keyboard and mouse as in a PC action game, for TOTK's controls: WASD move (left stick; Left Alt
+   held: walk), arrows camera (right stick), Space jump (X), Left Shift / Backspace sprint and back (B), E / Enter
+   interact and confirm (A), left click / F attack (Y), right click / V bow (ZR), Left Ctrl lock-on and shield (ZL),
+   Q abilities (L), R throw / use (R), C crouch (left stick click), middle click / T right stick click, Esc menu (Plus),
+   Tab / M map (Minus), 1 2 3 4 d-pad up, right, down, left.
    Controllers are mapped by button position, the
    Switch's own layout (upstream controller_map.h default): east A, south B, north X, west Y; triggers are ZL / ZR.
-   F11 toggles borderless fullscreen (not Alt+Enter: Alt is ZL). */
+   F11 toggles borderless fullscreen (not Alt+Enter: Alt is walk). */
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,22 +21,22 @@ static SDL_Gamepad *g_pads[8];
 
 static uint64_t key_button(SDL_Scancode k) {
     switch (k) {
-    case SDL_SCANCODE_J: return A;
-    case SDL_SCANCODE_K: case SDL_SCANCODE_SPACE: return B;
-    case SDL_SCANCODE_I: return X;
-    case SDL_SCANCODE_U: return Y;
-    case SDL_SCANCODE_Z: return LS;
-    case SDL_SCANCODE_C: return RS;
-    case SDL_SCANCODE_Q: return L;
-    case SDL_SCANCODE_E: return R;
-    case SDL_SCANCODE_LALT: return ZL;
-    case SDL_SCANCODE_LSHIFT: return ZR;
-    case SDL_SCANCODE_RETURN: return PLUS;
-    case SDL_SCANCODE_TAB: case SDL_SCANCODE_ESCAPE: return MINUS;
-    case SDL_SCANCODE_F: return LEFT;
-    case SDL_SCANCODE_T: return UP;
-    case SDL_SCANCODE_H: return RIGHT;
-    case SDL_SCANCODE_G: return DOWN;
+    case SDL_SCANCODE_E: case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: return A;   /* interact, confirm */
+    case SDL_SCANCODE_LSHIFT: case SDL_SCANCODE_BACKSPACE: return B;                       /* sprint, back */
+    case SDL_SCANCODE_SPACE: return X;                                                      /* jump */
+    case SDL_SCANCODE_F: return Y;                                                          /* attack */
+    case SDL_SCANCODE_C: return LS;                                                         /* crouch */
+    case SDL_SCANCODE_T: return RS;
+    case SDL_SCANCODE_Q: return L;                                                          /* abilities */
+    case SDL_SCANCODE_R: return R;                                                          /* throw / use */
+    case SDL_SCANCODE_LCTRL: return ZL;                                                     /* lock-on, shield */
+    case SDL_SCANCODE_V: return ZR;                                                         /* bow */
+    case SDL_SCANCODE_ESCAPE: return PLUS;                                                  /* menu */
+    case SDL_SCANCODE_TAB: case SDL_SCANCODE_M: return MINUS;                               /* map */
+    case SDL_SCANCODE_1: return UP;
+    case SDL_SCANCODE_2: return RIGHT;
+    case SDL_SCANCODE_3: return DOWN;
+    case SDL_SCANCODE_4: return LEFT;
     default: return 0;
     }
 }
@@ -56,7 +58,13 @@ static void update_pad(void) {
     const bool *k = SDL_GetKeyboardState(NULL);
     host_pad p = {0};
     for (int i = 0; i < SDL_SCANCODE_COUNT; i++) if (k[i]) p.buttons |= key_button((SDL_Scancode)i);
-    int tilt = k[SDL_SCANCODE_LCTRL] ? 12000 : 32767;   /* Left Ctrl: the left stick part way (walk) */
+    int tilt = k[SDL_SCANCODE_LALT] ? 12000 : 32767;   /* Left Alt: the left stick part way (walk) */
+    {   /* mouse buttons (while the window has the mouse): left attack (Y), right bow (ZR), middle right stick click */
+        SDL_MouseButtonFlags mb = SDL_GetMouseFocus() == g_win ? SDL_GetMouseState(NULL, NULL) : 0;
+        if (mb & SDL_BUTTON_LMASK) p.buttons |= Y;
+        if (mb & SDL_BUTTON_RMASK) p.buttons |= ZR;
+        if (mb & SDL_BUTTON_MMASK) p.buttons |= RS;
+    }
     p.lx = tilt * (k[SDL_SCANCODE_D] - k[SDL_SCANCODE_A]);
     p.ly = tilt * (k[SDL_SCANCODE_W] - k[SDL_SCANCODE_S]);
     p.rx = 32767 * (k[SDL_SCANCODE_RIGHT] - k[SDL_SCANCODE_LEFT]);
