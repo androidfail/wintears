@@ -1134,6 +1134,10 @@ void pal_exception_report(char *out, size_t cap) {
 }
 #undef APPEND
 
+uint64_t pal_total_memory(void) {
+    MEMORYSTATUSEX m = {.dwLength = sizeof m};
+    return GlobalMemoryStatusEx(&m) ? m.ullTotalPhys : 0;
+}
 int pal_process_memory(uint64_t *resident, uint64_t *committed) {
     PROCESS_MEMORY_COUNTERS_EX m = {.cb = sizeof m};
     if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m)) return -1;

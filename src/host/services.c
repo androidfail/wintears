@@ -25,16 +25,22 @@ static void host_fs_init(void) { runtime_fs_init(); }
 static void cpu_boost(int mode) { if (mode < 0 || mode > 2) die("unknown CPU boost mode"); LOG("CPU boost request %d: Windows manages CPU frequency", mode); }
 
 /* TOTK_OPERATION_MODE=handheld reports handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of docked
-   (1, Boost 1). Read once; any other value stops the start. */
+   (1, Boost 1). Read once; any other value stops the start. Default: handheld on a Steam Deck (Steam sets SteamDeck=1:
+   the game then renders at up to 1280x720 with its handheld settings instead of 1920x1080, for a 1280x800 screen and a
+   GPU that was the limit there) and on machines with up to 16 GiB of memory (laptops: less memory for render targets,
+   less GPU work), docked elsewhere. */
 static int handheld_mode(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = pal_getenv("TOTK_OPERATION_MODE");
         int h;
-        if (!e || !strcmp(e, "docked")) h = 0;
+        const char *deck = pal_getenv("SteamDeck");
+        uint64_t ram = pal_total_memory();
+        if (!e) h = (deck && *deck == '1') || (ram && ram <= (33ull << 29));   /* 16.5 GiB */
+        else if (!strcmp(e, "docked")) h = 0;
         else if (!strcmp(e, "handheld")) h = 1;
         else die("TOTK_OPERATION_MODE must be docked or handheld");
-        LOG("operation mode reported to the game: %s", h ? "handheld (performance normal)" : "docked (performance boost)");
+        LOG("operation mode reported to the game: %s (%s)", h ? "handheld (performance normal)" : "docked (performance boost)", e ? "TOTK_OPERATION_MODE" : !h ? "default" : deck && *deck == '1' ? "Steam Deck" : "16 GiB of memory or less");
         v = h;
     }
     return v;

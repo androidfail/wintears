@@ -9,7 +9,7 @@
    buffer) take their bytes from pool memory: uploaded at first use, and again at the first use in a submission after
    the dirty tracker saw a write to their pages. A texture the GPU writes is owned by the GPU from then on.
 
-   Images unused for 600 submissions are dropped, except those whose content cannot be made again (rendered or copied
+   Images unused for 600 submissions (300 when their bytes are in pool memory) are dropped, except those whose content cannot be made again (rendered or copied
    into by the GPU) while a texture object still refers to them (upstream: while a serial holds the storage). Dropping
    those left a menu background, or a sky rendered once, blank when it was used again. */
 #include "gfx/vk/vk.h"
@@ -424,8 +424,13 @@ static void content_note(vtex *e, const tex_t *t, uint64_t sub) {   /* at upload
 static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
     uint64_t t0 = pal_now_ns(), n = t->L.size;
     unsigned every = n > (1u << 20) ? 64 : 16, phase = (unsigned)((uintptr_t)e >> 6);
+    /* 8-bit textures up to 4 MiB (the font glyph caches: a few glyphs written at a time, which sampling misses: letters
+       and whole save-screen text missing on the Steam Deck) and textures up to 1 MiB (save thumbnails, UI) are hashed
+       whole at every check, never sampled */
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    int glyphs = bpb == 1 && bw == 1 && bh == 1 && n <= (4u << 20);
     if (n > (16u << 10) && !e->hot && (sub + phase) % 4) return 0;   /* cold: looked at every 4th submission */
-    int whole = n <= (16u << 10) || e->hot || (sub + phase) % every == 0;
+    int whole = n <= (1u << 20) || glyphs || e->hot || (sub + phase) % every == 0;
     int changed = whole ? hash_whole(t->mem, n) != e->hash : hash_sampled(t->mem, n) != e->shash;
     if (changed) e->hot = 64; else if (e->hot) e->hot--;
     vk_ns_hash += pal_now_ns() - t0;
@@ -679,9 +684,22 @@ static void held_by_slots(nvn_hmap *held);   /* below: the images the texture po
 typedef struct { uint64_t now; nvn_hmap held; } idle_arg;   /* held: the keys of the images texture objects still refer to */
 static int idle(const vtex *e, const void *arg) {
     const idle_arg *a = arg;
+    /* an image whose bytes are in pool memory is uploaded again when needed: dropped after 300 unused submissions (10 s
+       at 30 fps), the others after 600 */
+    if (e->used_sub + 300 >= a->now) return 0;   /* 120 kept the PC from ever loading a save: not lower */
+    if (e->mirrored && !e->owned) return 1;
     if (e->used_sub + 600 >= a->now) return 0;
-    if (e->mirrored && !e->owned) return 1;   /* its bytes are in pool memory: uploaded again when needed */
     return !nvn_hm_get(&a->held, &e->k);
+}
+/* The memory guard (vk_dev.c) over its budget: re-uploadable images not used in the last 120 submissions go now (only
+   then: freeing them that early in normal play kept the game from loading a save). */
+int vt_pressure;
+static uint64_t g_pressure_freed;
+static int pressure_idle(const vtex *e, const void *arg) {
+    const idle_arg *a = arg;
+    if (!(e->mirrored && !e->owned) || e->used_sub + 120 >= a->now) return 0;
+    g_pressure_freed += e->bytes;
+    return 1;
 }
 void vt_end_submission(void) {
     uint64_t now = vk_sub_serial();
@@ -700,6 +718,11 @@ void vt_end_submission(void) {
     for (uint32_t i = 0; i < g_ser.cap; i++) if (g_ser.vals[i]) nvn_hm_put(&a.held, g_ser.vals[i], (void *)1);
     held_by_slots(&a.held);   /* a descriptor can outlive the texture object it was made from */
     drop_where(idle, &a, 0);   /* unused for 600 submissions: no submission in flight uses them */
+    if (vt_pressure) {
+        g_pressure_freed = 0;
+        drop_where(pressure_idle, &a, 1);
+        static int n; if (n++ < 20 || n % 100 == 0) VLOG("memory guard: over budget, %.0f MiB of re-uploadable textures freed (%d times so far)", g_pressure_freed / 1048576.0, n);
+    }
     free(a.held.keys); free(a.held.vals);
 }
 

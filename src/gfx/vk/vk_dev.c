@@ -724,7 +724,7 @@ static void *done_thread(void *unused) {
         pthread_mutex_lock(&g_done_mu);
         for (chunk *c = s->chunks, *nx; c; c = nx) {
             nx = c->next;
-            if (c->size == CHUNK_SIZE && g_free_chunk_n < 4) { c->next = g_free_chunks; g_free_chunks = c; g_free_chunk_n++; }
+            if (c->size == CHUNK_SIZE && g_free_chunk_n < 2) {   /* 2 spare 16 MiB staging chunks */ c->next = g_free_chunks; g_free_chunks = c; g_free_chunk_n++; }
             else { vmaDestroyBuffer(vk_vma, c->buf, c->al); atomic_fetch_sub(&g_chunk_bytes, c->size); free(c); }
         }
         s->chunks = NULL;
@@ -784,6 +784,36 @@ static uint64_t g_sub_max;
 static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;
 /* Where memory goes (every 10 s, and before an out-of-memory failure). */
 int vk_integrated; uint64_t vk_local_heap;
+/* The memory guard: every 64 submissions, the process's resident memory plus, on a GPU that shares system memory, what
+   the driver holds, against a budget (TOTK_MEMORY_BUDGET_MB; default 7 GiB, less on machines with under 8.5 GiB, so
+   that the system keeps 1.5 GiB). Over it, re-uploadable textures go at once (vt_pressure). */
+static uint64_t g_mem_peak, g_mem_budget;
+static uint64_t mem_total(void) {
+    uint64_t res = 0, com = 0; pal_process_memory(&res, &com);
+    static int count_gpu = -1;   /* TOTK_MEMORY_COUNT_GPU=1: count the driver's memory on a discrete GPU too (simulates a laptop) */
+    if (count_gpu < 0) { const char *e = pal_getenv("TOTK_MEMORY_COUNT_GPU"); count_gpu = e && *e == '1'; }
+    if (vk_integrated || count_gpu) {
+        VmaBudget b[VK_MAX_MEMORY_HEAPS]; vmaGetHeapBudgets(vk_vma, b);
+        VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(vk_phys, &mp);
+        for (uint32_t i = 0; i < mp.memoryHeapCount; i++) res += b[i].usage;
+    }
+    return res;
+}
+static void mem_guard(void) {
+    extern int vt_pressure;
+    vt_pressure = 0;
+    if (vk_sub_serial() % 64) return;
+    if (!g_mem_budget) {
+        const char *e = pal_getenv("TOTK_MEMORY_BUDGET_MB"); uint64_t ram = pal_total_memory();
+        g_mem_budget = e ? (uint64_t)atoll(e) << 20 : 7ull << 30;
+        if (!e && ram && ram - (3ull << 29) < g_mem_budget) g_mem_budget = ram - (3ull << 29);
+        VLOG("memory guard: budget %.0f MiB (%s; machine %.0f MiB, %s GPU)", g_mem_budget / 1048576.0, e ? "TOTK_MEMORY_BUDGET_MB" : "default",
+             ram / 1048576.0, vk_integrated ? "integrated: its memory counts" : "discrete");
+    }
+    uint64_t t = mem_total();
+    if (t > g_mem_peak) g_mem_peak = t;
+    vt_pressure = t > g_mem_budget;
+}
 void vk_log_memory(void) {
     uint64_t res = 0, com = 0, hb = 0, hs = 0; pal_process_memory(&res, &com); host_heap_range(&hb, &hs);
     uint64_t img[4]; vt_memory(img);
@@ -793,8 +823,8 @@ void vk_log_memory(void) {
     for (uint32_t i = 0; i < mp.memoryHeapCount && at < sizeof heaps - 80; i++)
         at += (size_t)snprintf(heaps + at, sizeof heaps - at, "%s heap %u%s %.0f/%.0f MiB", i ? "," : "", i, mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " (GPU)" : "",
                                b[i].usage / 1048576.0, b[i].budget / 1048576.0);
-    VLOG("memory: process %.0f MiB resident, %.0f MiB committed (game heap %.0f MiB); images %.0f MiB (decoded ASTC %.0f, other uploaded %.0f, GPU-written %.0f; %.0f MiB saved by mip drop); staging %.0f MiB; driver:%s",
-         res / 1048576.0, com / 1048576.0, hs / 1048576.0, (img[0] + img[1] + img[2]) / 1048576.0, img[0] / 1048576.0, img[1] / 1048576.0, img[2] / 1048576.0, img[3] / 1048576.0,
+    VLOG("memory: guarded total %.0f MiB (peak %.0f, budget %.0f); process %.0f MiB resident, %.0f MiB committed (game heap %.0f MiB); images %.0f MiB (decoded ASTC %.0f, other uploaded %.0f, GPU-written %.0f; %.0f MiB saved by mip drop); staging %.0f MiB; driver:%s",
+         mem_total() / 1048576.0, g_mem_peak / 1048576.0, g_mem_budget / 1048576.0, res / 1048576.0, com / 1048576.0, hs / 1048576.0, (img[0] + img[1] + img[2]) / 1048576.0, img[0] / 1048576.0, img[1] / 1048576.0, img[2] / 1048576.0, img[3] / 1048576.0,
          atomic_load(&g_chunk_bytes) / 1048576.0, heaps);
 }
 static uint64_t submit(const uint64_t *handles, int n) {
@@ -811,6 +841,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
     vx_end_pass();
     uint64_t f = vk_flush(NULL, NULL);
     atomic_store(&g_game_fence, f);
+    mem_guard();
     vt_end_submission();
     pthread_mutex_unlock(&vk_mu);
     { extern void *volatile runtime_replay_thread; runtime_replay_thread = NULL; }
