@@ -249,3 +249,4 @@
 "VectorZeroExtend64",
 "VectorZeroExtend8",
 "VectorZeroUpper",
+"ZeroVector",

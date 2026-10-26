@@ -237,6 +237,7 @@ static inline wt_v128 wt_op_VectorRotateWholeVectorRight(wt_v128 a, uint8_t n) {
     n -= 64; return wt_v(a.hi >> n | a.lo << (64 - n), a.lo >> n | a.hi << (64 - n));
 }
 static inline wt_v128 wt_op_VectorZeroUpper(wt_v128 a) { return wt_v(a.lo, 0); }
+static inline wt_v128 wt_op_ZeroVector(void) { return wt_v(0, 0); }
 #define WT_WIDEN(N, FI, FO, LANES, CAST) static inline wt_v128 wt_op_##N(wt_v128 x) { wt_lanes a = WT_L(x), r; for (unsigned i = 0; i < LANES; i++) r.FO[i] = CAST a.FI[i]; return r.v; }
 WT_WIDEN(VectorZeroExtend8, b, h, 8, (uint16_t)) WT_WIDEN(VectorZeroExtend16, h, w, 4, (uint32_t)) WT_WIDEN(VectorZeroExtend32, w, d, 2, (uint64_t))
 WT_WIDEN(VectorSignExtend8, sb, sh, 8, (int16_t)) WT_WIDEN(VectorSignExtend16, sh, sw, 4, (int32_t)) WT_WIDEN(VectorSignExtend32, sw, sd, 2, (int64_t))

@@ -414,8 +414,8 @@ struct Emitter {
         case O::ByteReverseDual: def("__builtin_bswap64(" + a(0) + ")"); return true;
         case O::CountLeadingZeros32: def("wt_clz32(" + a(0) + ")"); return true;
         case O::CountLeadingZeros64: def("wt_clz64(" + a(0) + ")"); return true;
-        case O::ExtractRegister32: def("wt_extr32(" + a(0) + ", " + a(1) + ", " + a(2) + ")"); return true;
-        case O::ExtractRegister64: def("wt_extr64(" + a(0) + ", " + a(1) + ", " + a(2) + ")"); return true;
+        case O::ExtractRegister32: def("wt_extr32(" + a(1) + ", " + a(0) + ", " + a(2) + ")"); return true;   // IR: (low, high, lsb)
+        case O::ExtractRegister64: def("wt_extr64(" + a(1) + ", " + a(0) + ", " + a(2) + ")"); return true;   // IR: (low, high, lsb)
         case O::ReplicateBit32: def("(uint32_t)-(int32_t)(" + a(0) + " >> " + a(1) + " & 1)"); return true;
         case O::ReplicateBit64: def("(uint64_t)-(int64_t)(" + a(0) + " >> " + a(1) + " & 1)"); return true;
         case O::MaxSigned32: def("((int32_t)" + a(0) + " > (int32_t)" + a(1) + " ? " + a(0) + " : " + a(1) + ")"); return true;
