@@ -61,7 +61,7 @@ static void (*g_heap_shrink)(uint64_t lo, uint64_t hi), (*g_alias_unmap)(uint64_
 void host_on_alias_unmap(void (*fn)(uint64_t lo, uint64_t hi)) { g_alias_unmap = fn; }
 void host_alias_region(uint64_t *base, uint64_t *size) { *base = ALIAS_START; *size = alias_size; }
 /* The alias region is committed in grains of ALIAS_GRAIN from its start: a grain stays committed (and readable) while
-   any page in it is mapped; pages unmapped in a grain still in use are discarded and come back zeroed. The GPU is given
+   any page in it is mapped; pages unmapped in a grain still in use stay as they are and come back zeroed. The GPU is given
    whole grains (Wine / Proton): TOTK keeps its physical memory as hundreds of separate runs of about 1 MiB, one GPU
    import each at page granularity, and every import is named in every submission (750 imports: 12 ms each). */
 static uint32_t alias_grain_pages[ALIAS_SIZE_MAX / ALIAS_GRAIN];   /* mapped pages per grain */
@@ -335,8 +335,10 @@ static uint64_t alias_map(int unmap, uint64_t addr, uint64_t size) {
         }
         for (uint64_t g = g0; g <= g1; g++) {
             uint64_t glo = ALIAS_START + g * ALIAS_GRAIN, lo = addr > glo ? addr : glo, hi = addr + size < glo + ALIAS_GRAIN ? addr + size : glo + ALIAS_GRAIN;
-            if (!alias_grain_pages[g]) { if (pal_decommit((uintptr_t)glo, (size_t)ALIAS_GRAIN)) die("decommit physical alias pages"); }
-            else pal_discard((uintptr_t)lo, (size_t)(hi - lo));   /* stays readable: a GPU window may hold the grain */
+            /* a grain still in use keeps the pages as they are (readable: a GPU window may hold it); they are zeroed
+               when mapped again */
+            (void)lo; (void)hi;
+            if (!alias_grain_pages[g] && pal_decommit((uintptr_t)glo, (size_t)ALIAS_GRAIN)) die("decommit physical alias pages");
         }
     } else if (fresh) {
         for (uint64_t g = (addr - ALIAS_START) / ALIAS_GRAIN; g <= (addr + size - 1 - ALIAS_START) / ALIAS_GRAIN; g++) {

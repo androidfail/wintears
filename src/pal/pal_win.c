@@ -252,8 +252,49 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *e) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* A crash nothing handled: what, where (module + offset, or generated code), the faulting address, and return addresses
+   found on the stack in wintears.exe (relative to its preferred base 0x140000000, for addr2line / nm). Written to the
+   log before the process ends: the log goes through a pipe whose last lines were lost with the process. */
+void pal_tee_flush(void);
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS *e) {
+    static volatile LONG once;
+    if (InterlockedExchange(&once, 1)) return EXCEPTION_CONTINUE_SEARCH;
+    EXCEPTION_RECORD *r = e->ExceptionRecord;
+    CONTEXT *c = e->ContextRecord;
+    char b[1600]; size_t len = 0;
+#define APPEND(...) do { int w_ = snprintf(b + len, len < sizeof b ? sizeof b - len : 0, __VA_ARGS__); if (w_ > 0) len += (size_t)w_; } while (0)
+    uintptr_t exe = (uintptr_t)GetModuleHandleW(NULL);
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(exe + ((IMAGE_DOS_HEADER *)exe)->e_lfanew);
+    uintptr_t exe_end = exe + nt->OptionalHeader.SizeOfImage;
+    APPEND("[wintears] CRASH: exception %#lx in thread %lu at ", (unsigned long)r->ExceptionCode, (unsigned long)GetCurrentThreadId());
+    uintptr_t ip = (uintptr_t)r->ExceptionAddress;
+    HMODULE m = NULL; char mod[MAX_PATH] = "";
+    if (ip >= exe && ip < exe_end) APPEND("wintears.exe %#llx", (unsigned long long)(ip - exe + 0x140000000ull));
+    else if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ip, &m) && m) {
+        GetModuleFileNameA(m, mod, sizeof mod);
+        const char *base = strrchr(mod, '\\'); APPEND("%s+%#llx", base ? base + 1 : mod, (unsigned long long)(ip - (uintptr_t)m));
+    } else APPEND("%p (generated code: the JIT)", (void *)ip);
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2)
+        APPEND(", %s %p", r->ExceptionInformation[0] == 1 ? "writing" : r->ExceptionInformation[0] == 8 ? "executing" : "reading", (void *)r->ExceptionInformation[1]);
+#if defined(_M_X64) || defined(__x86_64__)
+    APPEND("; stack:");
+    const uintptr_t *sp = (const uintptr_t *)(uintptr_t)c->Rsp;
+    MEMORY_BASIC_INFORMATION mi;
+    if (VirtualQuery(sp, &mi, sizeof mi) == sizeof mi) {
+        uintptr_t end = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+        for (int i = 0, n = 0; i < 1024 && n < 16 && (uintptr_t)(sp + i + 1) <= end; i++)
+            if (sp[i] >= exe && sp[i] < exe_end) { APPEND(" %#llx", (unsigned long long)(sp[i] - exe + 0x140000000ull)); n++; }
+    }
+#endif
+#undef APPEND
+    fputs(b, stderr); fputc('\n', stderr);
+    pal_tee_flush();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static BOOL CALLBACK veh_init(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
+    SetUnhandledExceptionFilter(crash_filter);
     return AddVectoredExceptionHandler(1, veh) != NULL;
 }
 
