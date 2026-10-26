@@ -1134,6 +1134,10 @@ void pal_exception_report(char *out, size_t cap) {
 }
 #undef APPEND
 
+uint64_t pal_available_memory(void) {
+    MEMORYSTATUSEX m = {.dwLength = sizeof m};
+    return GlobalMemoryStatusEx(&m) ? m.ullAvailPhys : 0;
+}
 uint64_t pal_total_memory(void) {
     MEMORYSTATUSEX m = {.dwLength = sizeof m};
     return GlobalMemoryStatusEx(&m) ? m.ullTotalPhys : 0;

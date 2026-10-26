@@ -178,7 +178,7 @@ static void c1_place(vk_shader *s, const uint8_t *data, uint32_t n) {
     VkDeviceSize at = (g_c1_used + al - 1) & ~(al - 1);
     if (!g_c1_buf || at + n + 65536 > C1_ARENA) {   /* a new arena (the old one stays: shaders keep pointing into it) */
         VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = C1_ARENA, .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-        VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VmaAllocationCreateInfo ac = {.usage = vk_prefer_device()};
         VKC(vmaCreateBuffer(vk_vma, &bi, &ac, &g_c1_buf, &g_c1_al, NULL));
         at = 0;
         vkCmdFillBuffer(vk_pre(), g_c1_buf, 0, VK_WHOLE_SIZE, 0);

@@ -326,8 +326,10 @@ static import_t *alias_window(uint64_t a, uint64_t b) {   /* g_pool_mu held */
 static int in_alias(uint64_t a, uint64_t b) { uint64_t base, size; host_alias_region(&base, &size); return a >= base && b <= base + size; }
 static int heap_whole(void) {
     static int whole = -1;
-    if (whole < 0) { const char *e = pal_getenv("TOTK_IMPORT_HEAP"); whole = e ? *e != '0' : !pal_under_wine();
-                     if (!whole) VLOG("the heap's pools are given to the GPU in 16 MiB windows of the heap (%s)", e ? "TOTK_IMPORT_HEAP=0" : "Wine / Proton"); }
+    if (whole < 0) { const char *e = pal_getenv("TOTK_IMPORT_HEAP"); int few = vk_props.limits.maxMemoryAllocationCount < 16384;
+                     whole = e ? *e != '0' : !pal_under_wine() && !few;
+                     if (!whole) VLOG("the heap's pools are given to the GPU in 16 MiB windows of the heap (%s)", e ? "TOTK_IMPORT_HEAP=0" : pal_under_wine() ? "Wine / Proton" :
+                                      "the driver allows few allocations: one import per pool made 3,000 of its 4,096 on a laptop"); }
     return whole;
 }
 static void windows_drop(uintptr_t lo, uintptr_t hi, import_t **out, int *n, int cap, int overlapping) {   /* g_pool_mu held: take windows out */
@@ -699,8 +701,9 @@ static void *mem_thread(void *unused) {
         if (!line) continue;
         pal_memory_breakdown(r, 3, line, 2048);
         VLOG("memory by region: %s", line);
-        { extern void alloc_big_report(char *out, size_t cap); alloc_big_report(line, 2048); VLOG("host allocations: %s", line); }
-        { extern void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs); uint64_t b, sl; jit_compile_stats(&b, &sl); VLOG("JIT: %llu blocks compiled (all cores)", (unsigned long long)b); }
+        /* weak: the test programs link this file without the exe's allocator and JIT */
+        { extern void alloc_big_report(char *out, size_t cap) __attribute__((weak)); if (alloc_big_report) { alloc_big_report(line, 2048); VLOG("host allocations: %s", line); } }
+        { extern void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs) __attribute__((weak)); if (jit_compile_stats) { uint64_t b, sl; jit_compile_stats(&b, &sl); VLOG("JIT: %llu blocks compiled (all cores)", (unsigned long long)b); } }
         free(line);
     }
     return NULL;
@@ -759,6 +762,9 @@ static int init(void) {
     pthread_detach(t);
     if (pthread_create(&t, NULL, submit_thread, NULL)) die("Vulkan: submission thread");
     host_on_heap_shrink(heap_shrinking);
+    /* windowed imports go with content checks (as under Proton): with write protection as well, a submission took about
+       a second on the PC (TOTK_IMPORT_HEAP=0 without TOTK_DIRTY_PROTECT=0) */
+    { void nvn_dirty_no_protect(const char *why); if (!heap_whole()) nvn_dirty_no_protect("the GPU gets the heap in windows"); }
     host_on_alias_unmap(heap_shrinking);
     pthread_detach(t);
     vt_init(); vs_init(); vd_init();
@@ -784,6 +790,12 @@ static uint64_t g_sub_max;
 static _Atomic uint64_t g_sub_ns, g_sub_n, g_gpu_lat_ns, g_gpu_lat_n, g_wait_ns;
 /* Where memory goes (every 10 s, and before an out-of-memory failure). */
 int vk_integrated; uint64_t vk_local_heap;
+VmaMemoryUsage vk_prefer_device(void) {
+    static int host = -1;
+    if (host < 0) { const char *e = pal_getenv("TOTK_PREFER_HOST"); host = e ? *e == '1' : vk_integrated && vk_local_heap < (1ull << 30);
+                    VLOG("GPU resources in %s (TOTK_PREFER_HOST)", host ? "shared memory: the GPU's own heap is small" : "the GPU's own memory first"); }
+    return host ? VMA_MEMORY_USAGE_AUTO_PREFER_HOST : VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+}
 /* The memory guard: every 64 submissions, the process's resident memory plus, on a GPU that shares system memory, what
    the driver holds, against a budget (TOTK_MEMORY_BUDGET_MB; default 7 GiB, less on machines with under 8.5 GiB, so
    that the system keeps 1.5 GiB). Over it, re-uploadable textures go at once (vt_pressure). */
@@ -795,7 +807,9 @@ static uint64_t mem_total(void) {
     if (vk_integrated || count_gpu) {
         VmaBudget b[VK_MAX_MEMORY_HEAPS]; vmaGetHeapBudgets(vk_vma, b);
         VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(vk_phys, &mp);
-        for (uint32_t i = 0; i < mp.memoryHeapCount; i++) res += b[i].usage;
+        uint64_t drv = 0;
+        for (uint32_t i = 0; i < mp.memoryHeapCount; i++) drv += b[i].usage;
+        res += drv > g_import_bytes ? drv - g_import_bytes : 0;   /* imported memory is the process's own: counted once */
     }
     return res;
 }
@@ -812,7 +826,9 @@ static void mem_guard(void) {
     }
     uint64_t t = mem_total();
     if (t > g_mem_peak) g_mem_peak = t;
-    vt_pressure = t > g_mem_budget;
+    uint64_t avail = pal_available_memory();
+    vt_pressure = t > g_mem_budget || (avail && avail < (768ull << 20));   /* or the system is short: Windows pages the game out */
+    if (vt_pressure) { static int n; if (n++ < 10) VLOG("memory guard: total %.0f MiB, system available %.0f MiB", t / 1048576.0, avail / 1048576.0); }
 }
 void vk_log_memory(void) {
     uint64_t res = 0, com = 0, hb = 0, hs = 0; pal_process_memory(&res, &com); host_heap_range(&hb, &hs);

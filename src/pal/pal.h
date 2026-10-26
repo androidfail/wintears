@@ -160,6 +160,7 @@ void pal_debug_write(const char *text);
 /* This process's memory: resident (working set) and private committed bytes. 0 on success. */
 int pal_process_memory(uint64_t *resident, uint64_t *committed);
 uint64_t pal_total_memory(void);   /* the machine's physical memory in bytes */
+uint64_t pal_available_memory(void);   /* physical memory free for use now */
 
 /* Where the process's memory is: committed and resident bytes per named range (the first that holds a region wins),
    then the rest by kind (private, mapped files, DLLs), and the largest unnamed private regions. One line into out. */

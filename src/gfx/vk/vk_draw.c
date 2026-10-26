@@ -82,7 +82,7 @@ static VkImageView dummy_image(VkImageViewType t, int storage) {
         .imageType = t == VK_IMAGE_VIEW_TYPE_1D || t == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? VK_IMAGE_TYPE_1D : t == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
         .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = {1, 1, 1}, .mipLevels = 1, .arrayLayers = cube ? 6 : 1, .samples = VK_SAMPLE_COUNT_1_BIT,
         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
-    VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo ac = {.usage = vk_prefer_device()};
     VkImage img; VmaAllocation al;
     VKC(vmaCreateImage(vk_vma, &ci, &ac, &img, &al, NULL));
     VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
@@ -102,7 +102,7 @@ static VkImageView dummy_image(VkImageViewType t, int storage) {
 
 static void fixed_init(void) {
     if (g_support) return;
-    VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo ac = {.usage = vk_prefer_device()};
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 1392, .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VKC(vmaCreateBuffer(vk_vma, &bi, &ac, &g_support, &g_support_al, NULL));
     bi.size = ZERO_SIZE;
@@ -198,7 +198,7 @@ static const shadow *shadow_make(uint64_t a, uint64_t n) {
     *x = (shadow){a, a + n, hb, ho};
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
                              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-    VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo ac = {.usage = vk_prefer_device()};
     VKC(vmaCreateBuffer(vk_vma, &bi, &ac, &x->dev, &x->al, NULL));
     /* filled in replay order (not in the uploads buffer): GPU writes earlier in this submission are in it */
     vx_end_pass();
@@ -536,7 +536,7 @@ uint64_t vk_ns_pipe_bg;   /* pipeline building on the workers (the 10-second lin
    2 s per 10 s on the Steam Deck when entering an area). Compute work is never left out. */
 int async_shaders(void) {
     static int on = -1;
-    if (on < 0) { const char *e = pal_getenv("TOTK_ASYNC_SHADERS"); on = e ? *e == '1' : pal_under_wine();
+    if (on < 0) { const char *e = pal_getenv("TOTK_ASYNC_SHADERS"); on = e ? *e == '1' : pal_under_wine() || vk_integrated;   /* a laptop: 5.8 s frames building them */
                   VLOG("shaders and pipelines: %s (TOTK_ASYNC_SHADERS)", on ? "made in the background, draws wait for them" : "made when first needed"); }
     return on;
 }

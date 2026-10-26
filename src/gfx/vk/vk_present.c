@@ -61,7 +61,7 @@ static int create_swapchain(void) {
     VkImageCreateInfo mi = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = g_fmt, .extent = {ext.width, ext.height, 1},
         .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-    VmaAllocationCreateInfo mac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo mac = {.usage = vk_prefer_device()};
     VKC(vmaCreateImage(vk_vma, &mi, &mac, &g_mid, &g_mid_al, NULL));
     g_mid_fresh = 1;
     if (!g_cp_pool) { VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = vk_qfam}; VKC(vkCreateCommandPool(vk_dev, &pi, NULL, &g_cp_pool)); }
@@ -113,7 +113,7 @@ static VkImage unorm_copy(VkCommandBuffer c, const vtex *e, uint32_t w, uint32_t
         VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-        VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VmaAllocationCreateInfo ac = {.usage = vk_prefer_device()};
         g_raw = VK_NULL_HANDLE;
         if (vmaCreateImage(vk_vma, &ci, &ac, &g_raw, &g_raw_al, NULL) != VK_SUCCESS) { g_raw = VK_NULL_HANDLE; return vt_image(e); }
         g_raw_fmt = f; g_raw_w = w; g_raw_h = h;

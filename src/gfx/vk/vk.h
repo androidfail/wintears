@@ -67,7 +67,10 @@ void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *
 /* fn(arg) on the completion thread once the open submission has completed (in submission order). */
 void vk_after(void (*fn)(void *arg), void *arg);
 void vk_wait_done(uint64_t fence);   /* the CPU-side effects up to fence have run too */
-void vk_lost(int r);   /* VK_ERROR_DEVICE_LOST: logs what the driver says went wrong (then the caller dies) */
+void vk_lost(int r);
+/* VMA usage for what the GPU reads and writes: its own memory, or shared memory on an integrated GPU whose own heap is
+   under 1 GiB (a laptop's 256 MiB carve-out filled up and allocations failed; TOTK_PREFER_HOST=1 forces it) */
+VmaMemoryUsage vk_prefer_device(void);   /* VK_ERROR_DEVICE_LOST: logs what the driver says went wrong (then the caller dies) */
 /* n bytes to guest address dst by the CPU once the open submission has completed: src's bytes as they are now
    (snapshot) or as they are then (src stays valid, e.g. guest memory) */
 void vk_after_write(uint64_t dst, const void *src, size_t n, int snapshot);

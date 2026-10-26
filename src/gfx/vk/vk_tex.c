@@ -275,7 +275,7 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = fl, .imageType = e->type, .format = e->fmt,
         .extent = {e->w, e->h, e->d}, .mipLevels = e->levels, .arrayLayers = e->layers, .samples = (VkSampleCountFlagBits)k->samples,
         .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-    VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo ac = {.usage = vk_prefer_device()};
     VkResult r = vmaCreateImage(vk_vma, &ci, &ac, &e->img, &e->al, NULL);
     if (r != VK_SUCCESS) {
         VLOG("image %ux%ux%u x%u levels %u format %d (NVN %#x target %d) not created (%d)", e->w, e->h, e->d, e->layers, e->levels,

@@ -165,12 +165,14 @@ void nvn_dirty_remove_range(const void *mem) {
     pthread_mutex_unlock(&g_slot_mu);
 }
 int nvn_dirty_tracked(const void *addr, size_t len) { range_t *r = find((uintptr_t)addr); return r && (uintptr_t)addr + len <= r->end; }
-int nvn_dirty_protecting(void) { static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_DIRTY_PROTECT"); on = e ? *e != '0' : !pal_under_wine(); } return on; }
+static const char *g_no_protect;   /* why write protection is off by default (nvn_dirty_no_protect, vk_dev.c) */
+void nvn_dirty_no_protect(const char *why) { g_no_protect = why; }   /* before any pool: content checks instead */
+int nvn_dirty_protecting(void) { static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_DIRTY_PROTECT"); on = e ? *e != '0' : !pal_under_wine() && !g_no_protect; } return on; }
 void nvn_dirty_protect(const void *addr, size_t len) {
     /* TOTK_DIRTY_PROTECT=0: pages are never made read-only (diagnosis: an AMD driver under Proton may refuse imported
        memory with read-only pages). Textures then never see later CPU writes. */
-    static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_DIRTY_PROTECT"); on = e ? *e != '0' : !pal_under_wine();
-        if (!on) LOG("dirty tracking by write protection: off (%s); textures are checked by content instead", e ? "TOTK_DIRTY_PROTECT=0" : "Wine / Proton: the Linux GPU driver refuses imported memory whose protection changes"); }
+    static int on = -1; if (on < 0) { on = nvn_dirty_protecting(); const char *e = pal_getenv("TOTK_DIRTY_PROTECT");
+        if (!on) LOG("dirty tracking by write protection: off (%s); textures are checked by content instead", e ? "TOTK_DIRTY_PROTECT=0" : g_no_protect ? g_no_protect : "Wine / Proton: the Linux GPU driver refuses imported memory whose protection changes"); }
     if (!on) return;
     if (!len || !nvn_dirty_tracked(addr, len)) return;
     range_t *r = find((uintptr_t)addr);

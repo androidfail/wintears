@@ -474,7 +474,7 @@ static VkImage tmp_image(VkFormat f, uint32_t w, uint32_t h) {
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-    VmaAllocationCreateInfo ac = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationCreateInfo ac = {.usage = vk_prefer_device()};
     tmp_ent t = {f, w, h, VK_NULL_HANDLE, NULL};
     if (vmaCreateImage(vk_vma, &ci, &ac, &t.img, &t.al, NULL) != VK_SUCCESS) return VK_NULL_HANDLE;
     VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
