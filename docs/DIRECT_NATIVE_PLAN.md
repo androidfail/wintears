@@ -130,7 +130,21 @@ What it means:
 - **Size.** At a few C lines per instruction, 13.6 M instructions make tens of millions of lines; compile time is
   measured first thing in phase 1.
 
-### Run-time split (needs game runs)
+### PC run (2026-10-26, desktop PC, 5.5 minutes, `TOTK_DIAG=1 TOTK_SAMPLE=1`, scripted input into the save)
+
+- 30.0 fps throughout (the game's cap); the three virtual cores were free about 79% of the time.
+- **Start-up:** 9.4 s of JIT compiling (728,000 blocks) in the first 10-second window.
+- **After that:** compiling is 0–100 ms per 10 s (under 0.4% of the cores' time), small bursts when new areas load.
+- **Steady state, per 10 s of the three cores (30 core-s):** guest code about 3.5 s (12%), svcs and host calls about
+  2.7 s, free about 23.6 s.
+- **JIT code caches resident:** about 220 MiB (89 + 67 + 65 MiB).
+
+On the PC the CPU is not the limit: Direct Native would remove about 9 s of start-up compiling, the small compile
+bursts and about 220 MiB of memory, not raise the frame rate. The decision rests on the Steam Deck run: its CPU is
+slower, Wine makes JIT memory handling dearer, and an earlier Deck log (commit `9f7a9c4`) showed the cores inside
+guest code for 2–3 cores' worth of wall time.
+
+### Run-time split (Steam Deck run still needed)
 
 The 10-second `waits` line (with `TOTK_DIAG=1`) now also shows **JIT compiling** time and blocks, next to the core-time
 split "guest code (compiling included) / free / handing over / svcs and host calls". Wanted: about 5 minutes of play
