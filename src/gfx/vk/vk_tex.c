@@ -429,7 +429,9 @@ static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
        whole at every check, never sampled */
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     int glyphs = bpb == 1 && bw == 1 && bh == 1 && n <= (4u << 20);
-    if (n > (16u << 10) && !e->hot && (sub + phase) % 4) return 0;   /* cold: looked at every 4th submission */
+    /* cold: looked at every 4th submission. Not glyph caches: text drawn once into a cached image (menus, dialogue)
+       in a submission that missed new glyphs kept those letters missing on the Steam Deck. */
+    if (n > (16u << 10) && !e->hot && !glyphs && (sub + phase) % 4) return 0;
     int whole = n <= (1u << 20) || glyphs || e->hot || (sub + phase) % every == 0;
     int changed = whole ? hash_whole(t->mem, n) != e->hash : hash_sampled(t->mem, n) != e->shash;
     if (changed) e->hot = 64; else if (e->hot) e->hot--;
