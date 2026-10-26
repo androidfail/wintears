@@ -800,6 +800,12 @@ static int region_layers(const vtex *e, const NVNcopyRegion *r, unsigned layer0,
     return *l0 + *nl <= e->layers;
 }
 
+typedef struct { const uint8_t *st; uint8_t *dst; size_t row, img, wb, hb; int nimg; } texel_out;
+static void texels_out(void *arg) {
+    const texel_out *o = arg;
+    for (int z = 0; z < o->nimg; z++) for (size_t y = 0; y < o->hb; y++)
+        memcpy(o->dst + (size_t)z * o->img + y * o->row, o->st + ((size_t)z * o->hb + y) * o->wb, o->wb);
+}
 void vt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (size_t)(r->height + bh - 1) / bh;
@@ -822,10 +828,14 @@ void vt_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNco
                             .imageExtent = {(uint32_t)r->width, e->type == VK_IMAGE_TYPE_1D ? 1 : (uint32_t)r->height, (uint32_t)nz}};
     vkCmdCopyImageToBuffer(c, e->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &cp);
     vk_barrier(c);
+    /* Copied out by the completion thread, before it recycles the submission's staging chunks (and before vk_wait_done
+       returns): read after the wait, the chunk was already reused or freed (garbage read-backs; on the Steam Deck, with
+       chunks of their own, a crash reading unmapped memory). */
+    texel_out o = {st, dst, row, img, wb, hb, nimg};
+    vk_after(texels_out, &o);
     uint64_t f = vk_flush(NULL, NULL);
     pthread_mutex_unlock(&vk_mu);
-    vk_wait_done(f);   /* the staging memory stays until the completion thread moves past f, after this returns */
-    for (int z = 0; z < nimg; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + (size_t)z * img + y * row, st + ((size_t)z * hb + y) * wb, wb);
+    vk_wait_done(f);
 }
 
 /* ---------- write-back of rendered textures ----------
