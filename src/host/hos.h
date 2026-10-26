@@ -47,10 +47,10 @@ void *host_guest_alloc(size_t size);              /* zeroed guest-visible memory
 void host_heap_range(uint64_t *base, uint64_t *size);
 /* fn(lo, hi) runs before the heap gives back [lo, hi) (SetHeapSize smaller); the GPU backend drops its windows there */
 void host_on_heap_shrink(void (*fn)(uint64_t lo, uint64_t hi));
-/* The alias region (MapPhysicalMemory): its range, the mapped run around [a, b) within [lim_lo, lim_hi) (0 when a page
-   of [a, b) is not mapped), and fn(lo, hi) run before pages there are unmapped. */
+/* The alias region (MapPhysicalMemory): its range, whether every 16 MiB grain (from its start) of [lo, hi) is committed
+   (a page in it mapped), and fn(lo, hi) run before grains there are decommitted. */
 void host_alias_region(uint64_t *base, uint64_t *size);
-int host_alias_run(uint64_t a, uint64_t b, uint64_t lim_lo, uint64_t lim_hi, uint64_t *lo, uint64_t *hi);
+int host_alias_committed(uint64_t lo, uint64_t hi);
 void host_on_alias_unmap(void (*fn)(uint64_t lo, uint64_t hi));   /* the guest heap now (SetHeapSize): one committed range */
 #define HOST_RETURN_SVC 0xfffeu
 

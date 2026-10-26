@@ -20,6 +20,7 @@
 #define GUEST_ADDRESS_LIMIT (1ull << 39)
 #define ALIAS_SPACE_AT 0x7000000000ull
 #define ALIAS_SIZE_MAX (64ull << 30)
+#define ALIAS_GRAIN (16ull << 20)
 #define LOW_SEARCH_FROM 0x300000000ull
 #define LOW_SIZE (6ull << 30)
 #define CODE_SIZE 0x0fc00000ull
@@ -59,20 +60,16 @@ static unsigned char tls_used[TLS_COUNT];
 static void (*g_heap_shrink)(uint64_t lo, uint64_t hi), (*g_alias_unmap)(uint64_t lo, uint64_t hi);
 void host_on_alias_unmap(void (*fn)(uint64_t lo, uint64_t hi)) { g_alias_unmap = fn; }
 void host_alias_region(uint64_t *base, uint64_t *size) { *base = ALIAS_START; *size = alias_size; }
-/* The run of mapped alias pages around [a, b), within [lim_lo, lim_hi): 0 if a page of [a, b) is not mapped. */
-int host_alias_run(uint64_t a, uint64_t b, uint64_t lim_lo, uint64_t lim_hi, uint64_t *lo, uint64_t *hi) {
-    if (a < ALIAS_START || b > alias_start + alias_size || b <= a) return 0;
-    if (lim_lo < ALIAS_START) lim_lo = ALIAS_START;
-    if (lim_hi > alias_start + alias_size) lim_hi = alias_start + alias_size;
-    uint64_t p0 = (a - ALIAS_START) / 4096, p1 = (b - 1 - ALIAS_START) / 4096, q0 = (lim_lo - ALIAS_START) / 4096, q1 = (lim_hi - ALIAS_START) / 4096;
+/* The alias region is committed in grains of ALIAS_GRAIN from its start: a grain stays committed (and readable) while
+   any page in it is mapped; pages unmapped in a grain still in use are discarded and come back zeroed. The GPU is given
+   whole grains (Wine / Proton): TOTK keeps its physical memory as hundreds of separate runs of about 1 MiB, one GPU
+   import each at page granularity, and every import is named in every submission (750 imports: 12 ms each). */
+static uint32_t alias_grain_pages[ALIAS_SIZE_MAX / ALIAS_GRAIN];   /* mapped pages per grain */
+int host_alias_committed(uint64_t lo, uint64_t hi) {
+    if (lo < ALIAS_START || hi > alias_start + alias_size || hi <= lo) return 0;
     pal_mutex_lock(&memory_lock);
     int ok = 1;
-    for (uint64_t p = p0; ok && p <= p1; p++) ok = alias_pages[p] != 0;
-    if (ok) {
-        while (p0 > q0 && alias_pages[p0 - 1]) p0--;
-        while (p1 + 1 < q1 && alias_pages[p1 + 1]) p1++;
-        *lo = ALIAS_START + p0 * 4096; *hi = ALIAS_START + (p1 + 1) * 4096;
-    }
+    for (uint64_t g = (lo - ALIAS_START) / ALIAS_GRAIN; ok && g <= (hi - 1 - ALIAS_START) / ALIAS_GRAIN; g++) ok = alias_grain_pages[g] != 0;
     pal_mutex_unlock(&memory_lock);
     return ok;
 }
@@ -313,7 +310,7 @@ static uint64_t alias_map(int unmap, uint64_t addr, uint64_t size) {
     pal_mutex_lock(&memory_lock);
     uint64_t first = (addr - ALIAS_START) / 4096, count = size / 4096;
     /* Horizon maps only the still unmapped pages of the range and keeps mapped pages and their contents: TOTK's
-       physical-memory heaps grow by mapping ranges that overlap what they own. Committing committed pages keeps them. */
+       physical-memory heaps grow by mapping ranges that overlap what they own. */
     uint64_t fresh = 0;
     if (!unmap) for (uint64_t i = 0; i < count; i++) if (!alias_pages[first + i]) fresh += 4096;
     /* LimitReached (132), which the SDK turns into its recoverable out-of-memory result */
@@ -322,16 +319,36 @@ static uint64_t alias_map(int unmap, uint64_t addr, uint64_t size) {
         for (unsigned i = 0; i < nstack_maps; i++)
             if (overlaps(addr, size, stack_maps[i].src, stack_maps[i].size)) { pal_mutex_unlock(&memory_lock); return 0xdc01; }
         uint64_t released = 0;
-        for (uint64_t i = 0; i < count; i++) if (alias_pages[first + i]) { alias_pages[first + i] = 0; released += 4096; }
+        for (uint64_t i = 0; i < count; i++)
+            if (alias_pages[first + i]) { alias_pages[first + i] = 0; alias_grain_pages[(first + i) * 4096 / ALIAS_GRAIN]--; released += 4096; }
         alias_bytes -= released;
-        /* The GPU lets go of these pages before they go (outside the lock: it waits for the GPU). They are marked
-           unmapped first, so no new GPU window can be made over them meanwhile: a window over decommitted pages lost
-           the device at the next submission on the Steam Deck. */
-        if (g_alias_unmap) { pal_mutex_unlock(&memory_lock); g_alias_unmap(addr, addr + size); pal_mutex_lock(&memory_lock); }
-        if (pal_decommit((uintptr_t)addr, (size_t)size)) die("decommit physical alias pages");
+        uint64_t g0 = (addr - ALIAS_START) / ALIAS_GRAIN, g1 = (addr + size - 1 - ALIAS_START) / ALIAS_GRAIN, e0 = UINT64_MAX, e1 = 0;
+        for (uint64_t g = g0; g <= g1; g++) if (!alias_grain_pages[g]) { if (e0 == UINT64_MAX) e0 = g; e1 = g; }
+        /* Grains left empty go: the GPU lets go of them first (outside the lock: it waits for the GPU). They are marked
+           empty before, so no new GPU window can be made over them meanwhile: a window over decommitted pages lost the
+           device at the next submission on the Steam Deck. */
+        if (e0 != UINT64_MAX && g_alias_unmap) {
+            pal_mutex_unlock(&memory_lock);
+            g_alias_unmap(ALIAS_START + e0 * ALIAS_GRAIN, ALIAS_START + (e1 + 1) * ALIAS_GRAIN);
+            pal_mutex_lock(&memory_lock);
+        }
+        for (uint64_t g = g0; g <= g1; g++) {
+            uint64_t glo = ALIAS_START + g * ALIAS_GRAIN, lo = addr > glo ? addr : glo, hi = addr + size < glo + ALIAS_GRAIN ? addr + size : glo + ALIAS_GRAIN;
+            if (!alias_grain_pages[g]) { if (pal_decommit((uintptr_t)glo, (size_t)ALIAS_GRAIN)) die("decommit physical alias pages"); }
+            else pal_discard((uintptr_t)lo, (size_t)(hi - lo));   /* stays readable: a GPU window may hold the grain */
+        }
     } else if (fresh) {
-        if (pal_commit((uintptr_t)addr, (size_t)size, PAL_PROT_READ | PAL_PROT_WRITE)) die("commit physical alias pages");
-        memset(alias_pages + first, 1, count);
+        for (uint64_t g = (addr - ALIAS_START) / ALIAS_GRAIN; g <= (addr + size - 1 - ALIAS_START) / ALIAS_GRAIN; g++) {
+            uint64_t glo = ALIAS_START + g * ALIAS_GRAIN;
+            uint64_t p0 = (addr > glo ? addr : glo) - ALIAS_START, p1 = (addr + size < glo + ALIAS_GRAIN ? addr + size : glo + ALIAS_GRAIN) - ALIAS_START;
+            int was = alias_grain_pages[g] != 0;   /* else committed now: zero-filled */
+            if (!was && pal_commit((uintptr_t)glo, (size_t)ALIAS_GRAIN, PAL_PROT_READ | PAL_PROT_WRITE)) die("commit physical alias pages");
+            for (uint64_t p = p0 / 4096; p < p1 / 4096; p++)
+                if (!alias_pages[p]) {
+                    alias_pages[p] = 1; alias_grain_pages[g]++;
+                    if (was) memset((void *)(uintptr_t)(ALIAS_START + p * 4096), 0, 4096);   /* discarded pages read back as anything */
+                }
+        }
         alias_bytes += fresh;
     }
     pal_mutex_unlock(&memory_lock);
