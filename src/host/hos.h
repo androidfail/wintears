@@ -45,6 +45,7 @@ uint64_t host_main_stack(uint64_t *size);
 uint64_t host_object_page(void);                  /* a guest page for host tokens the game only passes back (vi Display, Layer) */
 void *host_guest_alloc(size_t size);              /* zeroed guest-visible memory for host data the game reads; never freed */
 void host_heap_range(uint64_t *base, uint64_t *size);
+void host_guest_layout(uint64_t *low_base, uint64_t *low_size, uint64_t *heap_cap);   /* the guest's low region (code, stacks, heap) */
 /* fn(lo, hi) runs before the heap gives back [lo, hi) (SetHeapSize smaller); the GPU backend drops its windows there */
 void host_on_heap_shrink(void (*fn)(uint64_t lo, uint64_t hi));
 /* The alias region (MapPhysicalMemory): its range, whether every 16 MiB grain (from its start) of [lo, hi) is committed

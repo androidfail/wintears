@@ -74,6 +74,7 @@ int host_alias_committed(uint64_t lo, uint64_t hi) {
     return ok;
 }
 void host_on_heap_shrink(void (*fn)(uint64_t lo, uint64_t hi)) { g_heap_shrink = fn; }
+void host_guest_layout(uint64_t *low_base, uint64_t *low_size, uint64_t *heap_cap) { *low_base = low; *low_size = LOW_SIZE; *heap_cap = HEAP_CAP; }
 void host_heap_range(uint64_t *base, uint64_t *size) {
     pal_mutex_lock(&memory_lock); *base = heap; *size = heap_size; pal_mutex_unlock(&memory_lock);
 }

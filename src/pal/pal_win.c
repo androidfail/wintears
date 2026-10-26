@@ -1100,6 +1100,59 @@ int pal_process_memory(uint64_t *resident, uint64_t *committed) {
     return 0;
 }
 
+void pal_memory_breakdown(const pal_range *r, int n, char *out, size_t cap) {
+    enum { KINDS = 3, MAXN = 16, TOP = 10, BATCH = 512 };
+    static const char *const kind[KINDS] = {"other private", "mapped files", "DLLs"};
+    uint64_t com[MAXN + KINDS] = {0}, res[MAXN + KINDS] = {0};
+    struct { uintptr_t base; uint64_t com, res; int x; } top[TOP] = {{0}};
+    if (n > MAXN) n = MAXN;
+    PSAPI_WORKING_SET_EX_INFORMATION *ws = malloc(BATCH * sizeof *ws);
+    if (!ws) { snprintf(out, cap, "no memory for the breakdown"); return; }
+    uintptr_t at = 0x10000, cur_base = 0; uint64_t cur_com = 0, cur_res = 0; int cur_other = 0, cur_x = 0;
+    MEMORY_BASIC_INFORMATION mi;
+    for (;;) {
+        int more = VirtualQuery((void *)at, &mi, sizeof mi) == sizeof mi;
+        uintptr_t base = more ? (uintptr_t)mi.AllocationBase : 0;
+        if (cur_other && (!more || base != cur_base)) {   /* an unnamed private allocation ended: keep the largest */
+            int m = 0; for (int i = 1; i < TOP; i++) if (top[i].res < top[m].res) m = i;
+            if (cur_res > top[m].res) { top[m].base = cur_base; top[m].com = cur_com; top[m].res = cur_res; top[m].x = cur_x; }
+            cur_other = 0;
+        }
+        if (!more) break;
+        if (mi.State == MEM_COMMIT) {
+            uintptr_t lo = (uintptr_t)mi.BaseAddress, hi = lo + mi.RegionSize;
+            int c = -1;
+            for (int i = 0; i < n && c < 0; i++) if (lo >= r[i].lo && hi <= r[i].hi) c = i;
+            if (c < 0) c = n + (mi.Type == MEM_IMAGE ? 2 : mi.Type == MEM_MAPPED ? 1 : 0);
+            uint64_t rs = 0;
+            for (uintptr_t p = lo; p < hi; p += (uintptr_t)BATCH * 4096) {   /* small batches: the address space lock is held briefly */
+                size_t k = (hi - p) / 4096 < BATCH ? (hi - p) / 4096 : BATCH;
+                for (size_t i = 0; i < k; i++) ws[i].VirtualAddress = (void *)(p + i * 4096);
+                if (K32QueryWorkingSetEx(GetCurrentProcess(), ws, (DWORD)(k * sizeof *ws)))
+                    for (size_t i = 0; i < k; i++) rs += ws[i].VirtualAttributes.Valid ? 4096 : 0;
+            }
+            com[c] += mi.RegionSize; res[c] += rs;
+            if (c == n) { if (!cur_other || cur_base != base) { cur_base = base; cur_com = cur_res = 0; cur_x = 0; } cur_other = 1; cur_x |= (mi.Protect & 0xf0) != 0; cur_com += mi.RegionSize; cur_res += rs; }
+        }
+        uintptr_t next = (uintptr_t)mi.BaseAddress + mi.RegionSize;
+        if (next <= at || next >= (uintptr_t)0x7fffffff0000ull) break;
+        at = next;
+    }
+    free(ws);
+    size_t len = 0;
+#define APPEND(...) do { int w_ = snprintf(out + len, len < cap ? cap - len : 0, __VA_ARGS__); if (w_ > 0) len += (size_t)w_; } while (0)
+    out[0] = 0;
+    for (int i = 0; i < n + KINDS; i++)
+        APPEND("%s%s %.0f/%.0f", i ? ", " : "", i < n ? r[i].name : kind[i - n], res[i] / 1048576.0, com[i] / 1048576.0);
+    APPEND(" MiB resident/committed; largest other private (resident/committed MiB at base):");
+    for (int j = 0; j < TOP; j++) {   /* largest first */
+        int m = -1; for (int i = 0; i < TOP; i++) if (top[i].res && (m < 0 || top[i].res > top[m].res)) m = i;
+        if (m < 0) break;
+        APPEND(" %.0f/%.0f@%p%s", top[m].res / 1048576.0, top[m].com / 1048576.0, (void *)top[m].base, top[m].x ? " (code)" : ""); top[m].res = 0;
+    }
+#undef APPEND
+}
+
 void pal_debug_write(const char *text) {
     fputs(text, stderr);
     fflush(stderr);

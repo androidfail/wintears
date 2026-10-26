@@ -159,6 +159,10 @@ const char *pal_getenv(const char *name);       /* UTF-8; pointer valid until th
 void pal_debug_write(const char *text);
 /* This process's memory: resident (working set) and private committed bytes. 0 on success. */
 int pal_process_memory(uint64_t *resident, uint64_t *committed);
+/* Where the process's memory is: committed and resident bytes per named range (the first that holds a region wins),
+   then the rest by kind (private, mapped files, DLLs), and the largest unnamed private regions. One line into out. */
+typedef struct { uintptr_t lo, hi; const char *name; } pal_range;
+void pal_memory_breakdown(const pal_range *r, int n, char *out, size_t cap);
 /* Running under Wine / Proton (the Steam Deck). */
 int pal_under_wine(void);
 /* How long a short sleep really takes here (twenty sleeps of `ns`; the average in ns), for the log. */

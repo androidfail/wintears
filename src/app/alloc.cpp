@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <new>
 #include <windows.h>
 
@@ -61,17 +62,31 @@ inline long class_of(void *user) {
     return c <= kLargeClass ? static_cast<long>(c) : -1;
 }
 
-/* Large blocks: sizes rounded to a quarter of a power of two, freed ones kept by size, up to 256 MiB in all. */
+/* Large blocks: sizes rounded to a quarter of a power of two, freed ones kept by size, up to 64 MiB in all and none
+   of 16 MiB or more (rarely asked for again at the same size: 249 MiB sat unused in the cache at the title screen). */
 SRWLOCK g_large_mu = SRWLOCK_INIT;
 struct Lock { Lock() { AcquireSRWLockExclusive(&g_large_mu); } ~Lock() { ReleaseSRWLockExclusive(&g_large_mu); } };
 struct LargeFree { LargeFree *next; std::size_t size; };
 LargeFree *g_large_head;
 std::size_t g_large_bytes;
-constexpr std::size_t kLargeKeep = 256u << 20;
+constexpr std::size_t kLargeKeep = 64u << 20, kLargeKeepMax = 16u << 20;
 std::size_t large_round(std::size_t n) {
     std::size_t p = kLarge; while (p * 2 <= n) p *= 2;
     std::size_t q = p / 4, r = p; while (r < n) r += q;
     return r;
+}
+
+/* Blocks of 16 MiB and up alive, with the code that asked for them (the memory report, alloc_big_report). */
+struct Big { void *p; std::size_t n; void *ra; };
+Big g_big[64];
+void big_note(void *p, std::size_t n, void *ra) {
+    if (!p || n < (16u << 20)) return;
+    Lock l;
+    for (Big &b : g_big) if (!b.p) { b = {p, n, ra}; return; }
+}
+void big_gone(void *p) {
+    Lock l;
+    for (Big &b : g_big) if (b.p == p) { b.p = nullptr; return; }
 }
 
 void *place(unsigned char *raw, std::uint64_t cls, std::uint64_t size) {
@@ -106,6 +121,7 @@ void *alloc_or_null(std::size_t n) {
 void release(void *q) noexcept {
     if (!q) return;
     long c = class_of(q);
+    if (c == static_cast<long>(kLargeClass) && header_of(q)->size >= (16u << 20)) big_gone(q);
     if (c < 0) { __real_free(q); return; }   /* the runtime's own block */
     auto *raw = reinterpret_cast<unsigned char *>(header_of(q));
     if (c >= 1 && c <= static_cast<long>(kClasses)) {
@@ -114,7 +130,7 @@ void release(void *q) noexcept {
     } else if (c == static_cast<long>(kLargeClass)) {
         std::size_t r = header_of(q)->size;
         Lock l;
-        if (g_large_bytes + r <= kLargeKeep) {
+        if (r < kLargeKeepMax && g_large_bytes + r <= kLargeKeep) {
             auto *f = reinterpret_cast<LargeFree *>(raw); f->size = r; f->next = g_large_head; g_large_head = f; g_large_bytes += r;
             return;
         }
@@ -126,11 +142,12 @@ std::size_t usable(void *q) { return header_of(q)->size; }
 }  // namespace
 
 extern "C" {
-void *__wrap_malloc(std::size_t n) { return alloc_or_null(n); }
+void *__wrap_malloc(std::size_t n) { void *p = alloc_or_null(n); big_note(p, n, __builtin_return_address(0)); return p; }
 void __wrap_free(void *p) { release(p); }
 void *__wrap_calloc(std::size_t a, std::size_t b) {
     if (b && a > SIZE_MAX / b) return nullptr;
     void *p = alloc_or_null(a * b);
+    big_note(p, a * b, __builtin_return_address(0));
     if (p) std::memset(p, 0, a * b);
     return p;
 }
@@ -142,14 +159,15 @@ void *__wrap_realloc(void *p, std::size_t n) {
     if (n <= have && (n >= have / 2 || have <= kClasses * kStep)) return p;   /* fits, without wasting most of it */
     void *q = alloc_or_null(n);
     if (!q) return nullptr;
+    big_note(q, n, __builtin_return_address(0));
     std::memcpy(q, p, have < n ? have : n);
     release(p);
     return q;
 }
 }
 
-void *operator new(std::size_t n) { if (void *p = alloc_or_null(n)) return p; throw std::bad_alloc(); }
-void *operator new[](std::size_t n) { if (void *p = alloc_or_null(n)) return p; throw std::bad_alloc(); }
+void *operator new(std::size_t n) { if (void *p = alloc_or_null(n)) { big_note(p, n, __builtin_return_address(0)); return p; } throw std::bad_alloc(); }
+void *operator new[](std::size_t n) { if (void *p = alloc_or_null(n)) { big_note(p, n, __builtin_return_address(0)); return p; } throw std::bad_alloc(); }
 void *operator new(std::size_t n, const std::nothrow_t &) noexcept { return alloc_or_null(n); }
 void *operator new[](std::size_t n, const std::nothrow_t &) noexcept { return alloc_or_null(n); }
 void operator delete(void *p) noexcept { release(p); }
@@ -158,6 +176,19 @@ void operator delete(void *p, std::size_t) noexcept { release(p); }
 void operator delete[](void *p, std::size_t) noexcept { release(p); }
 void operator delete(void *p, const std::nothrow_t &) noexcept { release(p); }
 void operator delete[](void *p, const std::nothrow_t &) noexcept { release(p); }
+
+/* The live blocks of 16 MiB and up: "size MiB from code address" (addresses relative to the exe's preferred base, for
+   addr2line), and the bytes the large-block cache holds. */
+extern "C" void alloc_big_report(char *out, std::size_t cap) {
+    std::size_t len = 0;
+    auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    Lock l;
+    len += (std::size_t)std::snprintf(out, cap, "freed large blocks kept %.0f MiB; blocks of 16 MiB and up:", g_large_bytes / 1048576.0);
+    for (const Big &b : g_big)
+        if (b.p && len < cap)
+            len += (std::size_t)std::snprintf(out + len, cap - len, " %.0f MiB from %#llx", b.n / 1048576.0,
+                                              (unsigned long long)(reinterpret_cast<std::uintptr_t>(b.ra) - base + 0x140000000ull));
+}
 
 /* Self-check at start (main.c): blocks come back from the caches, sizes keep their class, foreign blocks pass through. */
 extern "C" int alloc_self_check(void) {

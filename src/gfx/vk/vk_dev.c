@@ -574,7 +574,9 @@ static chunk *new_chunk(VkDeviceSize size) {
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = c->size,   /* index: quads, 8-bit indices; texel: buffer textures copied (vk_tex.c) */
                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                       VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT};
-    VmaAllocationCreateInfo ac = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT, .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+    /* Dedicated: in VMA's shared blocks the 16 MiB chunks held a 256 MiB host-visible block, mapped and resident */
+    VmaAllocationCreateInfo ac = {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                                  .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
     VmaAllocationInfo info;
     VkResult r = vmaCreateBuffer(vk_vma, &bi, &ac, &c->buf, &c->al, &info);
     if (r != VK_SUCCESS) {   /* out of memory: let every earlier submission finish and hand its chunks back, drop the spare ones, try again */
@@ -683,6 +685,27 @@ uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo
     return s->fence;
 }
 
+/* Once a minute: where the process's memory is (the guest's heap, its physical memory, the rest of its address space,
+   then host allocations, mapped files and DLLs, and the largest host allocations: the JIT's code caches among them). */
+void host_guest_layout(uint64_t *low_base, uint64_t *low_size, uint64_t *heap_cap);
+static void *mem_thread(void *unused) {
+    (void)unused;
+    pal_thread_set_name("memory report");
+    for (;;) {
+        pal_sleep_ns(60000000000ull);
+        uint64_t lb, ls, hc, hb, hs, ab, as; host_guest_layout(&lb, &ls, &hc); host_heap_range(&hb, &hs); host_alias_region(&ab, &as);
+        pal_range r[] = {{hb, hb + hc, "game heap"}, {ab, ab + as, "game physical memory"}, {lb, lb + ls, "game code and stacks"}};
+        char *line = malloc(2048);
+        if (!line) continue;
+        pal_memory_breakdown(r, 3, line, 2048);
+        VLOG("memory by region: %s", line);
+        { extern void alloc_big_report(char *out, size_t cap); alloc_big_report(line, 2048); VLOG("host allocations: %s", line); }
+        { extern void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs); uint64_t b, sl; jit_compile_stats(&b, &sl); VLOG("JIT: %llu blocks compiled (all cores)", (unsigned long long)b); }
+        free(line);
+    }
+    return NULL;
+}
+
 static void lat_note(uint64_t ns);
 static void *done_thread(void *unused) {
     (void)unused;
@@ -732,6 +755,7 @@ static int init(void) {
     VKC(vkCreateSemaphore(vk_dev, &si, NULL, &g_tl));
     pthread_t t;
     if (pthread_create(&t, NULL, done_thread, NULL)) die("Vulkan: completion thread");
+    { pthread_t m; if (!pthread_create(&m, NULL, mem_thread, NULL)) pthread_detach(m); }
     pthread_detach(t);
     if (pthread_create(&t, NULL, submit_thread, NULL)) die("Vulkan: submission thread");
     host_on_heap_shrink(heap_shrinking);

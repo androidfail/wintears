@@ -39,6 +39,18 @@ if(WINTEARS_JIT)
   set(DYNARMIC_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
   # Older MinGW-w64 headers lack the newer CPU topology structs xbyak's cache query uses; dynarmic does not need it.
   add_compile_definitions($<$<COMPILE_LANGUAGE:CXX>:XBYAK_CPU_CACHE=0>)
+  # Our changes to dynarmic, applied to the submodule's working tree once (patches/): see each patch's comments.
+  foreach(p dynarmic-map-load-factor)
+    set(pf ${CMAKE_CURRENT_SOURCE_DIR}/patches/${p}.patch)
+    execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic apply --reverse --check ${pf}
+                    RESULT_VARIABLE applied OUTPUT_QUIET ERROR_QUIET)
+    if(NOT applied EQUAL 0)
+      execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR}/externals/dynarmic apply ${pf} RESULT_VARIABLE r)
+      if(NOT r EQUAL 0)
+        message(FATAL_ERROR "patches/${p}.patch does not apply to externals/dynarmic")
+      endif()
+    endif()
+  endforeach()
   add_subdirectory(externals/dynarmic EXCLUDE_FROM_ALL)
   # libopus (externals/opus, v1.5.2): the hardware Opus decoder upstream implements with it (game voices)
   set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)

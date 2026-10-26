@@ -1,0 +1,25 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index cec78138..01065c42 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -51,6 +51,7 @@ FP::FPCR A64EmitContext::FPCR(bool fpcr_controlled) const {
+ 
+ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_interface)
+         : EmitX64(code), conf(conf), jit_interface{jit_interface} {
++    fastmem_patch_info.max_load_factor(0.9f);  // wintears: about half the buckets (once per core)
+     GenMemory128Accessors();
+     GenFastmemFallbacks();
+     GenTerminalHandlers();
+diff --git a/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/backend/x64/emit_x64.cpp
+index 902ddef9..3c479699 100644
+--- a/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -43,6 +43,8 @@ void EmitContext::EraseInstruction(IR::Inst* inst) {
+ EmitX64::EmitX64(BlockOfCode& code)
+         : code(code) {
+     exception_handler.Register(code);
++    block_descriptors.max_load_factor(0.9f);  // wintears: about half the buckets (these maps exist once per core)
++    patch_information.max_load_factor(0.9f);
+ }
+ 
+ EmitX64::~EmitX64() = default;
