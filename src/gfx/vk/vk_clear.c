@@ -82,6 +82,7 @@ static VkPipeline pipeline_for(int kind, int index, uint32_t mask) {
 static void draw(VkPipeline p, VkRect2D rect, uint32_t layers) {
     VkCommandBuffer c = vk_cmd();
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vd_state_disturbed();   /* the draw path's record of the command buffer's state is stale now */
     VkViewport v = {0, 0, (float)S.pass_w, (float)S.pass_h, 0, 1};
     vkCmdSetViewportWithCount(c, 1, &v);
     vkCmdSetScissorWithCount(c, 1, &rect);
@@ -105,6 +106,7 @@ int vx_clear_masked_stencil(uint32_t wmask, uint32_t value, VkRect2D rect, uint3
     if (!p) return 0;
     VkCommandBuffer c = vk_cmd();
     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vd_state_disturbed();
     vkCmdSetStencilCompareMask(c, VK_STENCIL_FACE_FRONT_AND_BACK, 0xff);
     vkCmdSetStencilWriteMask(c, VK_STENCIL_FACE_FRONT_AND_BACK, wmask & 0xff);
     vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_AND_BACK, value & 0xff);

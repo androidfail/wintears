@@ -32,6 +32,7 @@ int vx_begin_pass(void);
 void vx_note_sampled(VkImage img, VkFormat fmt, uint32_t w, uint32_t h);   /* TOTK_PASSLOG: log this texture's contents after the pass */                    /* vk_exec.c: open a pass on the current targets (0 = none) */
 void vd_state_op(uint32_t op, const void *a);
 void vd_draw(const p_draw *dw, const p_draw_idx *di);
+void vd_state_disturbed(void);   /* another graphics pipeline was bound: the draw path sends all its state again */
 void vd_dispatch(const p_dispatch *d);
 void vd_init(void);
 void vd_pcache_save(void);   /* new pipelines since the last save: write the cache to the profile (at most once a minute) */
