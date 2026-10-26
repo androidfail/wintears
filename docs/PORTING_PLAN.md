@@ -19,7 +19,7 @@ Upstream reference: MNG at commit `4fdda41562a1c783fb1aacd18891ad4f48b8c360` (20
 | 6. In-game correctness | in progress: playable at ~30 fps with sound, cutscenes play (`src/host/movie.c`, libvpx VP9), saves are handled. Open (from play): in some scenes the background never loads and the characters stand in a black void for the whole scene; on the Great Sky Island the light is far too bright and the sky/clouds show through objects and Link (as if fog or the sky pass ignored depth); menu backgrounds are mostly blue, sometimes black. Left: MNG game patches (`game_patches.c`), guest sync tests |
 | 7. Performance and polish | started: `tools/prepare_shaders.py` translates the shaders ahead of play; per-frame barriers cut by inlining uniform updates (~510→285). Left: FSR, `VK_EXT_graphics_pipeline_library`, the 60 FPS patch, the HUD overlay, the mods folder |
 | 8. Packaging and release | not started |
-| 9. Ahead-of-time translation (Direct Native) | planned: `docs/DIRECT_NATIVE_PLAN.md` (whole game, hybrid with the JIT first) |
+| 9. Ahead-of-time translation (Direct Native) | planned in the SwitchNativityPorts vault (`wiki/concepts/Wintears Direct Native Plan.md`); phase 0 done (go) |
 
 ## Decisions
 
@@ -63,7 +63,7 @@ MNG runs the game's ARM64 code directly because Apple chips are ARM64. Windows P
 Everything else (platform layer, Horizon services, graphics, frontend, build) is shared. Track A is planned first;
 Track B is a few weeks of extra work once the shared parts exist.
 
-Full ahead-of-time translation of the game to x86 (Direct Native) is planned in `docs/DIRECT_NATIVE_PLAN.md`
+Full ahead-of-time translation of the game to x86 (Direct Native) is planned in the SwitchNativityPorts vault (`wiki/concepts/Wintears Direct Native Plan.md`)
 (2026-10-26); it replaces the hot-functions-only phase 9 below.
 
 ## 4. Architecture
@@ -270,7 +270,7 @@ The longest phase: a loop of "you play, send log + screenshot; Claude fixes".
 
 ### Phase 9 (optional): ahead-of-time translation of hot code
 
-Superseded by `docs/DIRECT_NATIVE_PLAN.md`.
+Superseded by the Direct Native plan in the SwitchNativityPorts vault (`wiki/concepts/Wintears Direct Native Plan.md`).
 
 Only if phase 7 profiling shows guest CPU code limits the frame rate. Translate the hottest functions ahead of time
 (ARM64 → LLVM IR → x86) and keep the JIT for everything else. Expected gain: tens of percent of the game-code time,

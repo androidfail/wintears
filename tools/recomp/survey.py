@@ -1,4 +1,4 @@
-"""Direct Native phase 0: a survey of the game's code modules (docs/DIRECT_NATIVE_PLAN.md).
+"""Direct Native phase 0: a survey of the game's code modules (Direct Native plan in the SwitchNativityPorts vault).
 
 Reads the NSOs in a built TOTK_win folder and prints totals only: code size, instruction classes, function starts
 found ahead of time (symbols, eh_frame, relocations, BL targets), how much of the code a recursive descent from those
