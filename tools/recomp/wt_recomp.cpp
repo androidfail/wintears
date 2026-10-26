@@ -303,7 +303,7 @@ struct Emitter {
         }
         case O::A64DataSynchronizationBarrier: case O::A64DataMemoryBarrier: line("__atomic_thread_fence(__ATOMIC_SEQ_CST);"); return true;
         case O::A64GetCNTFRQ: def("19200000u"); return true;
-        case O::A64GetCNTPCT: def("c->cntpct()"); return true;
+        case O::A64GetCNTPCT: def("c->cntpct(c->cntpct_user)"); return true;
         case O::A64GetCTR: def("0x8444c004u"); return true;
         case O::A64GetDCZID: def("4u"); return true;
         case O::A64GetTPIDR: def("c->tpidr"); return true;
@@ -518,6 +518,8 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     fputs("#include \"wt_native.h\"\n", f);
     for (uint64_t pc : done) fprintf(f, "void B_%llx(wt_ctx *);\n", (unsigned long long)pc);
     fprintf(f, "__declspec(dllexport) const unsigned long long wt_count = %zu;\n", done.size());
+    fprintf(f, "__declspec(dllexport) const unsigned long long wt_bases[3] = {0x%llxull, 0x%llxull, 0x%llxull};\n",
+            (unsigned long long)p.mods[0].base, (unsigned long long)p.mods[1].base, (unsigned long long)p.mods[2].base);
     fputs("__declspec(dllexport) const wt_entry wt_table[] = {\n", f);
     for (uint64_t pc : done) fprintf(f, "    {0x%llxull, B_%llx},\n", (unsigned long long)pc, (unsigned long long)pc);
     fputs("};\n", f);

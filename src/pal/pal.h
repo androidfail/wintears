@@ -161,6 +161,9 @@ void pal_debug_write(const char *text);
 int pal_process_memory(uint64_t *resident, uint64_t *committed);
 uint64_t pal_total_memory(void);   /* the machine's physical memory in bytes */
 uint64_t pal_available_memory(void);   /* physical memory free for use now */
+/* A shared library (UTF-8 path) and its exported symbols; NULL when missing. */
+void *pal_lib_open(const char *path);
+void *pal_lib_symbol(void *lib, const char *name);
 
 /* Where the process's memory is: committed and resident bytes per named range (the first that holds a region wins),
    then the rest by kind (private, mapped files, DLLs), and the largest unnamed private regions. One line into out. */

@@ -25,11 +25,14 @@ typedef struct wt_ctx {
     uint32_t excl_valid;
     uint32_t check_bit;
     volatile int *halt_request;  /* set by another thread (preemption): checked where dynarmic checks for a halt */
-    uint64_t (*cntpct)(void);    /* guest counter, 19.2 MHz */
+    uint64_t (*cntpct)(void *);  /* guest counter, 19.2 MHz */
+    void *cntpct_user;
 } wt_ctx;
 
 typedef void (*wt_block_fn)(wt_ctx *);
 typedef struct { uint64_t pc; wt_block_fn fn; } wt_entry;
+/* a DLL exports wt_count, wt_table (sorted by pc) and wt_bases: the guest addresses of main, subsdk0 and sdk it was
+   made for (the runtime refuses it if the loader put them elsewhere) */
 
 /* ---- helpers used by the generated code ---- */
 typedef uint8_t __attribute__((aligned(1), may_alias)) wt_u8u;

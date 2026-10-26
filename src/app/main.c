@@ -108,6 +108,17 @@ static int boot(const char *root, int trace) {
     if (host_memory_init(err, sizeof err)) { LOG("%s", err); return 1; }
     mods = ldr_create();
     if (!mods || load_modules(root)) return 1;
+    {   /* Direct Native hybrid mode (TOTK_NATIVE=1): recompiled blocks from <root>/native, dynarmic for the rest */
+        const char *e = pal_getenv("TOTK_NATIVE");
+        if (e && *e == '1') {
+            uint64_t b[3];
+            for (unsigned i = 0; i < 3; i++) b[i] = ldr_module_at(mods, i)->base;
+            char dir[1100], nerr[256];
+            snprintf(dir, sizeof dir, "%s/native", root);
+            size_t n = jit_native_load(dir, b, nerr, sizeof nerr);
+            LOG("Direct Native: %zu recompiled blocks from %s%s%s", n, dir, nerr[0] ? "; " : "", nerr);
+        }
+    }
     host_init(mods);
     host_set_trace(trace);
     char data[1100], profile[1100];

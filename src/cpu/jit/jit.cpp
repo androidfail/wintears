@@ -14,8 +14,33 @@
 #include <vector>
 
 #include "pal.h"
+#include "native/wt_native.h"
+
+#include <array>
+#include <string>
 
 using Dynarmic::A64::Vector;
+
+/* Direct Native, hybrid mode: blocks recompiled ahead of time (tools/recomp/wt_recomp, DLLs under <game>/native) run
+   from a table; a block missing from it runs in dynarmic, one block at a time (cycle counting with a budget of one
+   instruction makes Run return after a single block). */
+namespace {
+struct NativeTable {
+    std::vector<uint64_t> keys;
+    std::vector<wt_block_fn> fns;
+    unsigned shift = 64;
+    size_t n = 0;
+} g_nat;
+inline wt_block_fn nat_find(uint64_t pc) {
+    if (!g_nat.n) return nullptr;
+    size_t mask = g_nat.keys.size() - 1, i = (size_t)(((pc >> 2) * 0x9E3779B97F4A7C15ull) >> g_nat.shift);
+    for (;; i = (i + 1) & mask) {
+        uint64_t k = g_nat.keys[i];
+        if (k == pc) return g_nat.fns[i];
+        if (!k) return nullptr;
+    }
+}
+}  // namespace
 using VAddr = Dynarmic::A64::VAddr;
 
 /* Dynarmic's IR instruction pool, replaced at link time (this file always links before libdynarmic, so its
@@ -117,6 +142,9 @@ struct jit_core final : Dynarmic::A64::UserCallbacks {
     int exc_kind = 0;
     uint64_t exc_pc = 0;
     std::unique_ptr<Dynarmic::A64::Jit> jit;
+    bool hybrid = false;         /* recompiled blocks loaded: the guest state lives in nc, dynarmic gets it per missed block */
+    wt_ctx nc{};
+    volatile int halt_req = 0;
 
     std::uint8_t MemoryRead8(VAddr a) override { return load<uint8_t>(a); }
     std::uint16_t MemoryRead16(VAddr a) override { return load<uint16_t>(a); }
@@ -156,7 +184,7 @@ struct jit_core final : Dynarmic::A64::UserCallbacks {
         }
     }
     void AddTicks(std::uint64_t) override {}
-    std::uint64_t GetTicksRemaining() override { return 0; }
+    std::uint64_t GetTicksRemaining() override { return hybrid ? 1 : 0; }   /* hybrid: one block per Run */
     std::uint64_t GetCNTPCT() override { return cfg.cntpct(cfg.user); }
 
     void stop_exception(VAddr pc, int kind) {
@@ -188,7 +216,11 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
     uc.cntfrq_el0 = 19200000;          /* Switch counter frequency */
     uc.dczid_el0 = 4;                  /* DC ZVA zeroes 64 bytes, as on the Switch's Cortex-A57 */
     uc.ctr_el0 = 0x8444c004;
-    uc.enable_cycle_counting = false;  /* runs until halted: preemption uses jit_halt */
+    c->hybrid = g_nat.n != 0;
+    uc.enable_cycle_counting = c->hybrid;  /* JIT only: runs until halted (preemption uses jit_halt) */
+    c->nc.halt_request = &c->halt_req;
+    c->nc.cntpct = c->cfg.cntpct;
+    c->nc.cntpct_user = c->cfg.user;
     /* Architecturally unpredictable forms run as the hardware does them instead of stopping: TOTK main+0x12497b8 has
        "stlxr wzr, xzr, [x8]" (status register = data register), executed as the store with the status discarded. */
     uc.define_unpredictable_behaviour = true;
@@ -211,7 +243,32 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
 
 void jit_core_destroy(jit_core *c) { delete c; }
 
+static void to_jit(jit_core *c) {   /* hybrid: the state of nc into dynarmic for one block */
+    auto &j = *c->jit; const wt_ctx &n = c->nc;
+    std::array<uint64_t, 31> r; memcpy(r.data(), n.x, sizeof r); j.SetRegisters(r);
+    std::array<Vector, 32> v; for (size_t i = 0; i < 32; i++) v[i] = Vector{n.v[i].lo, n.v[i].hi}; j.SetVectors(v);
+    j.SetSP(n.sp); j.SetPC(n.pc); j.SetFpcr(n.fpcr); j.SetFpsr(n.fpsr); j.SetPstate(n.nzcv);
+    c->tpidr_el0 = n.tpidr; c->tpidrro_el0 = n.tpidrro;
+}
+static void from_jit(jit_core *c) {
+    auto &j = *c->jit; wt_ctx &n = c->nc;
+    auto r = j.GetRegisters(); memcpy(n.x, r.data(), sizeof n.x);
+    auto v = j.GetVectors(); for (size_t i = 0; i < 32; i++) n.v[i] = wt_v128{v[i][0], v[i][1]};
+    n.sp = j.GetSP(); n.pc = j.GetPC(); n.fpcr = j.GetFpcr(); n.fpsr = j.GetFpsr(); n.nzcv = j.GetPstate() & 0xF0000000u;
+    n.tpidr = c->tpidr_el0;
+}
+
 void jit_load(jit_core *c, const jit_context *ctx) {
+    if (c->hybrid) {
+        wt_ctx &n = c->nc;
+        memcpy(n.x, ctx->x, sizeof n.x); n.sp = ctx->sp; n.pc = ctx->pc;
+        for (size_t i = 0; i < 32; i++) n.v[i] = wt_v128{ctx->v[i][0], ctx->v[i][1]};
+        n.fpcr = ctx->fpcr; n.fpsr = ctx->fpsr; n.nzcv = ctx->pstate & 0xF0000000u;
+        n.tpidr = ctx->tpidr_el0; n.tpidrro = ctx->tpidrro_el0; n.excl_valid = 0;
+        c->tpidr_el0 = ctx->tpidr_el0; c->tpidrro_el0 = ctx->tpidrro_el0;
+        c->jit->ClearExclusiveState();
+        return;
+    }
     auto &j = *c->jit;
     for (size_t i = 0; i < 31; i++) j.SetRegister(i, ctx->x[i]);
     j.SetSP(ctx->sp);
@@ -226,6 +283,14 @@ void jit_load(jit_core *c, const jit_context *ctx) {
 }
 
 void jit_save(jit_core *c, jit_context *ctx) {
+    if (c->hybrid) {
+        const wt_ctx &n = c->nc;
+        memcpy(ctx->x, n.x, sizeof n.x); ctx->sp = n.sp; ctx->pc = n.pc;
+        for (size_t i = 0; i < 32; i++) { ctx->v[i][0] = n.v[i].lo; ctx->v[i][1] = n.v[i].hi; }
+        ctx->fpcr = n.fpcr; ctx->fpsr = n.fpsr; ctx->pstate = n.nzcv;
+        ctx->tpidr_el0 = n.tpidr; ctx->tpidrro_el0 = n.tpidrro;
+        return;
+    }
     auto &j = *c->jit;
     for (size_t i = 0; i < 31; i++) ctx->x[i] = j.GetRegister(i);
     ctx->sp = j.GetSP();
@@ -249,9 +314,73 @@ static int stop_of(jit_core *c, Dynarmic::HaltReason r) {
     return stop;
 }
 
-int jit_run(jit_core *c) { return stop_of(c, c->jit->Run()); }
-int jit_step(jit_core *c) { return stop_of(c, c->jit->Step()); }
-void jit_halt(jit_core *c) { c->jit->HaltExecution(kHaltExternal); }
+static int exc_kind_of(uint32_t e) {   /* dynarmic A64::Exception to jit_exception_kind, as ExceptionRaised */
+    using E = Dynarmic::A64::Exception;
+    switch (static_cast<E>(e)) {
+    case E::WaitForInterrupt: case E::WaitForEvent: return JIT_EXC_WAIT;
+    case E::Breakpoint: return JIT_EXC_BREAKPOINT;
+    case E::NoExecuteFault: return JIT_EXC_NO_EXECUTE;
+    case E::UnallocatedEncoding: case E::ReservedValue: case E::UnpredictableInstruction: return JIT_EXC_UNDEFINED;
+    default: return JIT_EXC_OTHER;
+    }
+}
+
+int jit_run(jit_core *c) {
+    if (!c->hybrid) return stop_of(c, c->jit->Run());
+    wt_ctx &n = c->nc;
+    const auto stops = kHaltSvc | kHaltException | kHaltExternal;
+    for (;;) {
+        if (c->halt_req) { c->halt_req = 0; c->jit->ClearHalt(kHaltExternal); return JIT_STOP_HALT; }
+        wt_block_fn f = n.fpcr == 0 ? nat_find(n.pc) : nullptr;   /* blocks were made for FPCR 0 */
+        if (f) {
+            n.halt = WT_RUN;
+            f(&n);
+            if (n.halt == WT_RUN) continue;
+            if (n.halt == WT_HALT_SVC) { c->svc = n.svc; return JIT_STOP_SVC; }
+            if (n.halt == WT_HALT_EXCEPTION) { c->exc_pc = n.exc_pc; c->exc_kind = exc_kind_of(n.exc_kind); return JIT_STOP_EXCEPTION; }
+            c->exc_pc = n.pc; c->exc_kind = JIT_EXC_UNDEFINED; return JIT_STOP_EXCEPTION;   /* Interpret terminal */
+        }
+        to_jit(c);
+        Dynarmic::HaltReason r = c->jit->Run();
+        from_jit(c);
+        if ((r & stops) != Dynarmic::HaltReason{}) { int s = stop_of(c, r); if (s == JIT_STOP_HALT) c->halt_req = 0; return s; }
+    }
+}
+int jit_step(jit_core *c) {
+    if (!c->hybrid) return stop_of(c, c->jit->Step());
+    to_jit(c); int s = stop_of(c, c->jit->Step()); from_jit(c); return s;
+}
+void jit_halt(jit_core *c) { c->halt_req = 1; c->jit->HaltExecution(kHaltExternal); }
+
+size_t jit_native_load(const char *dir, const uint64_t bases[3], char *err, size_t cap) {
+    std::vector<wt_entry> all;
+    err[0] = 0;
+    for (const char *name : {"totk_main.dll", "totk_subsdk0.dll", "totk_sdk.dll"}) {
+        std::string path = std::string(dir) + "/" + name;
+        void *lib = pal_lib_open(path.c_str());
+        if (!lib) continue;
+        auto *cnt = static_cast<const unsigned long long *>(pal_lib_symbol(lib, "wt_count"));
+        auto *tab = static_cast<const wt_entry *>(pal_lib_symbol(lib, "wt_table"));
+        auto *b = static_cast<const unsigned long long *>(pal_lib_symbol(lib, "wt_bases"));
+        if (!cnt || !tab || !b) { snprintf(err, cap, "%s: not a recompiled-code DLL", name); continue; }
+        if (b[0] != bases[0] || b[1] != bases[1] || b[2] != bases[2]) {
+            snprintf(err, cap, "%s was made for modules at %#llx/%#llx/%#llx, not where they are now: left out", name, b[0], b[1], b[2]);
+            continue;
+        }
+        all.insert(all.end(), tab, tab + *cnt);
+    }
+    if (all.empty()) return 0;
+    size_t cap2 = 1; unsigned bits = 0;
+    while (cap2 < all.size() * 2) { cap2 <<= 1; bits++; }
+    g_nat.keys.assign(cap2, 0); g_nat.fns.assign(cap2, nullptr); g_nat.shift = 64 - bits;
+    for (const wt_entry &e : all) {
+        size_t i = (size_t)(((e.pc >> 2) * 0x9E3779B97F4A7C15ull) >> g_nat.shift);
+        while (g_nat.keys[i] && g_nat.keys[i] != e.pc) i = (i + 1) & (cap2 - 1);
+        g_nat.keys[i] = e.pc; g_nat.fns[i] = e.fn;
+    }
+    g_nat.n = all.size();
+    return g_nat.n;
+}
 uint32_t jit_svc_number(jit_core *c) { return c->svc; }
 int jit_exception(jit_core *c, uint64_t *pc) {
     if (pc) *pc = c->exc_pc;

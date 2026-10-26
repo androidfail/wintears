@@ -53,6 +53,10 @@ typedef struct {
                                    after each floating-point instruction; only NaN payloads differ */
 } jit_config;
 
+/* Direct Native hybrid mode: load recompiled blocks (dir/totk_{main,subsdk0,sdk}.dll from tools/recomp/wt_recomp)
+   made for main, subsdk0 and sdk at bases[0..2]. Returns the blocks loaded (0: JIT only; err says why when a DLL was
+   refused). Call before jit_core_create: cores made afterwards run those blocks and give dynarmic the rest. */
+size_t jit_native_load(const char *dir, const uint64_t bases[3], char *err, size_t cap);
 jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id);
 void jit_core_destroy(jit_core *c);
 

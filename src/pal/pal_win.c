@@ -1134,6 +1134,13 @@ void pal_exception_report(char *out, size_t cap) {
 }
 #undef APPEND
 
+void *pal_lib_open(const char *path) {
+    wchar_t w[1024];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1024)) return NULL;
+    return (void *)LoadLibraryW(w);
+}
+void *pal_lib_symbol(void *lib, const char *name) { return lib ? (void *)GetProcAddress((HMODULE)lib, name) : NULL; }
+
 uint64_t pal_available_memory(void) {
     MEMORYSTATUSEX m = {.dwLength = sizeof m};
     return GlobalMemoryStatusEx(&m) ? m.ullAvailPhys : 0;
