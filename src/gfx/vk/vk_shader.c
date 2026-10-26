@@ -18,7 +18,8 @@
 int totk_depth_near_minus_w(void);
 
 /* ---------- translation service ---------- */
-static HANDLE g_svc_in, g_svc_out;
+static HANDLE g_svc_in, g_svc_out, g_svc_proc;
+static uint64_t g_svc_last;   /* the last request (g_svc_mu) */
 static char g_dir[1024];
 
 static void exe_dir(char *out, size_t cap) {
@@ -45,8 +46,32 @@ static void service_start(void) {
     if (!CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         die("cannot start the shader translator %s (error %lu): run python tools/build_xlate.py", exe, (unsigned long)GetLastError());
     CloseHandle(pi.hThread); CloseHandle(in_r); CloseHandle(out_w);
-    g_svc_in = in_w; g_svc_out = out_r;
+    g_svc_in = in_w; g_svc_out = out_r; g_svc_proc = pi.hProcess;
     VLOG("shader translation service started (%s), cache %s", exe, g_dir);
+}
+/* The translator goes after 20 s without a request (its memory back; started again by the next one): on an 8 GB laptop
+   it stayed for the whole session. Requests and this hold g_svc_mu. */
+static pthread_mutex_t g_svc_mu = PTHREAD_MUTEX_INITIALIZER;
+static void *svc_idle(void *unused) {
+    (void)unused;
+    pal_thread_set_name("shader translator idle");
+    for (;;) {
+        pal_sleep_ns(5000000000ull);
+        pthread_mutex_lock(&g_svc_mu);
+        if (g_svc_in && pal_now_ns() - g_svc_last > 20000000000ull) {
+            CloseHandle(g_svc_in); g_svc_in = NULL;   /* end of its input: it exits */
+            if (WaitForSingleObject(g_svc_proc, 3000) != WAIT_OBJECT_0) TerminateProcess(g_svc_proc, 0);
+            CloseHandle(g_svc_proc); CloseHandle(g_svc_out); g_svc_proc = g_svc_out = NULL;
+            static int n; if (n++ < 5) VLOG("shader translation service stopped (idle)");
+        }
+        pthread_mutex_unlock(&g_svc_mu);
+    }
+    return NULL;
+}
+static void service_idle_watch(void) {   /* g_svc_mu held */
+    static int started;
+    g_svc_last = pal_now_ns();
+    if (!started) { started = 1; pthread_t t; if (!pthread_create(&t, NULL, svc_idle, NULL)) pthread_detach(t); }
 }
 static void svc_write(const char *s) {
     for (size_t n = strlen(s); n;) { DWORD w; if (!WriteFile(g_svc_in, s, (DWORD)n, &w, NULL)) die("shader service: write failed"); s += w; n -= w; }
@@ -292,7 +317,7 @@ static shader_key *key_get(const char *hex) {
 /* A translation, with copies of everything it needs: it may run on the translation worker (async_shaders, vk_draw.c)
    after the program is gone. */
 typedef struct xjob { struct xjob *next; shader_key *k; int st, worker; char key[65], variant[112]; uint8_t *code; uint32_t length, c1o, local[3]; char *ans; vk_shader *out; } xjob;
-static pthread_mutex_t g_svc_mu = PTHREAD_MUTEX_INITIALIZER;   /* one request at a time to the translation service */
+/* g_svc_mu (above): one request at a time to the translation service */
 static xjob *xjob_make(stage_t *t, int st, const answers *a) {
     xjob *j = calloc(1, sizeof *j);
     if (!j) die("shader translation job");
@@ -322,6 +347,7 @@ static vk_shader *xjob_run(xjob *j) {
     if (vk_sb_align != 16) sb_add(&rq, ", \"sb_align\": %u", vk_sb_align);
     sb_add(&rq, ", \"depth_minus_w\": %s}\n", totk_depth_near_minus_w() ? "true" : "false");
     pthread_mutex_lock(&g_svc_mu);
+    service_idle_watch();
     service_start();
     uint64_t t0 = pal_now_ns();
     svc_write(rq.p);

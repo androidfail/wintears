@@ -306,13 +306,24 @@ static import_t *window_of(const import_t *pool, uintptr_t a, uintptr_t b) { ret
    windows of it on demand (at most about 130), shared by all pools in them. They go when the heap shrinks below them
    (host_on_heap_shrink), else with the process. Creating or finalizing a pool in the heap costs nothing then. */
 #define HEAP_GRAIN (16u << 20)
+/* The window size: 16 MiB under Wine (the Linux kernel's cost is per imported range at each submission), 2 MiB on
+   Windows, where an imported range is locked in memory instead: 16 MiB windows locked 1.9 GiB on an 8 GB laptop and
+   pushed the game into the page file. TOTK_WINDOW_MB overrides (a power of two, at most 16). */
+static uint64_t win_grain(void) {
+    static uint64_t g;
+    if (!g) { const char *e = pal_getenv("TOTK_WINDOW_MB"); uint64_t mb = e ? (uint64_t)atoi(e) : pal_under_wine() ? 16 : 2;
+              if (mb < 1 || mb > 16 || (mb & (mb - 1))) mb = 16;
+              g = mb << 20; VLOG("GPU windows of %llu MiB", (unsigned long long)mb); }
+    return g;
+}
 /* The alias region (MapPhysicalMemory) under Wine, likewise: the game keeps hundreds of small pools there. memory.c
    commits it in 16 MiB grains from its start, each kept while a page in it is mapped; the GPU is given the grains
    around each range. Windows go before their grains are decommitted (host_on_alias_unmap). */
 static import_t *alias_window(uint64_t a, uint64_t b) {   /* g_pool_mu held */
     uint64_t base, size; host_alias_region(&base, &size);
     if (a < base || b > base + size || b <= a) return NULL;
-    uint64_t k[2] = {base + ((a - base) & ~(uint64_t)(HEAP_GRAIN - 1)), base + ((b - base + HEAP_GRAIN - 1) & ~(uint64_t)(HEAP_GRAIN - 1))};
+    uint64_t gr = win_grain();   /* within memory.c's 16 MiB commit grains: a window of committed grains is committed */
+    uint64_t k[2] = {base + ((a - base) & ~(gr - 1)), base + ((b - base + gr - 1) & ~(gr - 1))};
     if (k[1] > base + size) k[1] = base + size;
     import_t *w = nvn_hm_get(&g_win, k);
     if (w) return w;
@@ -464,7 +475,7 @@ int vk_buf(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
     if (im0 && im0->windowed) im0 = window_of(im0, (uintptr_t)addr, (uintptr_t)(addr + (len ? len : 1)));
     if (!e && !heap_whole()) {   /* the heap's windows */
         uint64_t hb, hs; host_heap_range(&hb, &hs);
-        if (addr >= hb && addr + (len ? len : 1) <= hb + hs) im0 = window_in((uintptr_t)hb, (uintptr_t)(hb + hs), (uintptr_t)addr, (uintptr_t)(addr + (len ? len : 1)), HEAP_GRAIN);
+        if (addr >= hb && addr + (len ? len : 1) <= hb + hs) im0 = window_in((uintptr_t)hb, (uintptr_t)(hb + hs), (uintptr_t)addr, (uintptr_t)(addr + (len ? len : 1)), win_grain());
         else im0 = alias_window(addr, addr + (len ? len : 1));
         if (im0) { *buf = im0->buf; *off = addr - im0->lo; pthread_mutex_unlock(&g_pool_mu); return 1; }
     }

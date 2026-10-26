@@ -229,7 +229,7 @@ static uint64_t g_kind_bytes[3], g_drop_saved;
 static unsigned mip_drop_of(const tex_t *t, const vk_fmt *f) {
     static int on = -1; static unsigned minside;
     if (on < 0) { const char *e = pal_getenv("TOTK_MIP_DROP"), *m = pal_getenv("TOTK_MIP_DROP_MIN");
-        on = e ? atoi(e) != 0 : vk_integrated || vk_local_heap < (6ull << 30); minside = m ? (unsigned)atoi(m) : 512;
+        on = e ? atoi(e) != 0 : vk_integrated || vk_local_heap < (6ull << 30); minside = m ? (unsigned)atoi(m) : pal_total_memory() && pal_total_memory() < (12ull << 30) ? 256 : 512;   /* 256 under 12 GiB of memory */
         VLOG("large decoded ASTC textures leave out their top mip level: %s (both sides >= %u; TOTK_MIP_DROP=0/1)", on ? "on" : "off", minside); }
     unsigned g = (unsigned)t->d.target;
     if (!on || f->convert != 3 || !tex_mirrored(t) || t->d.levels < 2 || t->d.width < minside || t->d.height < minside) return 0;
