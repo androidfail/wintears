@@ -76,11 +76,14 @@ static void G_lock(void) {
 void runtime_wait_report(char *out, size_t cap) {
     static uint64_t last; uint64_t now = pal_now_ns(), span = last ? now - last : 0; last = now;
     double fr = atomic_exchange(&g_ns_free, 0) / 1e6, ho = atomic_exchange(&g_ns_handoff, 0) / 1e6, jt = atomic_exchange(&g_ns_jit, 0) / 1e6, all = 3 * span / 1e6;
+    static uint64_t lc, lb; uint64_t cn = jit_compile_ns(), b, sl; jit_compile_stats(&b, &sl);
+    double cm = (cn - lc) / 1e6; uint64_t nb = b - lb; lc = cn; lb = b;   /* Direct Native phase 0: JIT compiling vs game code */
     snprintf(out, cap, "lock G waited %.0f ms (%llu times), waiting for a core %.0f ms (%llu times, %llu preemptions), guest waits %.0f ms (%llu); "
-             "of %.0f core-ms: guest code %.0f, free %.0f, handing over %.0f, svcs and host calls %.0f",
+             "JIT compiling %.0f ms (%llu blocks, any thread); "
+             "of %.0f core-ms: guest code %.0f (compiling included), free %.0f, handing over %.0f, svcs and host calls %.0f",
              atomic_exchange(&g_ns_lock, 0) / 1e6, (unsigned long long)atomic_exchange(&g_n_lock_slow, 0), atomic_exchange(&g_ns_core, 0) / 1e6,
              (unsigned long long)atomic_exchange(&g_n_core_wait, 0), (unsigned long long)atomic_exchange(&g_n_preempt, 0),
-             atomic_exchange(&g_ns_block, 0) / 1e6, (unsigned long long)atomic_exchange(&g_n_block, 0), all, jt, fr, ho, all - jt - fr - ho);
+             atomic_exchange(&g_ns_block, 0) / 1e6, (unsigned long long)atomic_exchange(&g_n_block, 0), cm, (unsigned long long)nb, all, jt, fr, ho, all - jt - fr - ho);
 }
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];

@@ -26,7 +26,8 @@ using VAddr = Dynarmic::A64::VAddr;
 namespace {
 std::mutex g_slab_mu;
 std::vector<std::pair<size_t, char *>> g_slab_spare;
-std::atomic<uint64_t> g_pools{0}, g_slabs_new{0};
+std::atomic<uint64_t> g_pools{0}, g_slabs_new{0}, g_compile_ns{0};
+thread_local uint64_t t_compile_t0;   /* one pool per compiled block, alive from translation to emitted code */
 char *slab_take(size_t bytes) {
     {
         std::lock_guard<std::mutex> l(g_slab_mu);
@@ -51,9 +52,11 @@ void slab_give(char *p, size_t bytes) {
 namespace Dynarmic::Common {
 Pool::Pool(size_t object_size, size_t initial_pool_size) : object_size(object_size), slab_size(initial_pool_size) {
     g_pools.fetch_add(1, std::memory_order_relaxed);
+    t_compile_t0 = pal_now_ns();
     AllocateNewSlab();
 }
 Pool::~Pool() {
+    g_compile_ns.fetch_add(pal_now_ns() - t_compile_t0, std::memory_order_relaxed);
     slab_give(current_slab, object_size * slab_size);
     for (char *s : slabs) slab_give(s, object_size * slab_size);
 }
@@ -167,6 +170,7 @@ extern "C" {
 
 jit_monitor *jit_monitor_create(size_t cores) { return new jit_monitor(cores); }
 void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs) { *blocks = g_pools.load(); *new_slabs = g_slabs_new.load(); }
+uint64_t jit_compile_ns(void) { return g_compile_ns.load(); }
 void jit_monitor_destroy(jit_monitor *m) { delete m; }
 
 jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id) {

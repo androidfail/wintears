@@ -99,9 +99,51 @@ Alternatives considered:
 Total about 4–6 months at the current pace. Each phase ships: hybrid mode is useful on its own, because every
 function it covers is code the JIT no longer compiles.
 
+## Phase 0 results
+
+### Static survey (2026-10-26, `tools/recomp/survey.py`, 1.0.0)
+
+| | main | sdk | subsdk0 | all |
+|---|---|---|---|---|
+| Code | 42.7 MiB | 5.9 MiB | 3.3 MiB | 51.8 MiB, 13.58 M instructions |
+| Function starts found | 243,446 | 38,305 | 13,690 | 295,441 |
+| of them first from `.eh_frame` | 242,832 | 8,193 | 1,711 | |
+| Code reached by recursive descent | 94.6% | 92.2% | 93.7% | |
+| Switch tables (`br` after a table load) | 2,038 | 623 | 323 | 2,984 |
+| Import stubs / veneers (`br x16/x17`) | 643 | 8,911 | 3,911 | 13,465 |
+| Pointer tail calls (`ldr xN, [..]; br xN`) | 20,886 | 1,731 | 156 | 22,773 |
+| Other `br` | 2,294 | 67 | 45 | 2,406 |
+| Indirect calls (`blr`) | 104,749 | 12,665 | 3,833 | 121,247 |
+| `svc` | 0 | 60 | 0 | 60 |
+| Atomic / ordered memory instructions | 65,376 | 4,323 | 84 | 69,783 |
+| SIMD / FP share | 10.4% | 3.3% | 1.0% | |
+
+What it means:
+
+- **Function discovery is mostly solved.** main keeps a full `.eh_frame` (one entry per function) although it has only
+  704 symbols. With symbols and `BL` targets, a plain recursive descent reaches 92–95% of the code before switch
+  tables are resolved. The rest (about 730,000 non-zero words) is switch-table targets, functions reached only through
+  pointers, and data; hybrid mode covers it until it is found.
+- **Indirect control flow is common.** About 144,000 indirect calls and pointer tail calls (virtual calls). The
+  dispatcher's lookup is on a hot path: it needs a direct-mapped table, not a hash map.
+- **System instructions are rare.** All 60 `svc` are in the SDK; atomics are 0.5% of instructions.
+- **Size.** At a few C lines per instruction, 13.6 M instructions make tens of millions of lines; compile time is
+  measured first thing in phase 1.
+
+### Run-time split (needs game runs)
+
+The 10-second `waits` line (with `TOTK_DIAG=1`) now also shows **JIT compiling** time and blocks, next to the core-time
+split "guest code (compiling included) / free / handing over / svcs and host calls". Wanted: about 5 minutes of play
+on the PC and on the Steam Deck, title screen and the Great Sky Island, with `TOTK_DIAG=1`. Go / no-go from those:
+
+- **Go** if JIT compiling plus guest code is a large share of the cores' busy time on the Deck, or compiling shows up
+  as stutter (long 10-second windows with high compile time).
+- **No-go (stop at hybrid or not at all)** if guest code is a small share and compiling is negligible after the first
+  minutes: then only the JIT's memory (about 384 MiB committed) would be gained.
+
 ## Risks
 
-- **Build time and size.** Three modules, about 90 MiB mapped; the code share is measured in phase 0. The C output
+- **Build time and size.** Three modules, 51.8 MiB of code (phase 0). The C output
   is split into many files and compiled in parallel at `-O1`, expected tens of minutes on a desktop PC. The Steam Deck
   gets a DLL built on the PC from the same dump; the hash check keeps them matched.
 - **Indirect branches.** Jump tables and function pointers missed by discovery. Hybrid mode makes these misses

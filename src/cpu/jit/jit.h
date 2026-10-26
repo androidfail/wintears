@@ -39,6 +39,7 @@ typedef struct jit_monitor jit_monitor;   /* the global exclusive monitor for LD
 jit_monitor *jit_monitor_create(size_t cores);
 /* Blocks compiled (all cores) and instruction slabs allocated rather than reused, since the start. */
 void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs);
+uint64_t jit_compile_ns(void);   /* time spent compiling blocks (all cores), since the start */
 void jit_monitor_destroy(jit_monitor *m);
 
 typedef struct jit_core jit_core;
