@@ -8,7 +8,7 @@
       for the backend fence it ended with. "Signalled" thus means translated and GPU done, so memory the game reuses after
       a fence (command / control memory, pools, objects) is never read by a queued replay.
     - Pool add / delete and texture / program release are jobs in the same order; reading or writing what the GPU holds
-      (texels, invalidate, finish) first waits until the queue is empty. */
+      (texels, finish) first waits until the queue is empty; invalidate relies on the game's fence wait. */
 #include "gfx/nvn_backend.h"
 #include "host/hos.h"
 
@@ -98,7 +98,9 @@ int gpu_async(void) { return A; }
 const char *gpu_name(void) { return B->name; }
 void gpu_pool_add(const void *mem, uint64_t size) { if (A) push(&(job){.kind = J_POOL_ADD, .mem = mem, .size = size}); else B->pool_add(mem, size); }
 void gpu_pool_del(const void *mem) { if (A) push(&(job){.kind = J_POOL_DEL, .mem = mem}); else B->pool_del(mem); }
-void gpu_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { drain(); B->pool_invalidate(p, off, n); }
+/* Not drained: the game reads back after waiting on a fence, which already means "replayed and GPU done"; draining here
+   made each of ~150 calls a second wait ~2 ms for the next frame's replay (Steam Deck). */
+void gpu_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { B->pool_invalidate(p, off, n); }
 void gpu_set_tex_pool_n(int n) { B->set_tex_pool_n(n); }
 void gpu_reg_tex(int id, const tex_t *t, const view_t *v) { B->reg_tex(id, t, v); }   /* the backend locks its tables */
 void gpu_reg_samp(int id, const samp_par *p) { B->reg_samp(id, p); }

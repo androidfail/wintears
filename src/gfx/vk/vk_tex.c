@@ -425,11 +425,11 @@ static void content_note(vtex *e, const tex_t *t, uint64_t sub) {   /* at upload
 static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
     uint64_t t0 = pal_now_ns(), n = t->L.size;
     unsigned every = n > (1u << 20) ? 64 : 16, phase = (unsigned)((uintptr_t)e >> 6);
-    /* 8-bit textures up to 4 MiB (the font glyph caches: a few glyphs written at a time, which sampling misses: letters
+    /* 8-bit textures up to 16 MiB (the font glyph caches: a few glyphs written at a time, which sampling misses: letters
        and whole save-screen text missing on the Steam Deck) and textures up to 1 MiB (save thumbnails, UI) are hashed
        whole at every check, never sampled */
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    int glyphs = (bpb == 1 && bw == 1 && bh == 1 && n <= (4u << 20)) || e->whole_only;
+    int glyphs = (bpb == 1 && bw == 1 && bh == 1 && n <= (16u << 20)) || e->whole_only;   /* TOTK's save-menu font: 2048x4096, 8 MiB */
     /* cold: looked at every 4th submission. Not glyph caches: text drawn once into a cached image (menus, dialogue)
        in a submission that missed new glyphs kept those letters missing on the Steam Deck. */
     if (n > (16u << 10) && !e->hot && !glyphs && (sub + phase) % 4) return 0;
