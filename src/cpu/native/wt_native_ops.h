@@ -3,6 +3,7 @@
    nearest, no flush to zero) and NaNs not bit-exact (the JIT's TOTK_JIT_FAST_NAN default). Included by wt_native.h. */
 #pragma once
 #include <math.h>
+#include <xmmintrin.h>
 
 typedef union { wt_v128 v; uint8_t b[16]; int8_t sb[16]; uint16_t h[8]; int16_t sh[8]; uint32_t w[4]; int32_t sw[4];
                 uint64_t d[2]; int64_t sd[2]; float f[4]; double g[2]; } wt_lanes;
@@ -37,32 +38,40 @@ static inline uint32_t wt_op_FPMulX32(uint32_t a, uint32_t b) {   /* infinity x 
     if ((wt_isinf32(a) && wt_iszero32(b)) || (wt_iszero32(a) && wt_isinf32(b))) return ((a ^ b) & 0x80000000u) | 0x40000000u;
     return wt_op_FPMul32(a, b);
 }
+/* FPCR.FZ (MXCSR DAZ while recompiled code runs): helpers that look at bits instead of doing arithmetic take a
+   denormal input as a zero of the same sign, as ARM does */
+static inline uint32_t wt_daz32(uint32_t a) { return !(a & 0x7F800000u) && (a & 0x7FFFFFu) && (_mm_getcsr() & 0x40u) ? a & 0x80000000u : a; }
+static inline uint64_t wt_daz64(uint64_t a) { return !(a & 0x7FF0000000000000ull) && (a & 0xFFFFFFFFFFFFFull) && (_mm_getcsr() & 0x40u) ? a & 0x8000000000000000ull : a; }
 /* ARM FMIN / FMAX: a NaN wins; -0 is below +0 */
 static inline uint32_t wt_op_FPMin32(uint32_t a, uint32_t b) {
+    a = wt_daz32(a); b = wt_daz32(b);
     if (wt_isnan32(a)) return a | 0x00400000u; if (wt_isnan32(b)) return b | 0x00400000u;
     if (wt_iszero32(a) && wt_iszero32(b)) return a | b;
     return wt_f32(a) < wt_f32(b) ? a : b;
 }
 static inline uint32_t wt_op_FPMax32(uint32_t a, uint32_t b) {
+    a = wt_daz32(a); b = wt_daz32(b);
     if (wt_isnan32(a)) return a | 0x00400000u; if (wt_isnan32(b)) return b | 0x00400000u;
     if (wt_iszero32(a) && wt_iszero32(b)) return a & b;
     return wt_f32(a) > wt_f32(b) ? a : b;
 }
 static inline uint64_t wt_op_FPMin64(uint64_t a, uint64_t b) {
+    a = wt_daz64(a); b = wt_daz64(b);
     if (wt_isnan64(a)) return a | (1ull << 51); if (wt_isnan64(b)) return b | (1ull << 51);
     if (!(a << 1) && !(b << 1)) return a | b;
     return wt_f64(a) < wt_f64(b) ? a : b;
 }
 static inline uint64_t wt_op_FPMax64(uint64_t a, uint64_t b) {
+    a = wt_daz64(a); b = wt_daz64(b);
     if (wt_isnan64(a)) return a | (1ull << 51); if (wt_isnan64(b)) return b | (1ull << 51);
     if (!(a << 1) && !(b << 1)) return a & b;
     return wt_f64(a) > wt_f64(b) ? a : b;
 }
 /* FMINNM / FMAXNM: a quiet NaN against a number gives the number */
-static inline uint32_t wt_op_FPMinNumeric32(uint32_t a, uint32_t b) { if (wt_isnan32(a) && !wt_isnan32(b)) return b; if (wt_isnan32(b) && !wt_isnan32(a)) return a; return wt_op_FPMin32(a, b); }
-static inline uint32_t wt_op_FPMaxNumeric32(uint32_t a, uint32_t b) { if (wt_isnan32(a) && !wt_isnan32(b)) return b; if (wt_isnan32(b) && !wt_isnan32(a)) return a; return wt_op_FPMax32(a, b); }
-static inline uint64_t wt_op_FPMinNumeric64(uint64_t a, uint64_t b) { if (wt_isnan64(a) && !wt_isnan64(b)) return b; if (wt_isnan64(b) && !wt_isnan64(a)) return a; return wt_op_FPMin64(a, b); }
-static inline uint64_t wt_op_FPMaxNumeric64(uint64_t a, uint64_t b) { if (wt_isnan64(a) && !wt_isnan64(b)) return b; if (wt_isnan64(b) && !wt_isnan64(a)) return a; return wt_op_FPMax64(a, b); }
+static inline uint32_t wt_op_FPMinNumeric32(uint32_t a, uint32_t b) { a = wt_daz32(a); b = wt_daz32(b); if (wt_isnan32(a) && !wt_isnan32(b)) return b; if (wt_isnan32(b) && !wt_isnan32(a)) return a; return wt_op_FPMin32(a, b); }
+static inline uint32_t wt_op_FPMaxNumeric32(uint32_t a, uint32_t b) { a = wt_daz32(a); b = wt_daz32(b); if (wt_isnan32(a) && !wt_isnan32(b)) return b; if (wt_isnan32(b) && !wt_isnan32(a)) return a; return wt_op_FPMax32(a, b); }
+static inline uint64_t wt_op_FPMinNumeric64(uint64_t a, uint64_t b) { a = wt_daz64(a); b = wt_daz64(b); if (wt_isnan64(a) && !wt_isnan64(b)) return b; if (wt_isnan64(b) && !wt_isnan64(a)) return a; return wt_op_FPMin64(a, b); }
+static inline uint64_t wt_op_FPMaxNumeric64(uint64_t a, uint64_t b) { a = wt_daz64(a); b = wt_daz64(b); if (wt_isnan64(a) && !wt_isnan64(b)) return b; if (wt_isnan64(b) && !wt_isnan64(a)) return a; return wt_op_FPMax64(a, b); }
 /* FCMP: NZCV 0110 equal, 1000 less, 0010 greater, 0011 unordered */
 static inline uint32_t wt_fcmp(int lt, int eq, int gt) { return eq ? 0x60000000u : lt ? 0x80000000u : gt ? 0x20000000u : 0x30000000u; }
 static inline uint32_t wt_op_FPCompare32(uint32_t a, uint32_t b, unsigned q) { (void)q; float x = wt_f32(a), y = wt_f32(b); return wt_fcmp(x < y, x == y, x > y); }
@@ -131,6 +140,7 @@ static inline int wt_unpack32(uint32_t a, int *exp, uint64_t *mant) {   /* value
     int h = 31 - __builtin_clz(f); *exp = h - 149; *mant = (uint64_t)f << (62 - h); return 1;
 }
 static inline uint32_t wt_op_FPRecipEstimate32(uint32_t a) {
+    a = wt_daz32(a);
     uint32_t sign = a & 0x80000000u;
     if (wt_isnan32(a)) return a | 0x00400000u;
     if (wt_isinf32(a)) return sign;
@@ -144,6 +154,7 @@ static inline uint32_t wt_op_FPRecipEstimate32(uint32_t a) {
     return sign | (uint32_t)(rexp + 127) << 23 | ((uint32_t)est & 0x7FFFFFu);
 }
 static inline uint32_t wt_op_FPRSqrtEstimate32(uint32_t a) {
+    a = wt_daz32(a);
     if (wt_isnan32(a)) return a | 0x00400000u;
     if (wt_iszero32(a)) return (a & 0x80000000u) | 0x7F800000u;
     if (a & 0x80000000u) return 0x7FC00000u;

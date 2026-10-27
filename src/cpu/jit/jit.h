@@ -60,6 +60,8 @@ size_t jit_native_load(const char *dir, const uint64_t bases[3], char *err, size
 /* Hybrid mode counts since the start: blocks run recompiled, blocks given to dynarmic, blocks seen with FPCR != 0
    (recompiled blocks assume 0) and the last such FPCR. */
 void jit_native_stats(jit_core *c, uint64_t *native, uint64_t *missed, uint64_t *fpcr_other, uint64_t *last_fpcr);
+/* TOTK_NATIVE_MISSES=<file>: write the pcs the cores gave to dynarmic, most often first ("<hex pc> <count>" lines) */
+void jit_native_misses(jit_core *const *cores, size_t n, const char *path);
 jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id);
 void jit_core_destroy(jit_core *c);
 

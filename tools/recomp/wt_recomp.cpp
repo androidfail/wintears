@@ -23,6 +23,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <xmmintrin.h>
 
 #include "wt_native.h"
 #include "dynarmic/interface/A64/a64.h"
@@ -505,47 +506,61 @@ struct Emitter {
     }
 };
 
-int emit(Program &p, const std::string &dir, const std::string &only, size_t per_file) {
+int emit(Program &p, const std::string &dir, const std::string &only, size_t per_file, const char *seeds_file) {
     A64::UserConfig uc;
     uc.define_unpredictable_behaviour = true;
     uc.wall_clock_cntpct = true;
     uc.dczid_el0 = 4;
     std::vector<uint64_t> work;
     for (auto &m : p.mods) if (only == "all" || m.name == only) for (uint64_t s : m.seeds) work.push_back(m.base + s);
+    if (seeds_file) {   // block starts seen at run time (TOTK_NATIVE_MISSES: "<hex pc> <count>" lines)
+        FILE *f = fopen(seeds_file, "r");
+        unsigned long long pc, n;
+        size_t k = 0;
+        while (f && fscanf(f, "%llx %llu", &pc, &n) == 2) { work.push_back(pc); k++; }
+        if (f) fclose(f);
+        printf("%zu block starts from %s\n", k, seeds_file);
+    }
     auto in_scope = [&](uint64_t pc) {
         for (auto &m : p.mods) if (pc >= m.base + m.text_lo && pc < m.base + m.text_hi) return only == "all" || m.name == only;
         return false;
     };
+    // pass 1: every reachable block; pass 2: emit them in address order, one file per 2^per_file bytes of guest code.
+    // Files are named by address and only change when their blocks do, so build_native.py's object cache can reuse the
+    // compiled ones across rebuilds.
     std::unordered_set<uint64_t> seen;
-    std::vector<uint64_t> done;
-    std::map<std::string, uint64_t> missing;
-    Emitter em;
-    std::string cur;
-    size_t in_file = 0, files = 0;
-    uint64_t total = 0;
-    auto flush = [&]() {
-        if (cur.empty()) return;
-        std::string path = dir + "/blocks_" + std::to_string(files++) + ".c";
-        FILE *f = fopen(path.c_str(), "wb");
-        fputs("#include \"wt_native.h\"\n", f); fputs(cur.c_str(), f); fclose(f);
-        cur.clear(); in_file = 0;
-    };
     std::vector<uint64_t> next;
     while (!work.empty()) {
         uint64_t pc = work.back(); work.pop_back();
         if (!in_scope(pc) || !seen.insert(pc).second) continue;
         IR::Block b = translate(p, pc, uc);
-        total++;
         for (auto &inst : b)
             if (inst.GetOpcode() == IR::Opcode::PushRSB) work.push_back(A64::LocationDescriptor{IR::LocationDescriptor{inst.GetArg(0).GetU64()}}.PC());
         next.clear(); successors(b.GetTerminal(), next);
         for (uint64_t n : next) work.push_back(n);
+    }
+    std::vector<uint64_t> all(seen.begin(), seen.end());
+    std::sort(all.begin(), all.end());
+    std::vector<uint64_t> done;
+    std::map<std::string, uint64_t> missing;
+    Emitter em;
+    std::string cur;
+    size_t files = 0;
+    uint64_t total = all.size(), chunk = ~0ull;
+    auto flush = [&]() {
+        if (cur.empty()) return;
+        char name[64]; snprintf(name, sizeof name, "/blocks_%llx.c", (unsigned long long)chunk);
+        FILE *f = fopen((dir + name).c_str(), "wb");
+        fputs("#include \"wt_native.h\"\n", f); fputs(cur.c_str(), f); fclose(f);
+        cur.clear(); files++;
+    };
+    for (uint64_t pc : all) {
+        if (pc >> per_file != chunk) { flush(); chunk = pc >> per_file; }
+        IR::Block b = translate(p, pc, uc);
         if (!em.block(b, pc, cur)) { missing[em.why]++; continue; }
         done.push_back(pc);
-        if (++in_file == per_file) flush();
     }
     flush();
-    std::sort(done.begin(), done.end());
     FILE *f = fopen((dir + "/table.c").c_str(), "wb");
     fputs("#include \"wt_native.h\"\n", f);
     for (uint64_t pc : done) fprintf(f, "void B_%llx(wt_ctx *);\n", (unsigned long long)pc);
@@ -672,11 +687,16 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
         }
         n.nzcv = (uint32_t)(rnd() & 0xF) << 28; n.pc = e.pc; n.tpidr = scratch + 4096; n.tpidrro = scratch + 8192;
         n.halt_request = (volatile int *)&no_halt; n.cntpct = fixed_cntpct;
+        n.fpcr = (rnd() & 1) ? 0x01000000u : 0;   // half with FZ, as TOTK's threads run
         wt_ctx start = n;
         restore();
         g_in_test = 1;
-        if (__builtin_setjmp(g_fault_jmp)) { g_in_test = 0; faulted++; continue; }
+        static unsigned mx_host = _mm_getcsr();
+        if (__builtin_setjmp(g_fault_jmp)) { g_in_test = 0; _mm_setcsr(mx_host); faulted++; continue; }
+        unsigned mx = _mm_getcsr();
+        if (n.fpcr) _mm_setcsr(mx | 0x8040u);   // FTZ + DAZ, as the runtime does under FZ
         e.fn(&n);
+        _mm_setcsr(mx);
         g_in_test = 0;
         uint64_t h_native = mem_hash();
         // dynarmic, one block
@@ -684,7 +704,7 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
         auto &j = *cb.jit;
         std::array<uint64_t, 31> regs; memcpy(regs.data(), start.x, sizeof regs); j.SetRegisters(regs);
         std::array<A64::Vector, 32> vec; for (int i = 0; i < 32; i++) vec[i] = {start.v[i].lo, start.v[i].hi}; j.SetVectors(vec);
-        j.SetSP(start.sp); j.SetPC(start.pc); j.SetFpcr(0); j.SetFpsr(0); j.SetPstate(start.nzcv); j.ClearExclusiveState();
+        j.SetSP(start.sp); j.SetPC(start.pc); j.SetFpcr(start.fpcr); j.SetFpsr(0); j.SetPstate(start.nzcv); j.ClearExclusiveState();
         cb.tpidr = start.tpidr; cb.tpidrro = start.tpidrro; cb.svc = 0; cb.halted = 0; cb.exc = -1;
         g_in_test = 1;
         if (__builtin_setjmp(g_fault_jmp)) { g_in_test = 0; faulted++; cb.jit = std::make_unique<A64::Jit>(uc); continue; }
@@ -742,7 +762,7 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
 
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc < 3) { fprintf(stderr, "usage: wt_recomp <TOTK_win> survey | emit <dir> <module|all> [blocks per file]\n"); return 2; }
+    if (argc < 3) { fprintf(stderr, "usage: wt_recomp <TOTK_win> survey | emit <dir> <module|all> [log2 bytes of guest code per file [seeds file]] | difftest <dll> <samples> [seed]\n"); return 2; }
     Program p;
     uint64_t at = 0x300000000ull;
     for (const char *n : {"main", "subsdk0", "sdk"}) {
@@ -754,7 +774,7 @@ int main(int argc, char **argv) {
         p.mods.push_back(std::move(m));
     }
     if (!strcmp(argv[2], "survey")) return survey(p);
-    if (!strcmp(argv[2], "emit") && argc >= 5) return emit(p, argv[3], argv[4], argc > 5 ? (size_t)atoll(argv[5]) : 2000);
+    if (!strcmp(argv[2], "emit") && argc >= 5) return emit(p, argv[3], argv[4], argc > 5 ? (size_t)atoll(argv[5]) : 14, argc > 6 ? argv[6] : nullptr);   // 16 KiB of guest code a file
     if (!strcmp(argv[2], "difftest") && argc >= 5) return difftest(p, argv[3], (size_t)atoll(argv[4]), argc > 5 ? (uint64_t)atoll(argv[5]) : 1);
     fprintf(stderr, "unknown command %s\n", argv[2]);
     return 2;

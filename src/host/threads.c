@@ -94,6 +94,7 @@ void runtime_wait_report(char *out, size_t cap) {
                  (unsigned long long)(tf - lf), (unsigned long long)fp);
     }
     ln = tn; lm = tm; lf = tf;
+    { const char *mf = pal_getenv("TOTK_NATIVE_MISSES"); if (mf && *mf) jit_native_misses(g_jit, NCORE, mf); }
 }
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];

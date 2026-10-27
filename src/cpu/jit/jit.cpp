@@ -16,9 +16,11 @@
 #include "pal.h"
 #include "native/wt_native.h"
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <xmmintrin.h>
+#include <unordered_map>
 
 using Dynarmic::A64::Vector;
 
@@ -147,6 +149,7 @@ struct jit_core final : Dynarmic::A64::UserCallbacks {
     wt_ctx nc{};
     volatile int halt_req = 0;
     uint64_t n_native = 0, n_missed = 0, n_fpcr = 0, last_fpcr = 0;   /* blocks run (read racily for the log) */
+    std::unordered_map<uint64_t, uint64_t> *misses = nullptr;   /* TOTK_NATIVE_MISSES: missed pc -> count */
 
     std::uint8_t MemoryRead8(VAddr a) override { return load<uint8_t>(a); }
     std::uint16_t MemoryRead16(VAddr a) override { return load<uint16_t>(a); }
@@ -223,6 +226,7 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
     c->nc.halt_request = &c->halt_req;
     c->nc.cntpct = c->cfg.cntpct;
     c->nc.cntpct_user = c->cfg.user;
+    if (c->hybrid && pal_getenv("TOTK_NATIVE_MISSES")) c->misses = new std::unordered_map<uint64_t, uint64_t>;
     /* Architecturally unpredictable forms run as the hardware does them instead of stopping: TOTK main+0x12497b8 has
        "stlxr wzr, xzr, [x8]" (status register = data register), executed as the store with the status discarded. */
     uc.define_unpredictable_behaviour = true;
@@ -353,7 +357,13 @@ int jit_run(jit_core *c) {
             else { c->exc_pc = n.pc; c->exc_kind = JIT_EXC_UNDEFINED; stop = JIT_STOP_EXCEPTION; }   /* Interpret terminal */
             break;
         }
+        {   /* the host's stubs in guest memory (bridge entries "svc #n; ret", the return trap): no need for dynarmic */
+            uint32_t w; memcpy(&w, reinterpret_cast<const void *>(n.pc), 4);
+            if ((w & 0xFFE0001Fu) == 0xD4000001u) { c->svc = w >> 5 & 0xFFFF; n.pc += 4; stop = JIT_STOP_SVC; break; }
+            if (w == 0xD65F03C0u) { n.pc = n.x[30]; continue; }
+        }
         c->n_missed++;
+        if (c->misses) (*c->misses)[n.pc]++;
         to_jit(c);
         Dynarmic::HaltReason r = c->jit->Run();   /* dynarmic sets its own MXCSR and puts back the one it found */
         from_jit(c);
@@ -367,6 +377,17 @@ int jit_step(jit_core *c) {
     to_jit(c); int s = stop_of(c, c->jit->Step()); from_jit(c); return s;
 }
 void jit_halt(jit_core *c) { c->halt_req = 1; c->jit->HaltExecution(kHaltExternal); }
+void jit_native_misses(jit_core *const *cores, size_t n, const char *path) {
+    std::unordered_map<uint64_t, uint64_t> all;   /* read racily: a diagnostic */
+    for (size_t i = 0; i < n; i++) if (cores[i]->misses) for (auto &[pc, k] : *cores[i]->misses) all[pc] += k;
+    if (all.empty()) return;
+    std::vector<std::pair<uint64_t, uint64_t>> v(all.begin(), all.end());
+    std::sort(v.begin(), v.end(), [](auto &a, auto &b) { return a.second > b.second; });
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    for (auto &[pc, k] : v) fprintf(f, "%llx %llu\n", (unsigned long long)pc, (unsigned long long)k);
+    fclose(f);
+}
 void jit_native_stats(jit_core *c, uint64_t *native, uint64_t *missed, uint64_t *fpcr_other, uint64_t *last_fpcr) {
     *native = c->n_native; *missed = c->n_missed; *fpcr_other = c->n_fpcr; *last_fpcr = c->last_fpcr;
 }
