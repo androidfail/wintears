@@ -1,3 +1,4 @@
+#include <windows.h>
 /* NVN layer test (no game data, no JIT): the host's NVN functions called directly, as the game would through its
    stubs. Ports upstream's CPU-only probes (hle_nvn.c dm_nvn_probe_commands, dm_nvn_probe_deferred_binds) and checks
    what the null backend does at submit: event values, counter reports, buffer copies and uniform updates. */
@@ -223,6 +224,8 @@ static void test_vpool(void) {
 }
 
 int main(void) {
+    /* these tests read effects right after a submit, as the old synchronous replay gave them (the game waits on fences) */
+    SetEnvironmentVariableW(L"TOTK_ASYNC_REPLAY", L"0");
     test_commands();
     test_usage();
     test_deferred();
