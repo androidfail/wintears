@@ -76,6 +76,7 @@ VmaMemoryUsage vk_prefer_device(void);   /* VK_ERROR_DEVICE_LOST: logs what the 
    (snapshot) or as they are then (src stays valid, e.g. guest memory) */
 void vk_after_write(uint64_t dst, const void *src, size_t n, int snapshot);
 void vk_barrier(VkCommandBuffer c);  /* every earlier access before every later one */
+int vk_done_anchor(uint64_t *gpu_end, uint64_t *cpu_ns);   /* completion thread: the completing submission's GPU end and when it was seen */
 uint64_t vk_ticks(void);             /* 19.2 MHz counter ticks, the clock of the game's CNTPCT reads */
 
 /* vk_fmt.c ------------------------------------------------------------------------------------------------------ */

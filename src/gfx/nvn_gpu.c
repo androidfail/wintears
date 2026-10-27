@@ -1,7 +1,7 @@
 /* The GPU backend in use (nvn_backend.h): Vulkan when it starts (it needs the window), else the null backend.
    TOTK_GPU=null picks the null backend, TOTK_GPU=vulkan stops the run if Vulkan does not start.
 
-   Translation thread (TOTK_ASYNC_REPLAY=1, upstream's design in games/by3 hle_nvn.c): submits and presents are queued in
+   Translation thread (on by default, TOTK_ASYNC_REPLAY=0: off; upstream's design in games/by3 hle_nvn.c): submits and presents are queued in
    order to one host thread that replays them; the game's submit returns at once, so the game builds the next frame while
    this one is translated (on the Steam Deck the replay was ~27 ms of every frame on the game's critical path).
     - Fences: FenceSync takes the number of submits queued so far; a wait first waits until that submit is replayed, then
@@ -88,12 +88,12 @@ void gpu_init(void) {
         else LOG("[gpu] Vulkan backend not available: nothing is drawn (null backend)");
     }
     if (B == &gpu_null_ops) B->init();
-    const char *e = pal_getenv("TOTK_ASYNC_REPLAY"); A = e && atoi(e) > 0;
+    const char *e = pal_getenv("TOTK_ASYNC_REPLAY"); A = !(e && *e == '0');   /* on by default (tested on the Steam Deck); =0: off */
     if (A) {
         pthread_t t;
         if (pthread_create(&t, NULL, x_thread, NULL)) die("translation thread");
         pthread_detach(t);
-        LOG("[gpu] translation thread: submits and presents are replayed on their own thread (TOTK_ASYNC_REPLAY)");
+        LOG("[gpu] translation thread: submits and presents are replayed on their own thread (TOTK_ASYNC_REPLAY=0: off)");
     }
 }
 int gpu_async(void) { return A; }

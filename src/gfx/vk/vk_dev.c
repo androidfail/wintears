@@ -568,10 +568,17 @@ static void ts_begin(sub *s) {
     vkCmdWriteTimestamp2(s->pre, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, 2 * (uint32_t)s->slot);
 }
 static void ts_end(sub *s) { if (g_ts && s->slot < TS_SLOTS) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, 2 * (uint32_t)s->slot + 1); }
+/* The completing submission's GPU end timestamp and the CPU time it was seen done: the anchor that turns the game's
+   timestamp reports in it into the game's clock (vk_exec.c do_counter; completion thread only). */
+static uint64_t g_anchor_gpu, g_anchor_ns; static int g_anchor_ok;
+int vk_done_anchor(uint64_t *gpu_end, uint64_t *cpu_ns) { if (!g_anchor_ok) return 0; *gpu_end = g_anchor_gpu; *cpu_ns = g_anchor_ns; return 1; }
 static void ts_read(sub *s) {   /* the submission has completed */
     uint64_t t[2];
-    if (g_ts && s->slot < TS_SLOTS && vkGetQueryPoolResults(vk_dev, g_ts, 2 * (uint32_t)s->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
+    g_anchor_ok = 0;
+    if (g_ts && s->slot < TS_SLOTS && vkGetQueryPoolResults(vk_dev, g_ts, 2 * (uint32_t)s->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
         atomic_fetch_add(&g_gpu_busy_ns, (uint64_t)((double)(t[1] - t[0]) * vk_props.limits.timestampPeriod));
+        g_anchor_gpu = t[1]; g_anchor_ns = pal_now_ns(); g_anchor_ok = 1;
+    }
 }
 
 void vk_open(void) {

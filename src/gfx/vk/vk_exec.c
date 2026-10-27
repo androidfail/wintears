@@ -41,7 +41,7 @@ static int oq_make(void) {
     if (vkCreateQueryPool(vk_dev, &qi, NULL, &g_oq) != VK_SUCCESS) { g_oq = VK_NULL_HANDLE; g_oq_env = 0; VLOG("occlusion queries: no query pool, every query says visible"); return 0; }
     return 1;
 }
-typedef struct { uint64_t type, addr, from, to; int real; } ctr_act;
+typedef struct { uint64_t type, addr, from, to; int real; uint32_t tsq; } ctr_act;   /* tsq: its GPU timestamp query + 1 */
 static uint64_t oq_sum(uint64_t from, uint64_t to) {
     uint64_t n = to - from, sum = 0;
     if (n > OQ_N) { from = to - OQ_N; n = OQ_N; }
@@ -55,10 +55,42 @@ static uint64_t oq_sum(uint64_t from, uint64_t to) {
     free(r);
     return sum;
 }
+/* Timestamp reports (TIMESTAMP_TOP / TIMESTAMP, about one each per submission) get the GPU's own time at that point of
+   the command stream, in the game's clock: the submission's end anchors GPU time to the CPU clock. Before, both were
+   the CPU time the submission was seen done, so the game measured almost no GPU time between them (its dynamic
+   resolution reads it; a GPU-bound laptop stayed at full resolution). */
+#define RTS_N 4096
+static VkQueryPool g_rts; static uint32_t g_rts_next; static int g_rts_state;   /* 0 untried, 1 on, -1 off */
+static uint32_t rts_write(int top) {   /* replay: a timestamp query at this point; its number + 1, or 0 */
+    if (!g_rts_state) {
+        const char *e = pal_getenv("TOTK_GPU_TIMESTAMPS");
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = RTS_N};
+        g_rts_state = (e && *e == '0') || !vk_props.limits.timestampComputeAndGraphics || vkCreateQueryPool(vk_dev, &qi, NULL, &g_rts) != VK_SUCCESS ? -1 : 1;
+        VLOG("game timestamp reports: %s", g_rts_state > 0 ? "GPU time (TOTK_GPU_TIMESTAMPS=0: the CPU time the submission completed)" : "the CPU time the submission completed");
+    }
+    if (g_rts_state < 0) return 0;
+    uint32_t q = g_rts_next++ % RTS_N;
+    vkCmdResetQueryPool(vk_pre(), g_rts, q, 1);   /* the pre buffer runs first and is never inside a pass */
+    vkCmdWriteTimestamp2(vk_cmd(), top ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_rts, q);
+    return q + 1;
+}
+static uint64_t report_ticks(const ctr_act *c) {   /* completion thread */
+    uint64_t g, end, ns;
+    if (c->tsq && vk_done_anchor(&end, &ns) && vkGetQueryPoolResults(vk_dev, g_rts, c->tsq - 1, 1, 8, &g, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && g <= end) {
+        uint64_t back = (uint64_t)((double)(end - g) * vk_props.limits.timestampPeriod);   /* ns before the submission's end */
+        if (back < ns) { ns -= back; return ns / 625 * 12 + ns % 625 * 12 / 625; }
+    }
+    return vk_ticks();
+}
 static void do_counter(void *arg) {
     ctr_act *c = arg;
     /* NVNcounterData = {counter, timestamp}. Without counting on the GPU (never reset, or TOTK_OCCLUSION=0): "visible". */
-    uint64_t rec[2] = {c->real ? oq_sum(c->from, c->to) : c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1u << 20 : 0, vk_ticks()};
+    uint64_t rec[2] = {c->real ? oq_sum(c->from, c->to) : c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 1u << 20 : 0, report_ticks(c)};
+    {   static uint64_t top; static int shown;   /* the first GPU intervals the game will measure (TIMESTAMP_TOP to the next TIMESTAMP) */
+        if (c->type == NVN_COUNTER_TYPE_TIMESTAMP_TOP) top = rec[1];
+        else if (c->type == NVN_COUNTER_TYPE_TIMESTAMP && top) {
+            static uint64_t n, big; static double mx; double ms = (rec[1] - top) / 19200.0; n++; if (ms > 0.05) big++; if (ms > mx) mx = ms; top = 0;
+            if (shown < 12 && (n == 1000 || n == 5000 || n == 20000 || (ms > 0.05 && big <= 6))) { shown++; VLOG("[counter] game-measured GPU interval %.3f ms (%llu pairs, %llu over 0.05 ms, largest %.3f ms)", ms, (unsigned long long)n, (unsigned long long)big, mx); } } }
     dm_guest_write_prepare((void *)(uintptr_t)c->addr, sizeof rec);
     memcpy((void *)(uintptr_t)c->addr, rec, sizeof rec);
     free(c);
@@ -670,6 +702,8 @@ void vx_run(const uint8_t *p) {
         }
         case OP_REPORT_COUNTER: {
             ctr_act *c = calloc(1, sizeof *c); memcpy(&c->type, a, 8); memcpy(&c->addr, a + 8, 8);
+            {   static unsigned seen[64], logged; uint64_t ty = c->type < 64 ? c->type : 63;   /* TOTK_DIAG: the counter types the game reports (first 40) */
+                if (!seen[ty]++ || (logged < 40 && seen[ty] == 100)) { logged++; VLOG("[counter] type %llu reported (%u so far, submission %llu)", (unsigned long long)c->type, seen[ty], (unsigned long long)vk_sub_serial()); } }
             if (g_oq_on && c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { vx_end_pass(); c->real = 1; c->from = g_oq_start; c->to = g_oq_n; }   /* later draws do not count */
             else {   /* known now: the counter field is written in replay order, as the GPU does. TOTK gates its clears with a
                         conditional on a counter the CPU sets to 1 and a report after the clear resets; written only when the
@@ -680,6 +714,7 @@ void vx_run(const uint8_t *p) {
                 dm_guest_write_prepare((void *)(uintptr_t)c->addr, 8);
                 memcpy((void *)(uintptr_t)c->addr, &v, 8);
             }
+            if (c->type == NVN_COUNTER_TYPE_TIMESTAMP || c->type == NVN_COUNTER_TYPE_TIMESTAMP_TOP) c->tsq = rts_write(c->type == NVN_COUNTER_TYPE_TIMESTAMP_TOP);
             vk_after(do_counter, c); break;
         }
         case OP_RESET_COUNTER: {

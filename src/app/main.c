@@ -108,15 +108,17 @@ static int boot(const char *root, int trace) {
     if (host_memory_init(err, sizeof err)) { LOG("%s", err); return 1; }
     mods = ldr_create();
     if (!mods || load_modules(root)) return 1;
-    {   /* Direct Native hybrid mode (TOTK_NATIVE=1): recompiled blocks from <root>/native, dynarmic for the rest */
+    {   /* Direct Native hybrid mode: recompiled blocks from <root>/native when they are there (tools/recomp/build_native.py),
+           dynarmic for the rest; TOTK_NATIVE=0: the JIT only */
         const char *e = pal_getenv("TOTK_NATIVE");
-        if (e && *e == '1') {
+        if (!(e && *e == '0')) {
             uint64_t b[3];
             for (unsigned i = 0; i < 3; i++) b[i] = ldr_module_at(mods, i)->base;
             char dir[1100], nerr[256];
             snprintf(dir, sizeof dir, "%s/native", root);
             size_t n = jit_native_load(dir, b, nerr, sizeof nerr);
-            LOG("Direct Native: %zu recompiled blocks from %s%s%s", n, dir, nerr[0] ? "; " : "", nerr);
+            if (n || nerr[0]) LOG("Direct Native: %zu recompiled blocks from %s%s%s", n, dir, nerr[0] ? "; " : "", nerr);
+            else LOG("Direct Native: off, no recompiled blocks in %s (tools/recomp/build_native.py makes them); game code runs in the JIT", dir);
         }
     }
     host_init(mods);
