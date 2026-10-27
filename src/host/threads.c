@@ -58,6 +58,8 @@ static _Atomic uint64_t g_ns_lock, g_ns_core, g_ns_block, g_n_lock_slow, g_n_cor
 /* Core time: free (no owner), handed over but the new owner not running yet, running guest code; the rest is spent
    in svcs and host calls while holding the core. */
 static _Atomic uint64_t g_ns_free, g_ns_handoff, g_ns_jit;
+/* waits for a core that began while another core was free (the thread's mask did not allow it), by mask */
+static _Atomic uint64_t g_ns_mask_wait[8];
 static uint64_t g_free_since[3];
 /* Calls from guest code: count and time per svc (index < 0x100) and per host stub (0x100 + stub index); the reasons
    jit_run returned. */
@@ -94,6 +96,10 @@ void runtime_wait_report(char *out, size_t cap) {
                  (unsigned long long)(tf - lf), (unsigned long long)fp);
     }
     ln = tn; lm = tm; lf = tf;
+    {   size_t at = strlen(out);
+        at += (size_t)snprintf(out + at, at < cap ? cap - at : 0, "; core waits begun with another core free, by core mask:");
+        for (int m = 1; m < 8; m++) { uint64_t v = atomic_exchange(&g_ns_mask_wait[m], 0); if (v && at < cap) at += (size_t)snprintf(out + at, cap - at, " %#x %.0f ms", m, v / 1e6); }
+    }
     { const char *mf = pal_getenv("TOTK_NATIVE_MISSES"); if (mf && *mf) jit_native_misses(g_jit, NCORE, mf); }
 }
 #define MAX_H 4096
@@ -193,9 +199,11 @@ static void core_take(thr_t *t) {   /* holding G; waits until a core in t's mask
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
     preempt_for(t);
     uint64_t t0 = g_diag ? pal_now_ns() : 0;
+    int other_free = 0; for (int i = 0; i < NCORE; i++) other_free |= !g_core_owner[i];
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
     if (!g_diag) return;
     uint64_t t1 = pal_now_ns();
+    if (other_free) atomic_fetch_add(&g_ns_mask_wait[t->mask & 7], t1 - t0);
     atomic_fetch_add(&g_ns_core, t1 - t0); atomic_fetch_add(&g_n_core_wait, 1);
     if (t1 > t->core_since) atomic_fetch_add(&g_ns_handoff, t1 - t->core_since);
 }

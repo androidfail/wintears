@@ -39,6 +39,7 @@ struct vtex {
     /* content check (no write protection, the Steam Deck): whole and sampled hashes of what was uploaded, when each was
        last compared; hot = changed since its first upload */
     uint64_t hash, shash, hashed_sub, sampled_sub; int hot;
+    int whole_only;   /* sampling once missed a change here: hashed whole at every check from then on */
     view_ent *views; int nviews, cviews;
 };
 static nvn_hmap g_by_stor = {.klen = sizeof(stor_key)};
@@ -428,12 +429,19 @@ static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
        and whole save-screen text missing on the Steam Deck) and textures up to 1 MiB (save thumbnails, UI) are hashed
        whole at every check, never sampled */
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-    int glyphs = bpb == 1 && bw == 1 && bh == 1 && n <= (4u << 20);
+    int glyphs = (bpb == 1 && bw == 1 && bh == 1 && n <= (4u << 20)) || e->whole_only;
     /* cold: looked at every 4th submission. Not glyph caches: text drawn once into a cached image (menus, dialogue)
        in a submission that missed new glyphs kept those letters missing on the Steam Deck. */
     if (n > (16u << 10) && !e->hot && !glyphs && (sub + phase) % 4) return 0;
     int whole = n <= (1u << 20) || glyphs || e->hot || (sub + phase) % every == 0;
     int changed = whole ? hash_whole(t->mem, n) != e->hash : hash_sampled(t->mem, n) != e->shash;
+    /* a whole hash saw a change that sampling would have missed (a few texels written: glyphs in a large atlas,
+       broken save-menu text on the Steam Deck): this texture is never sampled again */
+    if (changed && whole && !e->whole_only && n > (16u << 10) && hash_sampled(t->mem, n) == e->shash) {
+        e->whole_only = 1;
+        static int said; if (said++ < 40) VLOG("[tex] sampling missed a change in a %ux%u texture (NVN format %#x, %llu KiB): hashed whole from now on",
+                                         t->d.width, t->d.height, (unsigned)t->d.format, (unsigned long long)(n >> 10));
+    }
     if (changed) e->hot = 64; else if (e->hot) e->hot--;
     vk_ns_hash += pal_now_ns() - t0;
     return changed;

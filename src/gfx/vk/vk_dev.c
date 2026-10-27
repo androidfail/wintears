@@ -917,7 +917,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
         static int diag = -1; if (diag < 0) { const char *d = pal_getenv("TOTK_DIAG"); diag = d && *d == '1'; }
         if (diag) { static uint64_t lastf; uint64_t f = pal_fault_total(); char cpu[600]; pal_thread_cpu_report(cpu, sizeof cpu);
           VLOG("cpu (last 10 s, %% of one core): %s; %llu memory faults", cpu, (unsigned long long)(f - lastf)); lastf = f;
-          void runtime_wait_report(char *out, size_t cap); char w[800]; runtime_wait_report(w, sizeof w);
+          void runtime_wait_report(char *out, size_t cap); char w[1400]; runtime_wait_report(w, sizeof w);
           extern _Atomic uint64_t vp_ns_acquire, vp_ns_present, vp_n_present; extern _Atomic unsigned long long vi_n_vsync;
           VLOG("waits (last 10 s): %s; %llu presents, acquiring images %.0f ms, presenting %.0f ms; %llu vsync signals", w,
                (unsigned long long)atomic_exchange(&vp_n_present, 0), atomic_exchange(&vp_ns_acquire, 0) / 1e6, atomic_exchange(&vp_ns_present, 0) / 1e6,
