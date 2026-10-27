@@ -53,6 +53,16 @@ static const struct { SDL_GamepadButton b; uint64_t bit; } pad_map[] = {
 static int32_t axis(int v) { return v < -32767 ? -32767 : v; }               /* SDL's -32768 .. 32767 to the Switch's range */
 static int32_t larger(int32_t a, int32_t b) { return abs(a) >= abs(b) ? a : b; }
 
+/* A stick at rest is not at 0: the Steam Deck's read up to about 4800 (15%) and the game took it as a push, so Link
+   drifted. Inside 16% of full tilt is the middle; the rest is stretched back to the full range (upstream: 12% per axis). */
+static void stick(SDL_Gamepad *g, SDL_GamepadAxis ax, SDL_GamepadAxis ay, int32_t *x, int32_t *y) {
+    float fx = axis(SDL_GetGamepadAxis(g, ax)) / 32767.f, fy = -axis(SDL_GetGamepadAxis(g, ay)) / 32767.f;   /* SDL's y grows downward */
+    float m = SDL_sqrtf(fx * fx + fy * fy), dz = 0.16f;
+    if (m <= dz) return;
+    float s = ((m > 1 ? 1 : m) - dz) / (1 - dz) * 32767.f / m;   /* same direction, length stretched from dz..1 to 0..1 */
+    *x = larger(*x, (int32_t)(fx * s)); *y = larger(*y, (int32_t)(fy * s));
+}
+
 /* The pad state from everything held right now: keyboard and every open controller. */
 static void update_pad(void) {
     const bool *k = SDL_GetKeyboardState(NULL);
@@ -75,11 +85,8 @@ static void update_pad(void) {
         for (size_t j = 0; j < sizeof pad_map / sizeof *pad_map; j++) if (SDL_GetGamepadButton(g, pad_map[j].b)) p.buttons |= pad_map[j].bit;
         if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16384) p.buttons |= ZL;
         if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16384) p.buttons |= ZR;
-        /* SDL's stick y grows downward, the Switch's upward */
-        p.lx = larger(p.lx, axis(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX)));
-        p.ly = larger(p.ly, -axis(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY)));
-        p.rx = larger(p.rx, axis(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX)));
-        p.ry = larger(p.ry, -axis(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY)));
+        stick(g, SDL_GAMEPAD_AXIS_LEFTX, SDL_GAMEPAD_AXIS_LEFTY, &p.lx, &p.ly);
+        stick(g, SDL_GAMEPAD_AXIS_RIGHTX, SDL_GAMEPAD_AXIS_RIGHTY, &p.rx, &p.ry);
     }
     host_input_set_pad(&p);
     /* the left stick's zone as the game gets it, when it changes (the first 1000: a stick that "stays held" on the
