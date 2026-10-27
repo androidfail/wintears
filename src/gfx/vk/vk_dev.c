@@ -514,6 +514,7 @@ typedef struct sub {
 enum { MAX_IN_FLIGHT = 6 };
 static VkSemaphore g_tl;
 static sub *g_cur, *g_free_subs, *g_fly_head, *g_fly_tail;
+static VkDeviceSize g_cur_staged;   /* staging the open submission holds (vk_stage, STAGE_SPLIT) */
 static chunk *g_free_chunks;
 static int g_in_flight, g_free_chunk_n;
 static _Atomic uint64_t g_chunk_bytes;   /* staging memory held (the memory line) */
@@ -589,7 +590,7 @@ void vk_open(void) {
     ts_begin(s);
     vk_barrier(s->pre);    /* after everything submitted earlier */
     vk_barrier(s->main);   /* after this submission's uploads */
-    g_cur = s; g_serial++;
+    g_cur = s; g_serial++; g_cur_staged = 0;
 }
 VkCommandBuffer vk_cmd(void) { vk_open(); if (g_bar_lazy) vk_barrier(g_cur->main); return g_cur->main; }
 VkCommandBuffer vk_pre(void) { vk_open(); return g_cur->pre; }
@@ -650,8 +651,19 @@ static chunk *new_chunk(VkDeviceSize size) {
     c->map = info.pMappedData;
     return c;
 }
+/* Staging held by the open submission: a scene load put ~900 MiB of texture uploads in one submission on the PC and
+   the driver refused more host memory (out of memory, a stop). Past STAGE_SPLIT the replay ends the submission between
+   two commands (vx_run, vk_split) so that its staging goes back once the GPU is done. */
+#define STAGE_SPLIT (256ull << 20)
+int vk_stage_heavy(void) { return g_cur && g_cur_staged > STAGE_SPLIT; }
+void vk_split(void) {   /* vk_mu held, between two commands of the replay: as at the end of a submission */
+    static unsigned long long n; if (!n++ || n % 100 == 0) VLOG("submission split after %llu MiB of staging (%llu so far)", (unsigned long long)(g_cur_staged >> 20), n);
+    vx_submit_done(); vx_end_pass(); vt_eager_writebacks();
+    vk_flush(NULL, NULL);
+}
 void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
     vk_open();
+    g_cur_staged += n;
     if (align < 16) align = 16;
     chunk *c = g_cur->chunks;
     VkDeviceSize at = c ? (c->used + align - 1) & ~(align - 1) : 0;

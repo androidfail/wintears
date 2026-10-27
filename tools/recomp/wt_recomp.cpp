@@ -71,6 +71,66 @@ struct Module {
     std::vector<uint64_t> seeds;   // guest addresses
 };
 
+// Switch jump tables (clang's AArch64 form): the case targets are reached only through "br xN", so neither symbols nor
+// branches name them (45% of the blocks given to the JIT in play were right after a branch, 48% mid-code). Recognised:
+//     cmp  wI, #n ; b.hi default            (n + 1 entries)
+//     adrp xT, table ; add xT, xT, #lo12
+//     adr  xA, anchor
+//     ldrb / ldrh / ldrsw  wE, [xT, xI(, lsl #s)]
+//     add  xD, xA, xE(, sxt / lsl #2)
+//     br   xD
+// in any order within the 24 instructions before the br; target = anchor + entry * 4 (bytes and halfwords unsigned).
+template <class Seed> size_t jump_tables(const Module &m, Seed seed) {
+    const uint8_t *I = m.img.data(); size_t found = 0;
+    auto reg_def = [&](uint64_t from, uint64_t lo, unsigned r, uint64_t *at) {   // the last instruction before `from` writing xr
+        for (uint64_t a = from; a > lo; ) { a -= 4; uint32_t w = rd32(I + a);
+            if ((w & 31) == r && (w & 0x1F000000) != 0x14000000 && (w & 0x7C000000) != 0x14000000) { *at = a; return w; }   // not a branch (Rd field)
+        }
+        return 0u;
+    };
+    for (uint64_t a = m.text_lo; a < m.text_hi; a += 4) {
+        uint32_t br = rd32(I + a);
+        if ((br & 0xFFFFFC1F) != 0xD61F0000) continue;
+        uint64_t lo = a >= m.text_lo + 4 * 24 ? a - 4 * 24 : m.text_lo, at;
+        unsigned rd = br >> 5 & 31;
+        uint32_t add = reg_def(a, lo, rd, &at);
+        unsigned ra, re, sh;
+        if ((add & 0xFFE00000) == 0x8B200000) { ra = add >> 5 & 31; re = add >> 16 & 31; sh = add >> 10 & 7; }        // add xD, xA, wE, sxtb/sxth/sxtw/uxt #s
+        else if ((add & 0xFF200000) == 0x8B000000 && !(add >> 22 & 3)) { ra = add >> 5 & 31; re = add >> 16 & 31; sh = add >> 10 & 63; }   // lsl #s
+        else continue;
+        if (sh != 2) continue;
+        uint64_t at_add = at;
+        uint32_t adr = reg_def(at_add, lo, ra, &at);
+        if ((adr & 0x9F000000) != 0x10000000) continue;
+        int64_t aimm = (int64_t)(((adr >> 5 & 0x7FFFF) << 2 | (adr >> 29 & 3)) << 43) >> 43;
+        uint64_t anchor = at + aimm;
+        uint32_t ld = reg_def(at_add, lo, re, &at);
+        unsigned esz; bool sgn = false;
+        if ((ld & 0xFFE00C00) == 0x38600800) esz = 1;                     // ldrb wE, [xT, xI]
+        else if ((ld & 0xFFE00C00) == 0x78600800) esz = 2;                // ldrh
+        else if ((ld & 0xFFE00C00) == 0xB8A00800) { esz = 4; sgn = true; }   // ldrsw
+        else continue;
+        unsigned rt = ld >> 5 & 31, ri = ld >> 16 & 31; uint64_t at_ld = at;
+        uint32_t addt = reg_def(at_ld, lo, rt, &at);
+        if ((addt & 0xFF800000) != 0x91000000 || (addt >> 5 & 31) != rt) continue;   // add xT, xT, #lo12
+        uint32_t adrp = reg_def(at, lo, rt, &at);
+        if ((adrp & 0x9F000000) != 0x90000000) continue;
+        int64_t pimm = (int64_t)(((uint64_t)(adrp >> 5 & 0x7FFFF) << 2 | (adrp >> 29 & 3)) << 43) >> 31;
+        uint64_t table = ((at & ~0xFFFull) + pimm) + ((addt >> 10 & 0xFFF) << ((addt >> 22 & 1) * 12));
+        int64_t n = -1;   // the bound: cmp wI / xI, #imm before the load
+        for (uint64_t c = at_ld; c > lo && n < 0; ) { c -= 4; uint32_t w = rd32(I + c);
+            if ((w & 0x7F80001F) == 0x7100001F && (w >> 5 & 31) == ri) n = (int64_t)((w >> 10 & 0xFFF) << ((w >> 22 & 1) * 12)) + 1; }
+        if (n <= 0 || n > 4096 || table + n * esz > m.img.size()) continue;
+        for (int64_t k = 0; k < n; k++) {
+            const uint8_t *e = I + table + k * esz;
+            int64_t v = esz == 1 ? e[0] : esz == 2 ? (int64_t)(e[0] | e[1] << 8) : sgn ? (int64_t)(int32_t)rd32(e) : (int64_t)rd32(e);
+            seed(anchor + v * 4);
+        }
+        found++;
+    }
+    return found;
+}
+
 bool load(const std::string &path, Module &m) {
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -127,6 +187,18 @@ bool load(const std::string &path, Module &m) {
     for (uint64_t a = m.text_lo; a < m.text_hi; a += 4) {
         uint32_t w = rd32(I + a);
         if ((w & 0xFC000000) == 0x94000000) { int64_t imm = (int64_t)((w & 0x3FFFFFF) << 6) >> 4; seed(a + imm); }
+    }
+    jump_tables(m, seed);
+    // code addresses taken in code (callbacks, lambdas passed as function pointers): adr, or adrp + add, into the text
+    for (uint64_t a = m.text_lo; a < m.text_hi; a += 4) {
+        uint32_t w = rd32(I + a);
+        if ((w & 0x9F000000) == 0x10000000) { int64_t imm = (int64_t)(((uint64_t)(w >> 5 & 0x7FFFF) << 2 | (w >> 29 & 3)) << 43) >> 43; seed(a + imm); }
+        else if ((w & 0x9F000000) == 0x90000000 && a + 4 < m.text_hi) {
+            uint32_t n = rd32(I + a + 4); unsigned r = w & 31;
+            if ((n & 0xFF800000) != 0x91000000 || (n >> 5 & 31) != r) continue;   // add xR', xR, #lo12 right after
+            int64_t page = (int64_t)(((uint64_t)(w >> 5 & 0x7FFFF) << 2 | (w >> 29 & 3)) << 43) >> 31;
+            seed(((a & ~0xFFFull) + page) + ((n >> 10 & 0xFFF) << ((n >> 22 & 1) * 12)));
+        }
     }
     std::sort(m.seeds.begin(), m.seeds.end());
     m.seeds.erase(std::unique(m.seeds.begin(), m.seeds.end()), m.seeds.end());
@@ -482,8 +554,8 @@ struct Emitter {
             }
             void operator()(const IR::Term::LinkBlock &t) { link(t.next); }
             void operator()(const IR::Term::LinkBlockFast &t) { link(t.next); }
-            void operator()(const IR::Term::PopRSBHint &) { e.body += ind + "return;\n"; }
-            void operator()(const IR::Term::FastDispatchHint &) { e.body += ind + "return;\n"; }
+            void operator()(const IR::Term::PopRSBHint &) { e.body += ind + "WT_DISPATCH(c);\n"; }        // a return
+            void operator()(const IR::Term::FastDispatchHint &) { e.body += ind + "WT_DISPATCH(c);\n"; }  // an indirect branch
             void sub(const IR::Terminal &x) { V v{e, d + 1, ind + "    "}; boost::apply_visitor(v, x); }
             void operator()(const IR::Term::If &t) {
                 e.body += ind + "if (wt_cond(c->nzcv, " + std::to_string(static_cast<int>(t.if_)) + ")) {\n"; sub(t.then_);
@@ -514,6 +586,33 @@ struct Emitter {
     }
 };
 
+// What kind of address the run-time misses are (TOTK_NATIVE_MISSES file): a known function start, the instruction after a
+// call (a return), after an unconditional branch / return (code reached only by an indirect jump: jump tables), or in
+// the middle of straight code. Totals only, weighted by how often each missed.
+int classify(Program &p, const char *path) {
+    FILE *f = fopen(path, "r"); if (!f) { fprintf(stderr, "cannot open %s\n", path); return 1; }
+    const char *kinds[] = {"function start", "after a call (return)", "after a branch / return (indirect jump target)", "mid-block", "outside the modules"};
+    uint64_t sites[5] = {}, hits[5] = {}; char line[128];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long pc, n; if (sscanf(line, "%llx %llu", &pc, &n) != 2) continue;
+        int k = 4;
+        for (auto &m : p.mods) {
+            if (pc < m.base + m.text_lo || pc >= m.base + m.text_hi) continue;
+            uint64_t off = pc - m.base;
+            if (std::binary_search(m.seeds.begin(), m.seeds.end(), off)) { k = 0; break; }
+            uint32_t prev = off >= 4 ? rd32(&m.img[off - 4]) : 0;
+            if ((prev & 0xFC000000) == 0x94000000 || (prev & 0xFFFFFC1F) == 0xD63F0000) k = 1;            // BL, BLR
+            else if ((prev & 0xFC000000) == 0x14000000 || (prev & 0xFFFFFC1F) == 0xD61F0000 || prev == 0xD65F03C0) k = 2;   // B, BR, RET
+            else k = 3;
+            break;
+        }
+        sites[k]++; hits[k] += n;
+    }
+    fclose(f);
+    uint64_t th = 0; for (auto h : hits) th += h;
+    for (int k = 0; k < 5; k++) printf("%-48s %6llu sites, %5.1f%% of misses\n", kinds[k], (unsigned long long)sites[k], th ? 100.0 * hits[k] / th : 0.0);
+    return 0;
+}
 int emit(Program &p, const std::string &dir, const std::string &only, size_t per_file, const char *seeds_file) {
     A64::UserConfig uc;
     uc.define_unpredictable_behaviour = true;
@@ -788,6 +887,7 @@ int main(int argc, char **argv) {
         p.mods.push_back(std::move(m));
     }
     if (!strcmp(argv[2], "survey")) return survey(p);
+    if (!strcmp(argv[2], "classify") && argc >= 4) return classify(p, argv[3]);
     if (!strcmp(argv[2], "emit") && argc >= 5) return emit(p, argv[3], argv[4], argc > 5 ? (size_t)atoll(argv[5]) : 14, argc > 6 ? argv[6] : nullptr);   // 16 KiB of guest code a file
     if (!strcmp(argv[2], "difftest") && argc >= 5) return difftest(p, argv[3], (size_t)atoll(argv[4]), argc > 5 ? (uint64_t)atoll(argv[5]) : 1);
     fprintf(stderr, "unknown command %s\n", argv[2]);

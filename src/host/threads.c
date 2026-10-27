@@ -537,6 +537,12 @@ static void *sampler(void *unused) {
             ids[nids++] = pal_thread_id_of(hs[c]);
             if (pal_thread_sample(hs[c], k, sizeof k)) {
                 stab_add(k, &cores);
+                {   /* TOTK_SAMPLE_OUT=<file>: every sample in the recompiled code, "<dll> <offset>" a line, for
+                       tools/recomp/build_native.py --hot (the files where the time goes get -O2) */
+                    static FILE *so; static int tried;
+                    if (!tried) { tried = 1; const char *e = pal_getenv("TOTK_SAMPLE_OUT"); if (e && *e) so = fopen(e, "w"); }
+                    if (so && !strncmp(k, "totk_", 5)) { char *sp = strchr(k, ' '); fprintf(so, "%.*s\n", sp ? (int)(sp - k) : (int)strlen(k), k); if (tick % 100 == 0) fflush(so); }
+                }
                 char *second = strstr(k, " < "); if (second) second = strstr(second + 3, " < "); if (second) *second = 0;
                 stab_add(k, &coarse);
             }

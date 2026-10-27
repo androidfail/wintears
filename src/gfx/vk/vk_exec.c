@@ -688,6 +688,7 @@ static int cond_eval(const p_render_cond *c) {
 
 void vx_run(const uint8_t *p) {
     for (;;) {
+        if (__builtin_expect(vk_stage_heavy(), 0)) vk_split();
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) die("Vulkan replay: corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
         const uint8_t *a = p + 8;

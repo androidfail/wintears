@@ -24,10 +24,20 @@ static bool enabled, allowed = true;
 static int holdType;
 static int64_t sample;
 
+/* TOTK_INPUT_SCRIPT's own presses, merged into what the frontend sets (it sets the pad every 8 ms from the keyboard and
+   controllers, which wiped scripted presses on the PC: scripted runs stayed at the title) */
+static host_pad scripted;
+static int32_t stronger(int32_t a, int32_t b) { return abs(b) > abs(a) ? b : a; }
+static void set_locked(const host_pad *p) {
+    host_pad m = *p;
+    m.buttons |= scripted.buttons;
+    m.lx = stronger(m.lx, scripted.lx); m.ly = stronger(m.ly, scripted.ly); m.rx = stronger(m.rx, scripted.rx); m.ry = stronger(m.ry, scripted.ry);
+    pending |= m.buttons & ~current.buttons;
+    current = m;
+}
 void host_input_set_pad(const host_pad *p) {
     pthread_mutex_lock(&inputLock);
-    pending |= p->buttons & ~current.buttons;
-    current = *p;
+    set_locked(p);
     pthread_mutex_unlock(&inputLock);
 }
 void host_input_clear(void) {
@@ -185,7 +195,6 @@ static int stick_of(const char *name, size_t n, int *sign) {
     for (int i = 0; i < 4; i++) if (!strncmp(name, axes[i], 2)) { *sign = name[2] == '+' ? 1 : -1; return i; }
     return -1;
 }
-static host_pad pad_now(void) { pthread_mutex_lock(&inputLock); host_pad p = current; pthread_mutex_unlock(&inputLock); return p; }
 static int32_t *axis(host_pad *p, int i) { return i == 0 ? &p->lx : i == 1 ? &p->ly : i == 2 ? &p->rx : &p->ry; }
 static void *input_script(void *arg) {
     const char *p = arg; uint64_t t0 = pal_now_ns();
@@ -198,13 +207,16 @@ static void *input_script(void *arg) {
         uint64_t when = t0 + (uint64_t)(at * 1e9);
         if (when > pal_now_ns()) pal_sleep_ns(when - pal_now_ns());
         LOG("[input] script: %.*s for %lu ms at %.1f s", (int)n, name, ms, at);
-        host_pad pad = pad_now();
-        if (bit) pad.buttons |= bit; else *axis(&pad, stick) = sign * 32767;
-        host_input_set_pad(&pad);
+        pthread_mutex_lock(&inputLock);
+        if (bit) scripted.buttons |= bit; else *axis(&scripted, stick) = sign * 32767;
+        { host_pad now = current; set_locked(&now); }
+        pthread_mutex_unlock(&inputLock);
         pal_sleep_ns((uint64_t)ms * 1000000);
-        pad = pad_now();
-        if (bit) pad.buttons &= ~bit; else *axis(&pad, stick) = 0;
-        host_input_set_pad(&pad);
+        pthread_mutex_lock(&inputLock);
+        if (bit) scripted.buttons &= ~bit; else *axis(&scripted, stick) = 0;
+        {   /* the frontend's own state comes back at its next update; until then drop only what the script added */
+            host_pad now = current; if (bit) now.buttons &= ~bit; else *axis(&now, stick) = 0; set_locked(&now); }
+        pthread_mutex_unlock(&inputLock);
     }
     if (p && *p) LOG("[input] TOTK_INPUT_SCRIPT: stopped at \"%s\" (want sec:button:ms,...)", p);
     return NULL;

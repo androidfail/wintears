@@ -225,6 +225,8 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
     c->hybrid = g_nat.n != 0;
     uc.enable_cycle_counting = c->hybrid;  /* JIT only: runs until halted (preemption uses jit_halt) */
     c->nc.halt_request = &c->halt_req;
+    c->nc.lc = reinterpret_cast<const wt_lce *>(c->lc); c->nc.lc_mask = sizeof c->lc / sizeof c->lc[0] - 1; c->nc.disp_fpcr = ~0u;
+    static_assert(sizeof c->lc[0] == sizeof(wt_lce), "the cache entry generated code reads");
     c->nc.cntpct = c->cfg.cntpct;
     c->nc.cntpct_user = c->cfg.user;
     if (c->hybrid && pal_getenv("TOTK_NATIVE_MISSES")) c->misses = new std::unordered_map<uint64_t, uint64_t>;
@@ -365,6 +367,7 @@ int jit_run(jit_core *c) {
         if (f) {
             c->n_native++;
             if (n.fpcr != mx_fpcr) { mx_fpcr = n.fpcr; _mm_setcsr((host_mxcsr & ~0x8040u) | (n.fpcr & 0x01000000u ? 0x8040u : 0)); }
+            n.disp_fpcr = mx_fpcr;   /* blocks may dispatch on by themselves while FPCR stays this (WT_DISPATCH) */
             n.halt = WT_RUN;
             f(&n);
             if (n.halt == WT_RUN) continue;
@@ -386,6 +389,7 @@ int jit_run(jit_core *c) {
         if ((r & stops) != Dynarmic::HaltReason{}) { stop = stop_of(c, r); if (stop == JIT_STOP_HALT) c->halt_req = 0; break; }
     }
     _mm_setcsr(host_mxcsr);
+    n.disp_fpcr = ~0u;   /* MXCSR is the host's again */
     return stop;
 }
 int jit_step(jit_core *c) {

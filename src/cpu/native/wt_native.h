@@ -27,9 +27,23 @@ typedef struct wt_ctx {
     volatile int *halt_request;  /* set by another thread (preemption): checked where dynarmic checks for a halt */
     uint64_t (*cntpct)(void *);  /* guest counter, 19.2 MHz */
     void *cntpct_user;
+    /* appended (older DLLs never read them): the runtime's per-core cache of recent blocks, for WT_DISPATCH, and the
+       FPCR the runtime set MXCSR for (a block whose FPCR differs goes back to the runtime) */
+    const struct wt_lce *lc;
+    uint32_t disp_fpcr, lc_mask;
 } wt_ctx;
 
 typedef void (*wt_block_fn)(wt_ctx *);
+typedef struct wt_lce { uint64_t pc; wt_block_fn fn; } wt_lce;   /* the runtime's cache entry (jit.cpp: fn 1 and 2 mark host stubs) */
+/* Indirect branches and returns (c->pc set): straight on to the next block when it is in the cache, else back to the
+   runtime's loop. Skipping the loop for these (~8 million a second on the Steam Deck) is phase 5's return linking. */
+#define WT_DISPATCH(c) do { \
+        if (!*(c)->halt_request && (c)->fpcr == (c)->disp_fpcr && (c)->lc) { \
+            const wt_lce *e_ = &(c)->lc[((c)->pc >> 2) & (c)->lc_mask]; \
+            if (e_->pc == (c)->pc && (uintptr_t)e_->fn > 2) { __attribute__((musttail)) return e_->fn(c); } \
+        } \
+        return; \
+    } while (0)
 typedef struct { uint64_t pc; wt_block_fn fn; } wt_entry;
 /* a DLL exports wt_count, wt_table (sorted by pc) and wt_bases: the guest addresses of main, subsdk0 and sdk it was
    made for (the runtime refuses it if the loader put them elsewhere) */
