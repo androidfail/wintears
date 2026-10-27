@@ -443,12 +443,28 @@ vk_prog *vs_prog(const prog_t *p) {
 int vs_has_stage(const vk_prog *pr, int stage) { return pr && pr->st[stage].present; }
 void vs_prog_release(uint64_t serial) { vk_prog *pr = nvn_hm_del(&g_progs, &serial); free(pr); }
 
+/* The variant answers of a stage are worked out again only when what they depend on changed: the bound texture and
+   image handles, a texture registration, the vertex formats (vertex stage), the targets' formats (fragment stage).
+   Working them out takes the slot lock and copies every bound slot, at every draw (most of the replay's locking). */
+static struct { uint64_t raw; int valid; uint64_t sig; answers a; } g_memo[6];
+static inline uint64_t mixk(uint64_t h, uint64_t v) { h ^= v; h *= 0x9E3779B97F4A7C15ull; return h ^ (h >> 29); }
+static uint64_t raw_key(int st) {
+    uint64_t h = mixk(0x51ED27ull, vt_treg_version());
+    for (int r = 0; r < 128; r++) h = mixk(h, S.tex[st][r]);
+    for (int r = 0; r < 32; r++) h = mixk(h, S.img[st][r]);
+    if (st == 0) { h = mixk(h, (uint64_t)S.nattr); for (int i = 0; i < S.nattr && i < 16; i++) h = mixk(h, S.attr[i]); }
+    if (st == 1) { h = mixk(h, (uint64_t)S.has_rt); if (S.has_rt) for (int i = 0; i < S.rt.n && i < 8; i++)
+        h = mixk(h, S.rt.color[i] ? (uint64_t)(S.rt.has_cview[i] && S.rt.cview[i].set_format ? S.rt.cview[i].format : S.rt.color[i]->d.format) + 1 : 0); }
+    return h;
+}
 vk_shader *vs_stage(vk_prog *pr, int st) {
     stage_t *t = &pr->st[st];
     if (!t->present) return NULL;
-    answers a; answers_of(st, &a);
-    uint64_t sig = answers_sig(&a);
+    uint64_t rk = raw_key(st);
+    if (!g_memo[st].valid || g_memo[st].raw != rk) { answers_of(st, &g_memo[st].a); g_memo[st].sig = answers_sig(&g_memo[st].a); g_memo[st].raw = rk; g_memo[st].valid = 1; }
+    uint64_t sig = g_memo[st].sig;
     for (int i = 0; i < t->nlast; i++) if (t->last[i].sig == sig) return t->last[i].s;
+    answers a = g_memo[st].a;   /* not one of this stage's recent variants: the full answers */
     shader_key *k = t->k;
     xlate_collect();
     vk_shader *found = NULL;

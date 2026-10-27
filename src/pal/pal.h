@@ -86,6 +86,8 @@ typedef struct { void *opaque; } pal_mutex;    /* SRWLOCK; zero-initialized = un
 void pal_mutex_lock(pal_mutex *m);
 int pal_mutex_trylock(pal_mutex *m);
 void pal_mutex_unlock(pal_mutex *m);
+void pal_mutex_lock_shared(pal_mutex *m);     /* readers together, writers (pal_mutex_lock) alone */
+void pal_mutex_unlock_shared(pal_mutex *m);
 
 typedef struct { void *opaque; } pal_cond;     /* CONDITION_VARIABLE; zero-initialized */
 #define PAL_COND_INIT {0}

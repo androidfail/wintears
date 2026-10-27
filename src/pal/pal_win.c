@@ -370,6 +370,8 @@ void pal_yield(void) { SwitchToThread(); }
 void pal_mutex_lock(pal_mutex *m) { AcquireSRWLockExclusive((PSRWLOCK)m); }
 int pal_mutex_trylock(pal_mutex *m) { return TryAcquireSRWLockExclusive((PSRWLOCK)m) ? 1 : 0; }
 void pal_mutex_unlock(pal_mutex *m) { ReleaseSRWLockExclusive((PSRWLOCK)m); }
+void pal_mutex_lock_shared(pal_mutex *m) { AcquireSRWLockShared((PSRWLOCK)m); }
+void pal_mutex_unlock_shared(pal_mutex *m) { ReleaseSRWLockShared((PSRWLOCK)m); }
 
 /* Nanoseconds to a millisecond timeout for the Win32 waits (rounded up so a short wait never becomes a spin). */
 static DWORD ms_timeout(int64_t ns) {

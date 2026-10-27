@@ -212,6 +212,9 @@ void host_alias_region(uint64_t *base, uint64_t *size);
 int host_alias_committed(uint64_t lo, uint64_t hi);
 void host_on_alias_unmap(void (*fn)(uint64_t lo, uint64_t hi));
 static pidx g_imports;               /* sorted by address, key = import_t * */
+/* Changes whenever an import or window comes or goes (g_pool_mu held): vk_buf's per-thread cache is valid only within one. */
+static _Atomic uint64_t g_imp_gen = 1;
+#define IMP_CHANGED() atomic_fetch_add_explicit(&g_imp_gen, 1, memory_order_relaxed)
 static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_pool_n, g_import_n;
 
@@ -266,7 +269,7 @@ static import_t *import_range_in(uintptr_t lo, uintptr_t hi, int listed) {
     if (!listed) return im_;
     { static int n; if (n++ < 24) VLOG("imported %p..%p (%.1f MiB) for the GPU", (void *)lo, (void *)hi, (hi - lo) / 1048576.0); }
     pidx_ent e = {lo, hi, lo, im_, 0, im_, 0};
-    if (!pidx_insert(&g_imports, &e)) die("Vulkan: pool table");
+    { if (!pidx_insert(&g_imports, &e)) die("Vulkan: pool table"); IMP_CHANGED(); }
     g_import_n++;
     return im_;
 }
@@ -347,7 +350,7 @@ static void windows_drop(uintptr_t lo, uintptr_t hi, import_t **out, int *n, int
     for (uint32_t i = 0; i < g_win.cap && *n < cap; i++) {
         import_t *w = g_win.vals ? g_win.vals[i] : NULL;
         if (!w || (overlapping ? (w->hi <= lo || w->lo >= hi) : (w->lo < lo || w->hi > hi))) continue;
-        uintptr_t k[2] = {w->lo, w->hi}; nvn_hm_del(&g_win, k);
+        uintptr_t k[2] = {w->lo, w->hi}; nvn_hm_del(&g_win, k); IMP_CHANGED();
         g_win_n--; g_win_bytes -= w->hi - w->lo; if (in_alias(w->lo, w->hi)) g_aw_live--;
         out[(*n)++] = w; i = (uint32_t)-1;   /* deletion shifts entries: rescan */
     }
@@ -371,7 +374,7 @@ static void pool_add(const void *mem, uint64_t size) {
             if (!im) die("Vulkan: pool table");
             *im = (import_t){lo, hi, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, 1};
             pidx_ent pe = {lo, hi, lo, im, 0, im, 0};
-            if (!pidx_insert(&g_imports, &pe)) die("Vulkan: pool table");
+            { if (!pidx_insert(&g_imports, &pe)) die("Vulkan: pool table"); IMP_CHANGED(); }
             g_import_n++;
         }
         if (!im) im = import_range(lo, hi);
@@ -410,7 +413,7 @@ static void pool_del(const void *mem) {
         uint64_t hb, hs; host_heap_range(&hb, &hs);
         if (im->lo != (uintptr_t)hb) {   /* the heap import stays */
             lo = im->lo; hi = im->hi;
-            pidx_remove(&g_imports, im, NULL);
+            pidx_remove(&g_imports, im, NULL); IMP_CHANGED();
             g_import_n--;
         } else im = NULL;
     } else im = NULL;
@@ -464,11 +467,17 @@ static import_t *standin_make(uintptr_t lo, uintptr_t hi) {   /* g_pool_mu held 
     import_t *im = calloc(1, sizeof *im);
     *im = (import_t){lo, hi, mem, buf, 1};
     pidx_ent e = {lo, hi, lo, im, 0, im, 0};
-    if (!pidx_insert(&g_imports, &e)) die("Vulkan: pool table");
+    { if (!pidx_insert(&g_imports, &e)) die("Vulkan: pool table"); IMP_CHANGED(); }
     VLOG("physical pool %p..%p (%.1f MiB) is not importable: the GPU uses device memory in its place (CPU_NO_ACCESS)", (void *)lo, (void *)hi, (hi - lo) / 1048576.0);
     return im;
 }
+/* The replay looks up the same few buffers for every binding of every draw (~15% of it on the Steam Deck, with the
+   lock): the last import or window found for each MiB of address is kept per thread until imports change. */
+static _Thread_local struct { uintptr_t lo, hi; VkBuffer buf; uint64_t gen; } t_vbc[64];
 int vk_buf(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
+    uint64_t gen = atomic_load_explicit(&g_imp_gen, memory_order_acquire), end = addr + (len ? len : 1);
+    __typeof__(t_vbc[0]) *ce = &t_vbc[(addr >> 20) & 63];
+    if (ce->gen == gen && addr >= ce->lo && end <= ce->hi) { *buf = ce->buf; *off = addr - ce->lo; return 1; }
     pthread_mutex_lock(&g_pool_mu);
     const pidx_ent *e = pidx_find(&g_imports, (uintptr_t)addr, len ? len : 1);
     const import_t *im0 = e ? e->buf : NULL;
@@ -477,9 +486,9 @@ int vk_buf(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off) {
         uint64_t hb, hs; host_heap_range(&hb, &hs);
         if (addr >= hb && addr + (len ? len : 1) <= hb + hs) im0 = window_in((uintptr_t)hb, (uintptr_t)(hb + hs), (uintptr_t)addr, (uintptr_t)(addr + (len ? len : 1)), win_grain());
         else im0 = alias_window(addr, addr + (len ? len : 1));
-        if (im0) { *buf = im0->buf; *off = addr - im0->lo; pthread_mutex_unlock(&g_pool_mu); return 1; }
+        if (im0) { *buf = im0->buf; *off = addr - im0->lo; *ce = (__typeof__(*ce)){im0->lo, im0->hi, im0->buf, gen}; pthread_mutex_unlock(&g_pool_mu); return 1; }
     }
-    if (im0) { *buf = im0->buf; *off = addr - im0->lo; }
+    if (im0) { *buf = im0->buf; *off = addr - im0->lo; *ce = (__typeof__(*ce)){im0->lo, im0->hi, im0->buf, gen}; }
     pthread_mutex_unlock(&g_pool_mu);
     if (e) return im0 != NULL;
     /* not imported: a virtual pool's pages, through their physical pool (its stand-in when that is not importable) */

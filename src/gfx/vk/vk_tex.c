@@ -410,6 +410,52 @@ static uint64_t hash_whole(const uint8_t *p, uint64_t n) {   /* eight independen
     for (int k = 0; k < 8; k++) { r = (r ^ h[k]) * 0xff51afd7ed558ccdull; r ^= r >> 29; }
     return r;
 }
+/* Large textures are hashed in HASH_PARTS pieces at once, on helper threads (the replay thread does the first piece):
+   whole hashes were ~40% of the replay without write protection (PC with TOTK_DIRTY_PROTECT=0, Steam Deck: ~11%). The
+   result depends only on the bytes, never on the threads. */
+enum { HASH_PARTS = 4, HASH_SPLIT = 1u << 20 };
+static pthread_mutex_t g_hp_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_hp_go = PTHREAD_COND_INITIALIZER, g_hp_done = PTHREAD_COND_INITIALIZER;
+static const uint8_t *g_hp_p[HASH_PARTS]; static uint64_t g_hp_n[HASH_PARTS], g_hp_h[HASH_PARTS];
+static int g_hp_left, g_hp_next = HASH_PARTS, g_hp_threads = -1;   /* g_hp_next: the next piece to take (HASH_PARTS: none) */
+static void *hash_worker(void *unused) {
+    (void)unused; pal_thread_set_name("texture hash");
+    pthread_mutex_lock(&g_hp_mu);
+    for (;;) {
+        while (g_hp_next >= HASH_PARTS) pthread_cond_wait(&g_hp_go, &g_hp_mu);
+        int i = g_hp_next++;
+        pthread_mutex_unlock(&g_hp_mu);
+        uint64_t h = hash_whole(g_hp_p[i], g_hp_n[i]);
+        pthread_mutex_lock(&g_hp_mu);
+        g_hp_h[i] = h;
+        if (!--g_hp_left) pthread_cond_signal(&g_hp_done);
+    }
+    return NULL;
+}
+static uint64_t hash_content(const uint8_t *p, uint64_t n) {   /* vk_mu held: one at a time */
+    if (n < HASH_SPLIT) return hash_whole(p, n);
+    if (g_hp_threads < 0) {
+        g_hp_threads = 0;
+        for (int i = 0; i < HASH_PARTS - 1; i++) { pthread_t t; if (!pthread_create(&t, NULL, hash_worker, NULL)) { pthread_detach(t); g_hp_threads++; } }
+    }
+    uint64_t part = (n / HASH_PARTS) & ~(uint64_t)63, at = 0;
+    pthread_mutex_lock(&g_hp_mu);
+    for (int i = 0; i < HASH_PARTS; i++) { g_hp_p[i] = p + at; g_hp_n[i] = i == HASH_PARTS - 1 ? n - at : part; at += part; }
+    g_hp_left = HASH_PARTS; g_hp_next = 0;
+    if (g_hp_threads) pthread_cond_broadcast(&g_hp_go);
+    while (g_hp_next < HASH_PARTS) {   /* this thread takes pieces too (all of them without helpers) */
+        int i = g_hp_next++;
+        pthread_mutex_unlock(&g_hp_mu);
+        uint64_t h = hash_whole(g_hp_p[i], g_hp_n[i]);
+        pthread_mutex_lock(&g_hp_mu);
+        g_hp_h[i] = h; g_hp_left--;
+    }
+    while (g_hp_left) pthread_cond_wait(&g_hp_done, &g_hp_mu);
+    uint64_t r = 0x9E3779B97F4A7C15ull ^ n;
+    for (int i = 0; i < HASH_PARTS; i++) { r = (r ^ g_hp_h[i]) * 0xff51afd7ed558ccdull; r ^= r >> 29; }
+    pthread_mutex_unlock(&g_hp_mu);
+    return r;
+}
 static uint64_t hash_sampled(const uint8_t *p, uint64_t n) {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ n, v;
     for (uint64_t at = 0; at + 64 <= n; at += 4096)
@@ -418,7 +464,7 @@ static uint64_t hash_sampled(const uint8_t *p, uint64_t n) {
 }
 static void content_note(vtex *e, const tex_t *t, uint64_t sub) {   /* at upload */
     uint64_t t0 = pal_now_ns();
-    e->hash = hash_whole(t->mem, t->L.size);
+    e->hash = hash_content(t->mem, t->L.size);
     e->shash = hash_sampled(t->mem, t->L.size);
     e->hashed_sub = e->sampled_sub = sub;
     vk_ns_hash += pal_now_ns() - t0;
@@ -435,7 +481,7 @@ static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
        in a submission that missed new glyphs kept those letters missing on the Steam Deck. */
     if (n > (16u << 10) && !e->hot && !glyphs && (sub + phase) % 4) return 0;
     int whole = n <= (1u << 20) || glyphs || e->hot || (sub + phase) % every == 0;
-    int changed = whole ? hash_whole(t->mem, n) != e->hash : hash_sampled(t->mem, n) != e->shash;
+    int changed = whole ? hash_content(t->mem, n) != e->hash : hash_sampled(t->mem, n) != e->shash;
     /* a whole hash saw a change that sampling would have missed (a few texels written: glyphs in a large atlas,
        broken save-menu text on the Steam Deck): this texture is never sampled again */
     if (changed && whole && !e->whole_only && n > (16u << 10) && hash_sampled(t->mem, n) == e->shash) {
@@ -747,7 +793,11 @@ static void held_by_slots(nvn_hmap *held) {
     }
 }
 static samp_par *g_sreg; static uint8_t *g_sreg_ok; static int g_nsreg;
-static pthread_mutex_t g_rmu = PTHREAD_MUTEX_INITIALIZER;
+/* The registered slots: read by every draw of the replay (shared), written when the game registers (alone). A slim
+   reader-writer lock: winpthreads mutexes were ~15% of the replay on the PC. g_treg_ver counts registrations. */
+static pal_mutex g_rmu;
+static _Atomic uint64_t g_treg_ver;
+uint64_t vt_treg_version(void) { return atomic_load_explicit(&g_treg_ver, memory_order_relaxed); }
 static nvn_hmap g_samplers = {.klen = sizeof(samp_par)};
 static int g_aniso, g_minmax;
 
@@ -761,38 +811,39 @@ void vt_init(void) {
 void vt_set_pool_n(int n) { (void)n; }
 void vt_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20)) return;
-    pthread_mutex_lock(&g_rmu);
+    pal_mutex_lock(&g_rmu);
     if (id >= g_ntreg) {
         int n = g_ntreg ? g_ntreg : 1024; while (n <= id) n *= 2;
         g_treg = realloc(g_treg, (size_t)n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *g_treg); g_ntreg = n;
     }
     g_treg[id].t = *t; g_treg[id].has_v = v != NULL; if (v) g_treg[id].v = *v; g_treg[id].ok = 1;
-    pthread_mutex_unlock(&g_rmu);
+    atomic_fetch_add_explicit(&g_treg_ver, 1, memory_order_relaxed);
+    pal_mutex_unlock(&g_rmu);
 }
 void vt_reg_samp(int id, const samp_par *p) {
     if (id < 0 || id >= (1 << 12)) return;
-    pthread_mutex_lock(&g_rmu);
+    pal_mutex_lock(&g_rmu);
     if (id >= g_nsreg) {
         int n = g_nsreg ? g_nsreg : 256; while (n <= id) n *= 2;
         g_sreg = realloc(g_sreg, (size_t)n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, (size_t)n);
         memset(g_sreg_ok + g_nsreg, 0, (size_t)(n - g_nsreg)); g_nsreg = n;
     }
     g_sreg[id] = *p; g_sreg_ok[id] = 1;
-    pthread_mutex_unlock(&g_rmu);
+    pal_mutex_unlock(&g_rmu);
 }
 /* The registered texture / sampler of a slot (copies, so the game may re-register meanwhile). */
 int vt_slot_tex(int id, tex_t *t, view_t *v, int *has_v) {
-    pthread_mutex_lock(&g_rmu);
+    pal_mutex_lock_shared(&g_rmu);
     int ok = id >= 0 && id < g_ntreg && g_treg[id].ok;
     if (ok) { *t = g_treg[id].t; *v = g_treg[id].v; *has_v = g_treg[id].has_v; }
-    pthread_mutex_unlock(&g_rmu);
+    pal_mutex_unlock_shared(&g_rmu);
     return ok;
 }
 int vt_slot_samp(int id, samp_par *p) {
-    pthread_mutex_lock(&g_rmu);
+    pal_mutex_lock_shared(&g_rmu);
     int ok = id >= 0 && id < g_nsreg && g_sreg_ok[id];
     if (ok) *p = g_sreg[id];
-    pthread_mutex_unlock(&g_rmu);
+    pal_mutex_unlock_shared(&g_rmu);
     return ok;
 }
 
