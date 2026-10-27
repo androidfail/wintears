@@ -895,6 +895,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
     for (int i = 0; i < n; i++) vx_run((const uint8_t *)(uintptr_t)handles[i]);
     vx_submit_done();
     vx_end_pass();
+    vt_eager_writebacks();
     uint64_t f = vk_flush(NULL, NULL);
     atomic_store(&g_game_fence, f);
     mem_guard();
@@ -913,6 +914,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average, GPU busy %.0f ms; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, atomic_exchange(&g_gpu_busy_ns, 0) / 1e6, w / 1e6, g_sh_bytes / 1048576.0);
         if (vk_n_pass) { char pe[400]; vx_pass_end_report(pe, sizeof pe); VLOG("pass ends by place (last 10 s): %s", pe); }
+        { extern _Atomic uint64_t vt_inv_n, vt_inv_wb, vt_inv_ns; VLOG("invalidates (last 10 s): %llu, %llu with write-backs (%.0f ms)", (unsigned long long)atomic_exchange(&vt_inv_n, 0), (unsigned long long)atomic_exchange(&vt_inv_wb, 0), atomic_exchange(&vt_inv_ns, 0) / 1e6); }
         vk_log_memory();
         static int diag = -1; if (diag < 0) { const char *d = pal_getenv("TOTK_DIAG"); diag = d && *d == '1'; }
         if (diag) { static uint64_t lastf; uint64_t f = pal_fault_total(); char cpu[600]; pal_thread_cpu_report(cpu, sizeof cpu);

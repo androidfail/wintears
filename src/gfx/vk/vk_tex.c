@@ -12,6 +12,7 @@
    Images unused for 600 submissions (300 when their bytes are in pool memory) are dropped, except those whose content cannot be made again (rendered or copied
    into by the GPU) while a texture object still refers to them (upstream: while a serial holds the storage). Dropping
    those left a menu background, or a sky rendered once, blank when it was used again. */
+#include <stdatomic.h>
 #include "gfx/vk/vk.h"
 #include "nvn_deswizzle.h"
 #include "nvn_dirty.h"
@@ -882,6 +883,19 @@ void runtime_core_back(int *away);
 static nvn_hmap g_wb = {.klen = 8};   /* by serial; g_wb_mu (inside vk_mu where both are held) */
 static pthread_mutex_t g_wb_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_wb_done, g_wb_skipped;
+/* Eager write-back: a small texture the CPU has read back before (TOTK: 1x1 targets, ~13 a second at the title) is
+   copied out in the submission that renders it and written to pool memory when that submission completes, before
+   its fence counts as done. The game's invalidate then finds nothing left to do; reading it back there waited for the
+   translation thread's whole submission and then for the GPU (~4 ms a call on the PC). g_wb_mu. */
+#define EAGER_MAX (64u << 10)
+static uint64_t g_rb_hot[64]; static unsigned g_rb_hot_n;   /* serials read back lately (a ring) */
+static tex_t g_eager[32]; static int g_neager;               /* rendered this submission, to copy out at its end */
+static int rb_hot(uint64_t serial) { for (unsigned i = 0; i < 64; i++) if (g_rb_hot[i] == serial) return 1; return 0; }
+static int eager_ok(const tex_t *t) {
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh); vk_fmt f;
+    return bpb && bw == 1 && bh == 1 && t->L.size <= EAGER_MAX && (t->d.levels <= 1) && t->L.layers <= 1 && t->d.samples <= 1 &&
+           vk_fmt_of(t->d.format, &f) && !f.convert && !f.depth && !f.stencil;
+}
 void vt_note_rendered(const tex_t *t) {
     static int off = -1;   /* TOTK_WRITEBACK=0: no write-back (A/B) */
     if (off < 0) { const char *e = pal_getenv("TOTK_WRITEBACK"); off = e && *e == '0'; }
@@ -892,6 +906,10 @@ void vt_note_rendered(const tex_t *t) {
     if (e && nvn_dirty_tracked(t->mem, (size_t)t->L.size) && !nvn_dirty_since(t->mem, (size_t)t->L.size, e->stamp)) { e->stamp = nvn_dirty_now(); pthread_mutex_unlock(&g_wb_mu); return; }   /* untouched since: still protected */
     if (!e) { e = malloc(sizeof *e); if (!e) { pthread_mutex_unlock(&g_wb_mu); return; } nvn_hm_put(&g_wb, &k, e); }
     e->t = *t; e->stamp = nvn_dirty_now();
+    if (rb_hot(k) && eager_ok(t)) {
+        int i = 0; while (i < g_neager && g_eager[i].serial != k) i++;
+        if (i == g_neager && g_neager < 32) g_eager[g_neager++] = *t;
+    }
     pthread_mutex_unlock(&g_wb_mu);
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* after the stamp: a CPU write from here on is seen */
 }
@@ -915,8 +933,10 @@ static int wb_back(const tex_t *t, uint8_t *storage) {   /* the rendering, swizz
     }
     return 1;
 }
+_Atomic uint64_t vt_inv_n, vt_inv_wb, vt_inv_ns, vt_inv_lock_ns;   /* invalidates, those with write-backs, their time, time waiting for vk_mu */
 void vt_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     if (!p || !p->mem) return;
+    atomic_fetch_add(&vt_inv_n, 1);
     const uint8_t *a = (const uint8_t *)p->mem + off, *z = a + n;
     wb_ent *list[64]; int nl = 0;
     pthread_mutex_lock(&g_wb_mu);
@@ -927,6 +947,7 @@ void vt_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     }
     pthread_mutex_unlock(&g_wb_mu);
     if (!nl) return;
+    atomic_fetch_add(&vt_inv_wb, 1); uint64_t inv0 = pal_now_ns();
     /* read-backs wait for the replay lock and the GPU: the guest thread gives its core up meanwhile */
     __attribute__((cleanup(runtime_core_back))) int away = runtime_core_away();
     int fresh[64];
@@ -951,12 +972,63 @@ void vt_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
             }
             free(tmp);
         }
+        if (ok) { pthread_mutex_lock(&g_wb_mu); if (!rb_hot(t->serial)) g_rb_hot[g_rb_hot_n++ % 64] = t->serial; pthread_mutex_unlock(&g_wb_mu); }
         if (ok) { if (++g_wb_done <= 4) VLOG("write-back: rendered texture %ux%u format %#x written to pool memory (%llu so far, %llu skipped: the CPU wrote since)", t->d.width, t->d.height, t->d.format, (unsigned long long)g_wb_done, (unsigned long long)g_wb_skipped); }
         else VK_ONCE("write-back of texture %ux%u format %#x target %d failed: pool memory keeps its old bytes", t->d.width, t->d.height, t->d.format, t->d.target);
         free(list[i]);
     }
+    atomic_fetch_add(&vt_inv_ns, pal_now_ns() - inv0);
 }
 
+typedef struct { tex_t t; const uint8_t *st; size_t pitch, n; uint64_t stamp; } eager_out;
+static void eager_done(void *arg) {   /* completion thread: the submission is done; its staging is still mapped */
+    eager_out *o = arg;
+    const tex_t *t = &o->t;
+    pthread_mutex_lock(&g_wb_mu);
+    uint64_t k = t->serial; wb_ent *e = nvn_hm_get(&g_wb, &k);
+    int mine = e && e->stamp == o->stamp;   /* not rendered again since: this copy is the newest */
+    if (mine) { nvn_hm_del(&g_wb, &k); free(e); }
+    pthread_mutex_unlock(&g_wb_mu);
+    if (mine) {
+        size_t size = (size_t)t->L.size; uint8_t *tmp = malloc(size);
+        if (tmp) {
+            memcpy(tmp, t->mem, size);
+            if (!nvn_swizzle(&t->d, 0, 0, o->st, o->pitch, tmp)) {
+                void *tok = nvn_dirty_gpu_write_begin(t->mem, size);
+                memcpy(t->mem, tmp, size);
+                nvn_dirty_gpu_write_end(tok);
+            }
+            free(tmp);
+        }
+    }
+    free(o);
+}
+void vt_eager_writebacks(void) {   /* vk_mu held, outside a pass, at the end of a submission's replay */
+    pthread_mutex_lock(&g_wb_mu);
+    tex_t list[32]; int n = g_neager; memcpy(list, g_eager, sizeof *list * (size_t)n); g_neager = 0;
+    uint64_t stamps[32];
+    for (int i = 0; i < n; i++) { uint64_t k = list[i].serial; wb_ent *e = nvn_hm_get(&g_wb, &k); stamps[i] = e ? e->stamp : 0; }
+    pthread_mutex_unlock(&g_wb_mu);
+    for (int i = 0; i < n; i++) {
+        const tex_t *t = &list[i];
+        vtex *e = vt_get(t);
+        if (!e || !stamps[i]) continue;
+        int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+        VkImageType type; uint32_t w, h, d, layers; shape(t, &type, &w, &h, &d, &layers);
+        size_t pitch = (size_t)w * bpb, sz = pitch * (type == VK_IMAGE_TYPE_1D ? 1 : h) * (type == VK_IMAGE_TYPE_3D ? d : 1);
+        VkBuffer sb; VkDeviceSize so;
+        uint8_t *st = vk_stage(sz, 16, &sb, &so);
+        VkCommandBuffer c = vk_cmd();
+        VkBufferImageCopy cp = {.bufferOffset = so, .imageSubresource = {e->aspect, 0, 0, 1},
+                                .imageExtent = {w, type == VK_IMAGE_TYPE_1D ? 1 : h, type == VK_IMAGE_TYPE_3D ? d : 1}};
+        vkCmdCopyImageToBuffer(c, e->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &cp);
+        vk_barrier_lazy();
+        eager_out *o = malloc(sizeof *o); if (!o) continue;
+        *o = (eager_out){*t, st, pitch, sz, stamps[i]};
+        vk_after(eager_done, o);
+        static int said; if (!said++) VLOG("eager write-back: rendered %ux%u format %#x copied out with its submission (the CPU reads it back)", t->d.width, t->d.height, t->d.format);
+    }
+}
 void vt_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     size_t wb = (size_t)((r->width + bw - 1) / bw) * bpb, hb = (size_t)(r->height + bh - 1) / bh;
