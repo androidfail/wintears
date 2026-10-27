@@ -35,6 +35,7 @@ typedef struct thr {
     uint64_t entry, arg, stack_top, tls; int prio, core; uint64_t mask;
     int started, exited, cancel;
     pthread_t pt; pthread_cond_t cv;
+    void *ev;   /* timed waits wait on this (pal_event_wait_ns: precise), set by wake */
     /* current wait: kind 0 = none, 1 = lock, 2 = condition, 3 = address, 4 = synchronization object */
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
     uint64_t wseq;             /* wait registration order: at equal priority first come, first woken */
@@ -45,6 +46,7 @@ typedef struct thr {
     uint64_t nsvc;
     int cur_core;              /* virtual core held while running guest code, -1 while blocked or not started */
     volatile int preempt;      /* a better thread waits for this thread's core */
+    int no_preempt;            /* yield to any thread: wait for a core to come free, displacing no one */
     uint64_t cseq, core_since; struct thr *cnext;
     uint32_t wh[4]; int nwh;
     jit_context *ctx;          /* the registers the thread runs now (nested host-to-guest calls replace it) */
@@ -60,6 +62,13 @@ static _Atomic uint64_t g_ns_lock, g_ns_core, g_ns_block, g_n_lock_slow, g_n_cor
 static _Atomic uint64_t g_ns_free, g_ns_handoff, g_ns_jit;
 /* waits for a core that began while another core was free (the thread's mask did not allow it), by mask */
 static _Atomic uint64_t g_ns_mask_wait[8];
+/* sleeps and timed waits that ran to their timeout, by requested length (<0.1, <1, <10 ms, longer): count, ns asked, ns taken */
+static _Atomic uint64_t g_slp_n[2][4], g_slp_ask[2][4], g_slp_took[2][4];
+static _Atomic uint64_t g_yield_n[3], g_yield_gave[3];   /* yields by kind (0, -1, -2) and those that handed the core over */
+static void slp_note(int kind, uint64_t ask, uint64_t took) {
+    int b = ask < 100000 ? 0 : ask < 1000000 ? 1 : ask < 10000000 ? 2 : 3;
+    atomic_fetch_add(&g_slp_n[kind][b], 1); atomic_fetch_add(&g_slp_ask[kind][b], ask); atomic_fetch_add(&g_slp_took[kind][b], took);
+}
 static uint64_t g_free_since[3];
 /* Calls from guest code: count and time per svc (index < 0x100) and per host stub (0x100 + stub index); the reasons
    jit_run returned. */
@@ -69,14 +78,23 @@ static inline int call_slot(uint32_t n) { return n < 0x100 ? (int)n : n >= BRIDG
 /* The timers below (every jit_run, svc, host call, wait: several clock reads and shared counters each) run only with
    TOTK_DIAG=1 (the [calls] and waits lines). */
 static int g_diag;
-static inline void call_note(uint32_t n, uint64_t t0) { int i = call_slot(n); if (i >= 0) { atomic_fetch_add(&g_call_n[i], 1); atomic_fetch_add(&g_call_ns[i], pal_now_ns() - t0); } }
+/* Guest calls are timed one in DIAG_EVERY per thread and counted that many times over: timing every one (clock reads and
+   shared counters, hundreds of thousands a second) slowed the game itself. */
+enum { DIAG_EVERY = 8 };
+static _Thread_local unsigned t_diag_k;
+static inline void call_note(uint32_t n, uint64_t t0) { int i = call_slot(n); if (i >= 0) { atomic_fetch_add(&g_call_n[i], DIAG_EVERY); atomic_fetch_add(&g_call_ns[i], (pal_now_ns() - t0) * DIAG_EVERY); } }
 static void G_lock(void) {
     if (!pthread_mutex_trylock(&G)) return;
     uint64_t t0 = pal_now_ns(); pthread_mutex_lock(&G);
     atomic_fetch_add(&g_ns_lock, pal_now_ns() - t0); atomic_fetch_add(&g_n_lock_slow, 1);
 }
 static jit_core *g_jit[NCORE];   /* the virtual cores (defined below) */
+static void log_calls(void);
 void runtime_wait_report(char *out, size_t cap) {
+    {   /* the svcs and host calls that hold the cores, every 10 s (the sampler logs them itself when it runs) */
+        static int smp = -1; if (smp < 0) { const char *e = pal_getenv("TOTK_SAMPLE"); smp = e && *e == '1'; }
+        if (!smp) log_calls();
+    }
     static uint64_t last; uint64_t now = pal_now_ns(), span = last ? now - last : 0; last = now;
     double fr = atomic_exchange(&g_ns_free, 0) / 1e6, ho = atomic_exchange(&g_ns_handoff, 0) / 1e6, jt = atomic_exchange(&g_ns_jit, 0) / 1e6, all = 3 * span / 1e6;
     static uint64_t lc, lb; uint64_t cn = jit_compile_ns(), b, sl; jit_compile_stats(&b, &sl);
@@ -99,6 +117,15 @@ void runtime_wait_report(char *out, size_t cap) {
     {   size_t at = strlen(out);
         at += (size_t)snprintf(out + at, at < cap ? cap - at : 0, "; core waits begun with another core free, by core mask:");
         for (int m = 1; m < 8; m++) { uint64_t v = atomic_exchange(&g_ns_mask_wait[m], 0); if (v && at < cap) at += (size_t)snprintf(out + at, cap - at, " %#x %.0f ms", m, v / 1e6); }
+        if (at < cap) at += (size_t)snprintf(out + at, cap - at, "; yields 0 / -1 / -2: %llu / %llu / %llu (core handed over %llu / %llu / %llu)",
+            (unsigned long long)atomic_exchange(&g_yield_n[0], 0), (unsigned long long)atomic_exchange(&g_yield_n[1], 0), (unsigned long long)atomic_exchange(&g_yield_n[2], 0),
+            (unsigned long long)atomic_exchange(&g_yield_gave[0], 0), (unsigned long long)atomic_exchange(&g_yield_gave[1], 0), (unsigned long long)atomic_exchange(&g_yield_gave[2], 0));
+        static const char *const kn[2] = {"sleeps", "timed waits that timed out"}, *const bn[4] = {"<0.1 ms", "<1 ms", "<10 ms", ">=10 ms"};
+        for (int k = 0; k < 2; k++) {
+            if (at < cap) at += (size_t)snprintf(out + at, cap - at, "; %s asked / taken:", kn[k]);
+            for (int b = 0; b < 4; b++) { uint64_t n = atomic_exchange(&g_slp_n[k][b], 0), a = atomic_exchange(&g_slp_ask[k][b], 0), tk = atomic_exchange(&g_slp_took[k][b], 0);
+                if (n && at < cap) at += (size_t)snprintf(out + at, cap - at, " %s %llux %.1f/%.1f ms", bn[b], (unsigned long long)n, a / 1e6, tk / 1e6); }
+        }
     }
     { const char *mf = pal_getenv("TOTK_NATIVE_MISSES"); if (mf && *mf) jit_native_misses(g_jit, NCORE, mf); }
 }
@@ -152,7 +179,7 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); }
+static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); if (t->ev) pal_event_set(t->ev); }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
 
 /* ---------- virtual cores ----------
@@ -197,7 +224,7 @@ static void core_take(thr_t *t) {   /* holding G; waits until a core in t's mask
         g_free_since[c] = 0; return;
     }
     t->cseq = ++g_wseq; t->cnext = g_core_wait; g_core_wait = t;
-    preempt_for(t);
+    if (t->no_preempt) t->no_preempt = 0; else preempt_for(t);
     uint64_t t0 = g_diag ? pal_now_ns() : 0;
     int other_free = 0; for (int i = 0; i < NCORE; i++) other_free |= !g_core_owner[i];
     while (t->cur_core < 0) pthread_cond_wait(&t->cv, &G);
@@ -242,16 +269,18 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
-    struct timespec dl;
-    if (ns > 0) {
-        clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
-        if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
-    }
-    uint64_t t0 = g_diag ? pal_now_ns() : 0; if (g_diag) atomic_fetch_add(&g_n_block, 1);
-    while (!t->woke) {
-        int rc = ns > 0 ? pthread_cond_timedwait(&t->cv, &G, &dl) : pthread_cond_wait(&t->cv, &G);
-        if (rc == ETIMEDOUT && !t->woke) { wait_unlink(t); t->wkind = 0; if (g_diag) atomic_fetch_add(&g_ns_block, pal_now_ns() - t0); return R_TIMEOUT; }
-    }
+    uint64_t t0 = pal_now_ns(); if (g_diag) atomic_fetch_add(&g_n_block, 1);
+    if (ns > 0) {   /* timed: a condition variable's timeout is whole milliseconds (1 ms late on the Steam Deck every time) */
+        if (!t->ev) t->ev = pal_event_new();
+        uint64_t end = t0 + (uint64_t)ns;
+        while (!t->woke) {
+            uint64_t now = pal_now_ns();
+            if (now >= end) { wait_unlink(t); t->wkind = 0; if (g_diag) { uint64_t d = now - t0; atomic_fetch_add(&g_ns_block, d); slp_note(1, (uint64_t)ns, d); } return R_TIMEOUT; }
+            pthread_mutex_unlock(&G);
+            pal_event_wait_ns(t->ev, end - now);   /* a set left over from an earlier wake only makes this loop look again */
+            pthread_mutex_lock(&G);
+        }
+    } else while (!t->woke) pthread_cond_wait(&t->cv, &G);
     if (g_diag) atomic_fetch_add(&g_ns_block, pal_now_ns() - t0);
     return t->wres;
 }
@@ -299,9 +328,10 @@ static void run(thr_t *t, jit_context *c) {
         if (t->cur_core < 0) die("thread %#x runs guest code without a virtual core", t->handle);
         jit_core *jc = g_jit[t->cur_core];
         jit_load(jc, c);
-        uint64_t tj = g_diag ? pal_now_ns() : 0;
+        int timed = g_diag && !(++t_diag_k % DIAG_EVERY);
+        uint64_t tj = timed ? pal_now_ns() : 0;
         int stop = jit_run(jc);
-        if (g_diag) { atomic_fetch_add(&g_ns_jit, pal_now_ns() - tj); atomic_fetch_add(&g_n_run, 1); }
+        if (timed) { atomic_fetch_add(&g_ns_jit, (pal_now_ns() - tj) * DIAG_EVERY); atomic_fetch_add(&g_n_run, DIAG_EVERY); }
         jit_save(jc, c);
         if (stop == JIT_STOP_HALT) { atomic_fetch_add(&g_n_stop_halt, 1); runtime_core_checkpoint(); continue; }
         if (stop == JIT_STOP_EXCEPTION) {
@@ -328,13 +358,13 @@ static void run(thr_t *t, jit_context *c) {
         uint32_t n = jit_svc_number(jc);
         if (n == HOST_RETURN_SVC) break;
         if (n >= BRIDGE_SVC_BASE) {
-            uint64_t ts = g_diag ? pal_now_ns() : 0; int done = bridge_dispatch(host_bridge(), n, c); if (g_diag) call_note(n, ts);
+            uint64_t ts = timed ? pal_now_ns() : 0; int done = bridge_dispatch(host_bridge(), n, c); if (timed) call_note(n, ts);
             if (done) continue;
             report_stop("unknown host stub svc", n, c);
             die("unknown host stub");
         }
         t->last_svc = (int)n; t->last_lr = c->x[30]; t->last_fp = c->x[29]; t->nsvc++;
-        { uint64_t ts = g_diag ? pal_now_ns() : 0; int done = host_svc(n, c); if (g_diag) call_note(n, ts); if (done) continue; }
+        { uint64_t ts = timed ? pal_now_ns() : 0; int done = host_svc(n, c); if (timed) call_note(n, ts); if (done) continue; }
         report_stop("unimplemented svc", n, c);
         die("svc 0x%02x is not implemented yet", n);
     }
@@ -382,7 +412,7 @@ static void *thread_main(void *p) {
 }
 static void thr_free(thr_t *t) {   /* holding G */
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
-    pthread_cond_destroy(&t->cv); free(t);
+    pthread_cond_destroy(&t->cv); if (t->ev) pal_event_free(t->ev); free(t);
 }
 static void thread_exit(thr_t *t) {
     G_lock();
@@ -444,6 +474,16 @@ static void stab_log(stab *s, const char *what, int show) {
 static void log_calls(void) {   /* the svcs and host functions guest code spent the most time in */
     char out[3000]; size_t at = 0; uint64_t ns[NCALL], n[NCALL], tn = 0;
     for (int i = 0; i < NCALL; i++) { ns[i] = atomic_exchange(&g_call_ns[i], 0); n[i] = atomic_exchange(&g_call_n[i], 0); tn += n[i]; }
+    uint64_t nn[NCALL]; memcpy(nn, n, sizeof nn);
+    char byn[1200]; size_t an = 0; byn[0] = 0;   /* the most frequent: cheap calls made very often cost in entry and exit */
+    for (int shown = 0; shown < 10; shown++) {
+        int b = -1; for (int i = 0; i < NCALL; i++) if (nn[i] && (b < 0 || nn[i] > nn[b])) b = i;
+        if (b < 0) break;
+        const char *nm = b < 0x100 ? host_svc_name((unsigned)b) : bridge_name(host_bridge(), BRIDGE_SVC_BASE + (uint32_t)(b - 0x100));
+        an += (size_t)snprintf(byn + an, an < sizeof byn ? sizeof byn - an : 0, "%s%s %llux %.0f ms", shown ? ", " : "", nm ? nm : "?", (unsigned long long)nn[b], ns[b] / 1e6);
+        nn[b] = 0;
+        if (an >= sizeof byn) break;
+    }
     for (int shown = 0; shown < 16; shown++) {
         int b = -1; for (int i = 0; i < NCALL; i++) if (ns[i] && (b < 0 || ns[i] > ns[b])) b = i;
         if (b < 0) break;
@@ -454,9 +494,9 @@ static void log_calls(void) {   /* the svcs and host functions guest code spent 
         if (at >= sizeof out) break;
     }
     static uint64_t lb, ls; uint64_t b, sl; jit_compile_stats(&b, &sl);
-    LOG("[calls] guest code ran %llu times between stops (%llu halts for preemption, %llu WFE waits), %llu blocks compiled (%llu new slabs), %llu calls; most time in: %s",
+    LOG("[calls] guest code ran %llu times between stops (%llu halts for preemption, %llu WFE waits), %llu blocks compiled (%llu new slabs), %llu calls; most time in: %s; most often: %s",
         (unsigned long long)atomic_exchange(&g_n_run, 0), (unsigned long long)atomic_exchange(&g_n_stop_halt, 0),
-        (unsigned long long)atomic_exchange(&g_n_stop_wait, 0), (unsigned long long)(b - lb), (unsigned long long)(sl - ls), (unsigned long long)tn, out);
+        (unsigned long long)atomic_exchange(&g_n_stop_wait, 0), (unsigned long long)(b - lb), (unsigned long long)(sl - ls), (unsigned long long)tn, out, byn);
     lb = b; ls = sl;
 }
 static void log_threads(void) {   /* every guest thread: priority, what it is doing, its last svc */
@@ -593,12 +633,17 @@ int svc_thread(int num, uint64_t *regs) {
         thr_t *self = cur();
         if (ns > 0) {
             G_lock(); core_put(self); pthread_mutex_unlock(&G);
+            uint64_t s0 = g_diag ? pal_now_ns() : 0;
             pal_sleep_ns((uint64_t)ns);
+            if (g_diag) slp_note(0, (uint64_t)ns, pal_now_ns() - s0);
             G_lock(); core_take(self); pthread_mutex_unlock(&G);
-        } else {   /* Horizon yield: hand the core to a waiting thread of equal or better priority */
+        } else {   /* Horizon yield: 0 and -1 hand the core to a waiting thread of equal or better priority, -2 (to any
+                      thread) to any waiting thread this core may run, whatever its priority */
             G_lock();
-            int give = 0; for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = self->cur_core >= 0 && core_allowed(w, self->cur_core) && w->prio <= self->prio;
-            if (give) { core_put(self); core_take(self); }
+            int any = ns == -2, k = ns == 0 ? 0 : ns == -1 ? 1 : 2;
+            int give = 0; for (thr_t *w = g_core_wait; w && !give; w = w->cnext) give = self->cur_core >= 0 && core_allowed(w, self->cur_core) && (any || w->prio <= self->prio);
+            if (g_diag) { atomic_fetch_add(&g_yield_n[k], 1); if (give) atomic_fetch_add(&g_yield_gave[k], 1); }
+            if (give) { core_put(self); self->no_preempt = any; core_take(self); }
             pthread_mutex_unlock(&G);
             if (!give) pal_yield();
         }

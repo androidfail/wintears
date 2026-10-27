@@ -109,6 +109,11 @@ void pal_tls_set(pal_tls_key k, void *v);
 uint64_t pal_now_ns(void);              /* monotonic */
 uint64_t pal_wall_time_ns(void);        /* nanoseconds since 1970-01-01 UTC */
 void pal_sleep_ns(uint64_t ns);         /* high-resolution where the OS offers it */
+void *pal_event_new(void);              /* auto-reset event */
+void pal_event_set(void *e);
+void pal_event_free(void *e);
+void pal_event_wait_ns(void *e, uint64_t ns);   /* until set or ns have passed, to the 100 ns (Wine: as asked; a condition
+                                                   variable's timeout is whole milliseconds, 1 ms late every time) */
 
 /* ---- files and paths (UTF-8 everywhere) -------------------------------------------------------------------- */
 

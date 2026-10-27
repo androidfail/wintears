@@ -332,6 +332,8 @@ static int exc_kind_of(uint32_t e) {   /* dynarmic A64::Exception to jit_excepti
     }
 }
 
+/* per-core cache markers for the host's stubs (never real block addresses) */
+static const wt_block_fn kStubSvc = reinterpret_cast<wt_block_fn>(uintptr_t{1}), kStubRet = reinterpret_cast<wt_block_fn>(uintptr_t{2});
 int jit_run(jit_core *c) {
     if (!c->hybrid) return stop_of(c, c->jit->Run());
     wt_ctx &n = c->nc;
@@ -350,6 +352,14 @@ int jit_run(jit_core *c) {
             auto &e = c->lc[(n.pc >> 2) & (sizeof c->lc / sizeof c->lc[0] - 1)];
             if (e.pc == n.pc) f = e.fn;
             else if ((f = nat_find(n.pc))) { e.pc = n.pc; e.fn = f; }
+            else {   /* the host's stubs ("svc #n; ret", outside the modules) are remembered too: every host call went
+                        through two missed lookups in the big table */
+                uint32_t w; memcpy(&w, reinterpret_cast<const void *>(n.pc), 4);
+                if ((w & 0xFFE0001Fu) == 0xD4000001u) { e.pc = n.pc; e.fn = kStubSvc; f = kStubSvc; }
+                else if (w == 0xD65F03C0u) { e.pc = n.pc; e.fn = kStubRet; f = kStubRet; }
+            }
+            if (f == kStubSvc) { uint32_t w; memcpy(&w, reinterpret_cast<const void *>(n.pc), 4); c->svc = w >> 5 & 0xFFFF; n.pc += 4; stop = JIT_STOP_SVC; break; }
+            if (f == kStubRet) { n.pc = n.x[30]; continue; }
         }
         if (!ok_fpcr) { c->n_fpcr++; c->last_fpcr = n.fpcr; }   /* counted: FPCR the blocks cannot take */
         if (f) {
@@ -432,7 +442,10 @@ int jit_exception(jit_core *c, uint64_t *pc) {
     if (pc) *pc = c->exc_pc;
     return c->exc_kind;
 }
-void jit_invalidate(jit_core *c, uint64_t addr, size_t size) { c->jit->InvalidateCacheRange(addr, size); }
+void jit_invalidate(jit_core *c, uint64_t addr, size_t size) {
+    c->jit->InvalidateCacheRange(addr, size);
+    for (auto &e : c->lc) if (e.pc >= addr && e.pc - addr < size) e = {};   /* stubs and blocks remembered there */
+}
 void jit_clear_cache(jit_core *c) { c->jit->ClearCache(); }
 
 }  // extern "C"

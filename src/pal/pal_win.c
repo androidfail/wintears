@@ -9,6 +9,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <cpuid.h>
+#include <x86intrin.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <knownfolders.h>
@@ -396,16 +398,42 @@ void pal_tls_set(pal_tls_key k, void *v) { TlsSetValue(k, v); }
 
 /* ---- time ------------------------------------------------------------------------------------------------------ */
 
+/* The monotonic clock reads the CPU's time-stamp counter when it is invariant (constant rate, in step on all cores),
+   scaled by a rate measured against QueryPerformanceCounter at the first call (20 ms). Under Wine on the Steam Deck
+   QueryPerformanceCounter took 146 ns a call against 16 for rdtsc, and the scheduler and diagnostics read the clock
+   several times per guest call (hundreds of thousands a second). Without an invariant TSC: QueryPerformanceCounter. */
 static LARGE_INTEGER qpc_freq;
 static INIT_ONCE qpc_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK qpc_init(PINIT_ONCE o, PVOID p, PVOID *c) { (void)o; (void)p; (void)c; return QueryPerformanceFrequency(&qpc_freq); }
-
-uint64_t pal_now_ns(void) {
-    InitOnceExecuteOnce(&qpc_once, qpc_init, NULL, NULL);
-    LARGE_INTEGER t;
-    QueryPerformanceCounter(&t);
+static uint64_t tsc0, tsc_ns0, tsc_mul;   /* ns = tsc_ns0 + (tsc - tsc0) * tsc_mul >> 32 */
+static int tsc_ready;                     /* 1 = TSC, 2 = QueryPerformanceCounter (release / acquire) */
+static uint64_t qpc_ns(void) {
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
     uint64_t f = (uint64_t)qpc_freq.QuadPart, v = (uint64_t)t.QuadPart;
     return v / f * 1000000000ull + v % f * 1000000000ull / f;
+}
+static BOOL CALLBACK qpc_init(PINIT_ONCE o, PVOID p, PVOID *c) {
+    (void)o; (void)p; (void)c;
+    QueryPerformanceFrequency(&qpc_freq);
+    unsigned a, b, cc, d; int inv = __get_cpuid(0x80000007, &a, &b, &cc, &d) && (d >> 8 & 1);
+    const char *e = getenv("TOTK_CLOCK_QPC");
+    if (!inv || (e && *e == '1')) { __atomic_store_n(&tsc_ready, 2, __ATOMIC_RELEASE); return TRUE; }
+    uint64_t q0 = qpc_ns(), t0 = __rdtsc(), q1, t1;
+    do { q1 = qpc_ns(); t1 = __rdtsc(); } while (q1 - q0 < 20000000ull);
+    if (t1 <= t0) { __atomic_store_n(&tsc_ready, 2, __ATOMIC_RELEASE); return TRUE; }
+    tsc_mul = (uint64_t)(((unsigned __int128)(q1 - q0) << 32) / (t1 - t0));
+    tsc0 = t1; tsc_ns0 = q1;
+    __atomic_store_n(&tsc_ready, 1, __ATOMIC_RELEASE);
+    return TRUE;
+}
+
+uint64_t pal_now_ns(void) {
+    int r = __atomic_load_n(&tsc_ready, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(r == 1, 1)) {
+        uint64_t t = __rdtsc();
+        return t <= tsc0 ? tsc_ns0 : tsc_ns0 + (uint64_t)(((unsigned __int128)(t - tsc0) * tsc_mul) >> 32);
+    }
+    if (!r) { InitOnceExecuteOnce(&qpc_once, qpc_init, NULL, NULL); r = __atomic_load_n(&tsc_ready, __ATOMIC_ACQUIRE); }
+    return r == 1 ? pal_now_ns() : qpc_ns();
 }
 
 uint64_t pal_wall_time_ns(void) {
@@ -427,9 +455,21 @@ static ntdelay_t wine_delay(void) {
     if (!looked) { looked = 1; if (pal_under_wine()) f = (ntdelay_t)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtDelayExecution"); }
     return f;
 }
-void pal_sleep_ns(uint64_t ns) {
-    ntdelay_t d = wine_delay();
-    if (d) { LARGE_INTEGER iv; iv.QuadPart = -(LONGLONG)((ns + 99) / 100); d(FALSE, &iv); return; }
+typedef LONG (NTAPI *ntwait_t)(HANDLE, BOOLEAN, PLARGE_INTEGER);
+void *pal_event_new(void) { HANDLE h = CreateEventW(NULL, FALSE, FALSE, NULL); if (!h) abort(); return h; }
+void pal_event_set(void *e) { SetEvent((HANDLE)e); }
+void pal_event_free(void *e) { CloseHandle((HANDLE)e); }
+static HANDLE thread_timer(void);
+void pal_event_wait_ns(void *e, uint64_t ns) {
+    static ntwait_t f; static int looked;
+    if (!looked) { if (pal_under_wine()) f = (ntwait_t)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWaitForSingleObject"); looked = 1; }
+    LARGE_INTEGER iv; iv.QuadPart = -(LONGLONG)((ns + 99) / 100);
+    if (f) { f((HANDLE)e, FALSE, &iv); return; }   /* Wine: the timeout is kept to the 100 ns */
+    HANDLE t = thread_timer();   /* Windows: the event or this thread's high-resolution timer, whichever comes first */
+    if (t && SetWaitableTimer(t, &iv, 0, NULL, NULL, FALSE)) { HANDLE hs[2] = {(HANDLE)e, t}; WaitForMultipleObjects(2, hs, FALSE, INFINITE); CancelWaitableTimer(t); }
+    else WaitForSingleObject((HANDLE)e, ms_timeout((int64_t)ns));
+}
+static HANDLE thread_timer(void) {   /* this thread's high-resolution waitable timer */
     InitOnceExecuteOnce(&timer_once, timer_init, NULL, NULL);
     HANDLE t = timer_tls != TLS_OUT_OF_INDEXES ? (HANDLE)TlsGetValue(timer_tls) : NULL;
     if (!t && timer_tls != TLS_OUT_OF_INDEXES) {
@@ -437,6 +477,12 @@ void pal_sleep_ns(uint64_t ns) {
         if (!t) t = CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);   /* before Windows 10 1803 */
         TlsSetValue(timer_tls, t);
     }
+    return t;
+}
+void pal_sleep_ns(uint64_t ns) {
+    ntdelay_t d = wine_delay();
+    if (d) { LARGE_INTEGER iv; iv.QuadPart = -(LONGLONG)((ns + 99) / 100); d(FALSE, &iv); return; }
+    HANDLE t = thread_timer();
     LARGE_INTEGER due;
     due.QuadPart = -(LONGLONG)((ns + 99) / 100);
     if (t && SetWaitableTimer(t, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(t, INFINITE);

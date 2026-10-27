@@ -205,6 +205,23 @@ static void test_time(void) {
     uint64_t b = pal_now_ns();
     CHECK(b > a && b - a >= 1500000);
     CHECK(pal_wall_time_ns() > 1700000000ull * 1000000000ull);   /* after 2023 */
+    /* the TSC clock never goes back and keeps pace with the wall clock over 200 ms (within 2%) */
+    uint64_t prev = pal_now_ns(); int back = 0;
+    for (int i = 0; i < 100000; i++) { uint64_t v = pal_now_ns(); back |= v < prev; prev = v; }
+    CHECK(!back);
+    uint64_t w0 = pal_wall_time_ns(), m0 = pal_now_ns();
+    pal_sleep_ns(200000000);
+    uint64_t dw = pal_wall_time_ns() - w0, dm = pal_now_ns() - m0;
+    CHECK(dm > dw * 98 / 100 && dm < dw * 102 / 100);
+    /* event waits: a set event returns at once, an unset one at about its timeout */
+    void *e = pal_event_new();
+    pal_event_set(e);
+    uint64_t t0 = pal_now_ns(); pal_event_wait_ns(e, 1000000000ull);
+    CHECK(pal_now_ns() - t0 < 100000000ull);
+    t0 = pal_now_ns(); pal_event_wait_ns(e, 3000000ull);
+    uint64_t took = pal_now_ns() - t0;
+    CHECK(took >= 2900000ull && took < 50000000ull);
+    pal_event_free(e);
 }
 
 static void test_files(void) {
