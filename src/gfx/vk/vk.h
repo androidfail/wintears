@@ -145,7 +145,11 @@ VkBufferView vt_texel_view_copy(const tex_t *t);   /* sampled use only: a view o
 
 /* vk_exec.c ----------------------------------------------------------------------------------------------------- */
 void vx_run(const uint8_t *list);   /* replay one recording into the open submission */
-void vx_end_pass(void);             /* the render pass in progress ends (before copies, uploads, present) */
+void vx_end_pass_at(const char *file, int line);   /* the render pass in progress ends (before copies, uploads, present) */
+#define vx_end_pass() vx_end_pass_at(__FILE__, __LINE__)   /* TOTK_DIAG counts pass ends by where they happen */
+void vx_pass_end_report(char *out, size_t cap);
+int vx_barrier_pending(void);        /* a game barrier waits in the open pass (vk_exec.c) */
+void vx_pass_wrote_storage(void);    /* a draw of the open pass writes storage buffers / images */   /* the most frequent places, since the last report */
 void vx_submit_done(void);          /* end of a game submission: CPU effects queued, state kept for the next */
 void vx_pin_refs(void (*mark)(const void *));   /* texture copies the replay state still points to (nvn.c pin sweep) */
 

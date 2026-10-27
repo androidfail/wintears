@@ -499,6 +499,7 @@ typedef struct { void (*fn)(void *); void *arg; } act_t;
 typedef struct sub {
     VkCommandPool pool; VkCommandBuffer pre, main;
     uint64_t fence, t_submit; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
+    int slot;   /* its two timestamp queries: 2 * slot, 2 * slot + 1 (GPU time of the submission) */
 } sub;
 #define CHUNK_SIZE (16ull << 20)   /* staging: larger requests get a chunk of their own size */
 enum { MAX_IN_FLIGHT = 6 };
@@ -542,7 +543,26 @@ static sub *take_sub(void) {
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = s->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 2};
     VKC(vkAllocateCommandBuffers(vk_dev, &ai, cb));
     s->pre = cb[0]; s->main = cb[1];
+    { static int slots; s->slot = slots++; }
     return s;
+}
+/* GPU time: from the start of a submission to its end, summed (TOTK_DIAG line "GPU busy") */
+#define TS_SLOTS 32
+static VkQueryPool g_ts; static _Atomic uint64_t g_gpu_busy_ns;
+static void ts_begin(sub *s) {
+    if (!g_ts && vk_props.limits.timestampComputeAndGraphics) {
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2 * TS_SLOTS};
+        if (vkCreateQueryPool(vk_dev, &qi, NULL, &g_ts) != VK_SUCCESS) g_ts = VK_NULL_HANDLE;
+    }
+    if (!g_ts || s->slot >= TS_SLOTS) return;
+    vkCmdResetQueryPool(s->pre, g_ts, 2 * (uint32_t)s->slot, 2);
+    vkCmdWriteTimestamp2(s->pre, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g_ts, 2 * (uint32_t)s->slot);
+}
+static void ts_end(sub *s) { if (g_ts && s->slot < TS_SLOTS) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, 2 * (uint32_t)s->slot + 1); }
+static void ts_read(sub *s) {   /* the submission has completed */
+    uint64_t t[2];
+    if (g_ts && s->slot < TS_SLOTS && vkGetQueryPoolResults(vk_dev, g_ts, 2 * (uint32_t)s->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
+        atomic_fetch_add(&g_gpu_busy_ns, (uint64_t)((double)(t[1] - t[0]) * vk_props.limits.timestampPeriod));
 }
 
 void vk_open(void) {
@@ -550,6 +570,7 @@ void vk_open(void) {
     sub *s = take_sub();
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VKC(vkBeginCommandBuffer(s->pre, &bi)); VKC(vkBeginCommandBuffer(s->main, &bi));
+    ts_begin(s);
     vk_barrier(s->pre);    /* after everything submitted earlier */
     vk_barrier(s->main);   /* after this submission's uploads */
     g_cur = s; g_serial++;
@@ -686,6 +707,7 @@ uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo
                            .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
     VkDependencyInfo hd = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &hb};
     vkCmdPipelineBarrier2(s->main, &hd);   /* the CPU reads what the GPU wrote into pool memory once the fence is done */
+    ts_end(s);
     VKC(vkEndCommandBuffer(s->pre)); VKC(vkEndCommandBuffer(s->main));
     if (!g_fence) { pthread_mutex_lock(&g_pool_mu); imports_describe(); pthread_mutex_unlock(&g_pool_mu); }
     qitem *it = calloc(1, sizeof *it);
@@ -739,7 +761,7 @@ static void *done_thread(void *unused) {
         VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_tl, .pValues = &s->fence};
         VkResult r = vkWaitSemaphores(vk_dev, &wi, UINT64_MAX);
         if (r != VK_SUCCESS) vk_lost(r), die("Vulkan: waiting for the GPU failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
-        lat_note(pal_now_ns() - s->t_submit);
+        lat_note(pal_now_ns() - s->t_submit); ts_read(s);
         for (int i = 0; i < s->nact; i++) s->acts[i].fn(s->acts[i].arg);
         s->nact = 0;
         pthread_mutex_lock(&g_done_mu);
@@ -888,8 +910,9 @@ static uint64_t submit(const uint64_t *handles, int n) {
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
         { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu imports alive (%.0f MiB), of them %llu windows (%.0f MiB, %d over physical memory)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6,
                                      (unsigned long long)g_import_all, g_import_bytes / 1048576.0, (unsigned long long)g_win_n, g_win_bytes / 1048576.0, g_aw_live); vk_ns_hash = 0; }
-        VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
-             (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, w / 1e6, g_sh_bytes / 1048576.0);
+        VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average, GPU busy %.0f ms; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
+             (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, atomic_exchange(&g_gpu_busy_ns, 0) / 1e6, w / 1e6, g_sh_bytes / 1048576.0);
+        if (vk_n_pass) { char pe[400]; vx_pass_end_report(pe, sizeof pe); VLOG("pass ends by place (last 10 s): %s", pe); }
         vk_log_memory();
         static int diag = -1; if (diag < 0) { const char *d = pal_getenv("TOTK_DIAG"); diag = d && *d == '1'; }
         if (diag) { static uint64_t lastf; uint64_t f = pal_fault_total(); char cpu[600]; pal_thread_cpu_report(cpu, sizeof cpu);

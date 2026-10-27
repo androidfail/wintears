@@ -1227,9 +1227,10 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         if (!g_def_on) LOG("[nvn] TOTK_DEFERRED_BINDS=0: deferred binds read their handles at record time");
     }
     if (g_def_on) for (int i = 0; i < n; i++) resolve_deferred((const uint8_t *)(uintptr_t)h[i], 0);
-    pin_step(now);
+    if (!gpu_async()) pin_step(now);   /* with the translation thread it runs there, before the replay */
     gpu_submit((const uint64_t *)h, n);
 }
+void nvn_pin_step_now(void) { pin_step(__atomic_load_n(&g_submits, __ATOMIC_RELAXED)); }
 
 /* ---------- window / present ---------- */
 #define WB(b) ((win_builder_t *)(b))

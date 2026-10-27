@@ -11,6 +11,7 @@
 #include "nvn_obj.h"
 
 void gpu_init(void);
+int gpu_async(void);   /* TOTK_ASYNC_REPLAY: submits and presents are replayed on the translation thread (nvn_gpu.c) */
 const char *gpu_name(void);
 
 /* memory pools: [mem, mem+size), GPU address = CPU address */

@@ -367,6 +367,20 @@ typedef struct { uint64_t serial; VkBuffer b; VkDeviceSize o; uint8_t bytes[0xA0
 static drv_ent g_drv[2][6];
 static inline uint64_t mix64(uint64_t h, uint64_t v) { h ^= v; h *= 0x100000001b3ull; h ^= h >> 29; h *= 0xff51afd7ed558ccdull; return h; }
 static uint64_t mix_bytes(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; uint64_t v; for (size_t i = 0; i + 8 <= n; i += 8) { memcpy(&v, b + i, 8); h = mix64(h, v); } for (size_t i = n & ~(size_t)7; i < n; i++) h = mix64(h, b[i]); return h; }
+/* What the draw being prepared samples and whether it writes storage (vk_exec.c: a game barrier left in the open pass
+   is honoured only when the draw reads the pass's own targets or the pass writes storage). */
+static struct { const uint8_t *lo; uint64_t n; } g_smp[32]; static int g_nsmp, g_dw_storage;
+static int samples_targets(void) {   /* a sampled texture overlaps a render target of the open pass */
+    const tex_t *tg[9]; int nt = 0;
+    for (int i = 0; i < S.rt.n && i < 8; i++) if (S.rt.color[i]) tg[nt++] = S.rt.color[i];
+    if (S.rt.depth) tg[nt++] = S.rt.depth;
+    if (g_nsmp >= 32) return 1;   /* more than were noted: assume so */
+    for (int i = 0; i < g_nsmp; i++) for (int k = 0; k < nt; k++) {
+        const uint8_t *lo = tg[k]->mem; uint64_t n = tg[k]->L.size ? tg[k]->L.size : 1;
+        if (g_smp[i].lo < lo + n && lo < g_smp[i].lo + g_smp[i].n) return 1;
+    }
+    return 0;
+}
 static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
     VkDescriptorSet set = VK_NULL_HANDLE;   /* made at the end, unless an equal one is there */
     enum { MAXW = 96, MAXI = 512 };
@@ -410,6 +424,7 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             default: break;
             }
             if (b->type == DT_UBO && d.range > 65536) d.range = 65536;
+            if (b->type != DT_UBO && b->rw) g_dw_storage = 1;
             { extern int vk_passlog_on; if (vk_passlog_on) VLOG("[pass]   st%d b%d %s kind %d reg %d -> %s off %#llx range %#llx (ssbo addr %#llx size %#llx)", st, b->binding, b->type == DT_UBO ? "ubo" : "ssbo", b->kind, b->reg, d.buffer == g_zero ? "zero" : "real",
                 (unsigned long long)d.offset, (unsigned long long)d.range, b->reg >= 0 && b->reg < 16 ? (unsigned long long)S.ssbo[st][b->reg].addr : 0ull, b->reg >= 0 && b->reg < 16 ? (unsigned long long)S.ssbo[st][b->reg].size : 0ull); }
             for (uint32_t k = 0; k < cnt; k++) bi[nb + k] = d;
@@ -441,6 +456,8 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                     VkImageView v = e ? vt_view(e, &s.t, s.has_v ? &s.v : NULL, VT_SAMPLED, (VkImageViewType)b->view) : VK_NULL_HANDLE;
                     if (v) d.imageView = v;
                     vt_prov_input(&s.t);
+                    if (g_nsmp < 32) g_smp[g_nsmp] = (__typeof__(g_smp[0])){s.t.mem, s.t.L.size ? s.t.L.size : 1};
+                    g_nsmp++;
                     extern int vk_passlog_on;
                     if (vk_passlog_on) { VLOG("[pass]     tex %ux%ux%u levels %u fmt %#x target %d flags %#x at %p, last written by %s", s.t.d.width, s.t.d.height, s.t.d.depth, s.t.d.levels, s.t.d.format, s.t.d.target, s.t.d.flags, (void *)s.t.mem, vt_writer_of(e));
                         if (e) { uint32_t w, h, d; vt_size(e, 0, &w, &h, &d); vx_note_sampled(vt_image(e), vt_vkformat(e), w, h); vt_prov_dump(e); } }
@@ -455,6 +472,7 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                 if (slot_texture(S.img[st][b->reg], &s)) {
                     vtex *e = vt_get(&s.t);
                     VkImageView v = e ? vt_view(e, &s.t, s.has_v ? &s.v : NULL, VT_STORAGE, (VkImageViewType)b->view) : VK_NULL_HANDLE;
+                    g_dw_storage = 1;
                     if (v) { d.imageView = v; snprintf(vt_writer, sizeof vt_writer, "image store, NVN format %#x", s.t.d.format); vt_written(e); }
                 }
             }
@@ -875,8 +893,11 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     /* the descriptor sets first: they may upload textures (into this submission's upload buffer, before the pass) */
     { void vx_target_log_check(void); vx_target_log_check(); }
     vt_prov_reset();
+    g_nsmp = g_dw_storage = 0;
     VkDescriptorSet s0 = stage_set(vs, 0), s1 = fs ? stage_set(fs, 1) : VK_NULL_HANDLE;
+    if (vx_barrier_pending() && samples_targets()) vx_end_pass();   /* the game's barrier: this draw reads what the pass drew */
     if (!vx_begin_pass()) { g_skipped[2]++; return; }
+    if (g_dw_storage) vx_pass_wrote_storage();
     { void vx_prov_draw(const char *vs, const char *fs); vx_prov_draw(vs->name, fs ? fs->name : NULL); }
     int prim = dw ? dw->prim : di->prim;
     VkPipelineLayout lay = layout_of(vs->dsl, fs ? fs->dsl : VK_NULL_HANDLE);

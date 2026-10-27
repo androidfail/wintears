@@ -181,8 +181,34 @@ static void pass_output_sample(void) {   /* after vkCmdEndRendering */
 }
 
 /* ---------- render passes ---------- */
-void vx_end_pass(void) {
+static struct { const char *f; int line; unsigned n; } g_endw[48]; static int g_nendw;
+static struct { int32_t bits; unsigned n, in_pass; } g_barw[16]; static int g_nbarw;
+/* A game barrier inside an open pass: Vulkan already orders attachment writes within a pass, so the pass (and the full
+   barrier that ends it) is kept until a draw samples the pass's own targets (vk_draw.c) or the pass has written storage;
+   any other end of the pass includes the barrier. ~100 barriers a frame in TOTK each drained the GPU. TOTK_BARRIER_DEFER=0: off. */
+static int g_bar_pending, g_pass_storage;
+static int bar_defer(void) { static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_BARRIER_DEFER"); on = !(e && *e == '0'); } return on; }
+int vx_barrier_pending(void) { return g_pass && g_bar_pending; }
+void vx_pass_wrote_storage(void) { g_pass_storage = 1; }   /* the game's barriers by bits */
+void vx_pass_end_report(char *out, size_t cap) {   /* top 8 by count, as file:line n */
+    size_t k = 0; out[0] = 0;
+    for (int r = 0; r < 8; r++) {
+        int b = -1; for (int i = 0; i < g_nendw; i++) if (g_endw[i].n && (b < 0 || g_endw[i].n > g_endw[b].n)) b = i;
+        if (b < 0) break;
+        const char *s = strrchr(g_endw[b].f, '/'); s = s ? s + 1 : g_endw[b].f;
+        k += (size_t)snprintf(out + k, k < cap ? cap - k : 0, "%s%s:%d %u", r ? ", " : "", s, g_endw[b].line, g_endw[b].n); g_endw[b].n = 0;
+        if (k >= cap) break;
+    }
+    for (int i = 0; i < g_nendw; i++) g_endw[i].n = 0;
+    k += (size_t)snprintf(out + k, k < cap ? cap - k : 0, "; game barriers by bits (in a pass):");
+    for (int i = 0; i < g_nbarw && k < cap; i++) if (g_barw[i].n) k += (size_t)snprintf(out + k, cap - k, " %#x %u (%u)", g_barw[i].bits, g_barw[i].n, g_barw[i].in_pass);
+    for (int i = 0; i < g_nbarw; i++) g_barw[i].n = g_barw[i].in_pass = 0;
+}
+void vx_end_pass_at(const char *file, int line) {
     if (!g_pass) return;
+    {   int i = 0; while (i < g_nendw && (g_endw[i].line != line || g_endw[i].f != file)) i++;
+        if (i == g_nendw && g_nendw < 48) g_endw[g_nendw++] = (__typeof__(g_endw[0])){file, line, 0};
+        if (i < g_nendw) g_endw[i].n++; }
     if (plog()) VLOG("[pass] %ux%u colors %d (%d %d) depth %d: %d draws, %d clears", S.pass_w, S.pass_h, S.pass_fmt.ncolor, (int)S.pass_fmt.color[0], (int)S.pass_fmt.color[1],
                      (int)S.pass_fmt.depth, g_pass_draws, g_pass_clears);
     if (g_oq_open) { vkCmdEndQuery(vk_cmd(), g_oq, (uint32_t)((g_oq_n - 1) % OQ_N)); g_oq_open = 0; }
@@ -196,7 +222,7 @@ void vx_end_pass(void) {
     }
     g_pass_draws = g_pass_clears = 0;
     vk_barrier_lazy();
-    g_pass = 0; memset(g_pass_col, 0, sizeof g_pass_col);
+    g_pass = 0; g_bar_pending = g_pass_storage = 0; memset(g_pass_col, 0, sizeof g_pass_col);
     if (g_tgt_log) { g_tgt_log = 0; plog(); }
 }
 
@@ -679,7 +705,13 @@ void vx_run(const uint8_t *p) {
         case OP_RENDER_COND: { const p_render_cond *rc = (const p_render_cond *)a; uint64_t x, y; memcpy(&x, (const void *)(uintptr_t)rc->addr, 8); memcpy(&y, (const void *)(uintptr_t)(rc->addr + 16), 8);
             S.render_disabled = !cond_eval(rc);
             snprintf(g_off_why, sizeof g_off_why, "rendering off (conditional mode %d: counters %#llx %#llx at %#llx, read on the CPU)", (int)rc->mode, (unsigned long long)x, (unsigned long long)y, (unsigned long long)rc->addr); break; }
-        case OP_BARRIER: vx_end_pass(); vk_barrier_lazy(); break;
+        case OP_BARRIER: {
+            int32_t bits; memcpy(&bits, a, 4);
+            {   int i = 0; while (i < g_nbarw && g_barw[i].bits != bits) i++;
+                if (i == g_nbarw && g_nbarw < 16) g_barw[g_nbarw++] = (__typeof__(g_barw[0])){bits, 0, 0};
+                if (i < g_nbarw) { g_barw[i].n++; g_barw[i].in_pass += g_pass != 0; } }
+            if (g_pass && !g_pass_storage && bar_defer()) { g_bar_pending = 1; break; }
+            vx_end_pass(); vk_barrier_lazy(); break; }
         case OP_DRAW: if (!S.render_disabled) vd_draw((const p_draw *)a, NULL); else vd_note_drop(g_off_why); break;
         case OP_DRAW_IDX: if (!S.render_disabled) vd_draw(NULL, (const p_draw_idx *)a); else vd_note_drop(g_off_why); break;
         case OP_DISPATCH: vd_dispatch((const p_dispatch *)a); break;
