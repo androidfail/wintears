@@ -232,6 +232,7 @@ const char *ctype(IR::Type t) {
 
 struct Emitter {
     std::map<const IR::Inst *, int> id;
+    const std::unordered_set<uint64_t> *linkable = nullptr;   // blocks this DLL defines: direct jumps chain to them
     std::string body, why;   // why: the first opcode not supported
     char buf[512];
 
@@ -472,8 +473,15 @@ struct Emitter {
                 e.body += e.buf;
             }
             void operator()(const IR::Term::ReturnToDispatch &) { e.body += ind + "return;\n"; }
-            void operator()(const IR::Term::LinkBlock &t) { pc(t.next); }
-            void operator()(const IR::Term::LinkBlockFast &t) { pc(t.next); }
+            void link(const IR::LocationDescriptor &l) {   // chain: a tail call to the next block unless a halt is asked for
+                uint64_t to = A64::LocationDescriptor{l}.PC();
+                if (!e.linkable || !e.linkable->count(to)) { pc(l); return; }
+                snprintf(e.buf, sizeof e.buf, "%sc->pc = 0x%llxull; if (*c->halt_request) return; { extern void B_%llx(wt_ctx *); __attribute__((musttail)) return B_%llx(c); }\n",
+                         ind.c_str(), (unsigned long long)to, (unsigned long long)to, (unsigned long long)to);
+                e.body += e.buf;
+            }
+            void operator()(const IR::Term::LinkBlock &t) { link(t.next); }
+            void operator()(const IR::Term::LinkBlockFast &t) { link(t.next); }
             void operator()(const IR::Term::PopRSBHint &) { e.body += ind + "return;\n"; }
             void operator()(const IR::Term::FastDispatchHint &) { e.body += ind + "return;\n"; }
             void sub(const IR::Terminal &x) { V v{e, d + 1, ind + "    "}; boost::apply_visitor(v, x); }
@@ -544,6 +552,7 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     std::vector<uint64_t> done;
     std::map<std::string, uint64_t> missing;
     Emitter em;
+    em.linkable = &seen;
     std::string cur;
     size_t files = 0;
     uint64_t total = all.size(), chunk = ~0ull;
@@ -557,7 +566,12 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     for (uint64_t pc : all) {
         if (pc >> per_file != chunk) { flush(); chunk = pc >> per_file; }
         IR::Block b = translate(p, pc, uc);
-        if (!em.block(b, pc, cur)) { missing[em.why]++; continue; }
+        if (!em.block(b, pc, cur)) {   // left to dynarmic: a stub that hands the pc back, for blocks that chain to it
+            missing[em.why]++;
+            snprintf(em.buf, sizeof em.buf, "void B_%llx(wt_ctx *c) { c->pc = 0x%llxull; }\n", (unsigned long long)pc, (unsigned long long)pc);
+            cur += em.buf;
+            continue;
+        }
         done.push_back(pc);
     }
     flush();
@@ -672,7 +686,7 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
 
     std::map<std::string, uint64_t> tested_ops, bad_ops;
     size_t ok = 0, bad = 0, faulted = 0, shown = 0;
-    volatile int no_halt = 0;
+    volatile int no_halt = 1;   // chained blocks stop after the first: one block, as on the dynarmic side
     for (size_t s = 0; s < samples; s++) {
         const wt_entry &e = tab[rnd() % *cnt];
         // random state

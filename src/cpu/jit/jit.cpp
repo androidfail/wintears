@@ -149,7 +149,8 @@ struct jit_core final : Dynarmic::A64::UserCallbacks {
     wt_ctx nc{};
     volatile int halt_req = 0;
     uint64_t n_native = 0, n_missed = 0, n_fpcr = 0, last_fpcr = 0;   /* blocks run (read racily for the log) */
-    std::unordered_map<uint64_t, uint64_t> *misses = nullptr;   /* TOTK_NATIVE_MISSES: missed pc -> count */
+    std::unordered_map<uint64_t, uint64_t> *misses = nullptr;
+    struct { uint64_t pc; wt_block_fn fn; } lc[8192] = {};   /* recent pc -> block (128 KiB) */   /* TOTK_NATIVE_MISSES: missed pc -> count */
 
     std::uint8_t MemoryRead8(VAddr a) override { return load<uint8_t>(a); }
     std::uint16_t MemoryRead16(VAddr a) override { return load<uint16_t>(a); }
@@ -344,7 +345,12 @@ int jit_run(jit_core *c) {
     for (;;) {
         if (c->halt_req) { c->halt_req = 0; c->jit->ClearHalt(kHaltExternal); stop = JIT_STOP_HALT; break; }
         bool ok_fpcr = (n.fpcr & ~0x03000000u) == 0;
-        wt_block_fn f = ok_fpcr ? nat_find(n.pc) : nullptr;
+        wt_block_fn f = nullptr;
+        if (ok_fpcr) {   /* a small per-core cache in front of the big table (megabytes: a cache miss each time) */
+            auto &e = c->lc[(n.pc >> 2) & (sizeof c->lc / sizeof c->lc[0] - 1)];
+            if (e.pc == n.pc) f = e.fn;
+            else if ((f = nat_find(n.pc))) { e.pc = n.pc; e.fn = f; }
+        }
         if (!ok_fpcr) { c->n_fpcr++; c->last_fpcr = n.fpcr; }   /* counted: FPCR the blocks cannot take */
         if (f) {
             c->n_native++;
