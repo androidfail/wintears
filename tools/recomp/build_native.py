@@ -33,38 +33,45 @@ def compile_one(src, obj, inc, flags=None):
     return f'{os.path.basename(src)}: {r.stderr.strip()[:600]}'
 
 
+def wt_table(dll):
+    """(fn RVA, guest pc) of every block the DLL exports in wt_table, sorted by RVA."""
+    import struct
+    d = open(dll, 'rb').read()
+    u16, u32, u64 = (lambda o: struct.unpack_from('<H', d, o)[0]), (lambda o: struct.unpack_from('<I', d, o)[0]), (lambda o: struct.unpack_from('<Q', d, o)[0])
+    o = u32(0x3c) + 4; opt = o + 20; base = u64(opt + 24)
+    secs = [(u32(s + 12), max(u32(s + 8), u32(s + 16)), u32(s + 20)) for s in range(opt + u16(o + 16), opt + u16(o + 16) + 40 * u16(o + 2), 40)]
+    def off(rva): return next(rva - va + raw for va, size, raw in secs if va <= rva < va + size)
+    e = off(u32(opt + 112)); names, funcs, ords = off(u32(e + 32)), off(u32(e + 28)), off(u32(e + 36))
+    sym = {}
+    for i in range(u32(e + 24)):
+        n = off(u32(names + 4 * i)); sym[d[n:d.index(b'\0', n)].decode()] = u32(funcs + 4 * u16(ords + 2 * i))
+    t = off(sym['wt_table'])
+    return sorted((u64(t + 16 * i + 8) - base, u64(t + 16 * i)) for i in range(u64(off(sym['wt_count']))))
+
+
 def pick_hot(samples, dll, mod, share, hot_path):
-    """The C files of `mod` that hold `share` of the samples (dll offsets, TOTK_SAMPLE_OUT), via the last link's map."""
-    import bisect, re, struct
-    if not (os.path.exists(dll + '.map') and os.path.exists(dll + '.files')):
-        print(f'{mod}: no map from an earlier link yet: build once, run with TOTK_SAMPLE_OUT, then --hot'); return
-    pe = open(dll, 'rb').read(4096); o = struct.unpack_from('<I', pe, 0x3c)[0]
-    base = struct.unpack_from('<Q', pe, o + 24 + 24)[0]   # PE32+ ImageBase
-    names = dict(l.split(' ', 1) for l in open(dll + '.files').read().splitlines() if ' ' in l)   # object -> C file
-    ranges, pend = [], None   # (start, end, C file) of each object's .text
-    for line in open(dll + '.map', errors='replace'):
-        t = line.split()
-        if pend and len(t) >= 3 and t[0].startswith('0x'): t = [pend] + t
-        pend = t[0] if len(t) == 1 and t[0].startswith('.text') else None
-        if len(t) >= 4 and t[0].startswith('.text') and t[1].startswith('0x') and t[3].endswith('.o'):
-            f = names.get(os.path.basename(t[3].replace('\\', '/')))
-            size = int(t[2], 16)
-            if f and size: ranges.append((int(t[1], 16), int(t[1], 16) + size, f))
-    ranges.sort(); starts = [r[0] for r in ranges]
+    """The C files of `mod` that hold `share` of the samples (dll offsets, TOTK_SAMPLE_OUT). A sample belongs to the
+    block whose function starts at or before it (the DLL's own wt_table), and a block's file is named by its guest
+    address, so this works even after the recompiler changed every object."""
+    import bisect, re
+    if not os.path.exists(dll): print(f'{mod}: no {dll} to read the samples against'); return
+    tab = wt_table(dll); starts = [r for r, _ in tab]
     pat = re.compile(r'totk_' + re.escape(mod) + r'\.dll\+0x([0-9a-f]+)')
     per, n = {}, 0
     for line in open(samples, errors='replace'):
         m = pat.match(line.strip())
         if not m: continue
-        va = base + int(m.group(1), 16); i = bisect.bisect_right(starts, va) - 1
-        if i >= 0 and va < ranges[i][1]: per[ranges[i][2]] = per.get(ranges[i][2], 0) + 1; n += 1
+        i = bisect.bisect_right(starts, int(m.group(1), 16)) - 1
+        if i < 0: continue
+        f = f'blocks_{tab[i][1] >> 14:x}.c'   # wt_recomp emit ... 14: one file per 16 KiB of guest code
+        per[f] = per.get(f, 0) + 1; n += 1
     if not n: print(f'{mod}: no samples in {samples}'); return
     hot, got = [], 0
     for f, k in sorted(per.items(), key=lambda x: -x[1]):
         if got >= share * n: break
         hot.append(f); got += k
     open(hot_path, 'w').write('\n'.join(hot))
-    print(f'{mod}: {n} samples, {len(hot)} of {len(ranges)} files hold {100 * got / n:.0f}% of them: those get -O2 ({hot_path})')
+    print(f'{mod}: {n} samples, {len(hot)} of {len(per)} sampled files hold {100 * got / n:.0f}% of them: those get -O2 ({hot_path})')
 
 
 def main():
@@ -129,13 +136,11 @@ def main():
         dll = os.path.join(out, f'totk_{mod}.dll')
         stamp = hashlib.sha256('\n'.join(obj[f] for f in srcs).encode()).hexdigest()
         linked = 'skipped (unchanged)'
-        if not (os.path.exists(dll) and os.path.exists(dll + '.stamp') and open(dll + '.stamp').read() == stamp and os.path.exists(dll + '.map')):
+        if not (os.path.exists(dll) and os.path.exists(dll + '.stamp') and open(dll + '.stamp').read() == stamp):
             rsp = os.path.join(d, 'objs.rsp')
             open(rsp, 'w').write('\n'.join(obj[f].replace('\\', '/') for f in srcs))
-            # the map says which object (and so which C file, dll.files) each address came from: for --hot
-            r = subprocess.run(['gcc', '-shared', '-s', '-Wl,-Map=' + dll + '.map', '-o', dll, '@' + rsp], capture_output=True, text=True)
+            r = subprocess.run(['gcc', '-shared', '-s', '-o', dll, '@' + rsp], capture_output=True, text=True)
             if r.returncode: sys.exit(f'link failed for {mod}: {r.stderr[:2000]}')
-            open(dll + '.files', 'w').write('\n'.join(f'{os.path.basename(obj[f])} {f}' for f in srcs))
             open(dll + '.stamp', 'w').write(stamp)
             linked = f'{time.time() - t2:.0f} s'
         used = {os.path.basename(obj[f]) for f in srcs}   # each flag set's cache keeps only what this build uses

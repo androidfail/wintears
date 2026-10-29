@@ -6,6 +6,7 @@
 //
 // Modules are placed where src/app/main.c maps them (from 0x300000000, main, subsdk0, sdk, 2 MiB aligned), because
 // the IR holds absolute addresses; the runtime checks the bases before using translated code.
+#include <functional>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -234,6 +235,33 @@ void successors(const IR::Terminal &term, std::vector<uint64_t> &out) {
     boost::apply_visitor(v, term);
 }
 
+// NZCV liveness. A block that sets all four flags before reading any never sees the ones it was entered with; a block
+// whose every exit is a direct jump to such a block can keep its flags in a local (no store, and gcc drops the packing).
+bool writes_flags_first(const IR::Block &b) {
+    for (auto &in : b) {
+        if (in.ReadsFromCPSR()) return false;
+        if (in.WritesToCPSR()) return true;   // A64SetNZCV / A64SetNZCVRaw: all four flags
+    }
+    return false;   // read by the terminal (If) or left as they are
+}
+struct DirectExits : boost::static_visitor<bool> {   // every exit a direct jump?
+    bool operator()(const IR::Term::LinkBlock &) const { return true; }
+    bool operator()(const IR::Term::LinkBlockFast &) const { return true; }
+    bool operator()(const IR::Term::If &t) const { return boost::apply_visitor(*this, t.then_) && boost::apply_visitor(*this, t.else_); }
+    bool operator()(const IR::Term::CheckBit &t) const { return boost::apply_visitor(*this, t.then_) && boost::apply_visitor(*this, t.else_); }
+    template <class T> bool operator()(const T &) const { return false; }
+};
+bool flags_dead_at_exit(const IR::Block &b, const std::function<bool(uint64_t)> &writes_first) {
+    for (auto &in : b)   // a block that may stop in the middle (svc, exception) leaves its flags to the runtime
+        if (in.GetOpcode() == IR::Opcode::A64CallSupervisor || in.GetOpcode() == IR::Opcode::A64ExceptionRaised) return false;
+    DirectExits k;
+    if (!boost::apply_visitor(k, b.GetTerminal())) return false;
+    std::vector<uint64_t> next;
+    successors(b.GetTerminal(), next);
+    for (uint64_t n : next) if (!writes_first(n)) return false;
+    return !next.empty();
+}
+
 IR::Block translate(const Program &p, uint64_t pc, const A64::UserConfig &uc) {
     auto get = [&](uint64_t va) { return p.code(va); };
     IR::Block b = A64::Translate(A64::LocationDescriptor{pc, FP::FPCR{0}}, get, {uc.define_unpredictable_behaviour, uc.wall_clock_cntpct});
@@ -305,6 +333,7 @@ const char *ctype(IR::Type t) {
 struct Emitter {
     std::map<const IR::Inst *, int> id;
     const std::unordered_set<uint64_t> *linkable = nullptr;   // blocks this DLL defines: direct jumps chain to them
+    bool flags_local = false;   // set per block: keep NZCV in a local, it is dead at every exit
     std::string body, why;   // why: the first opcode not supported
     char buf[512];
 
@@ -548,7 +577,8 @@ struct Emitter {
             void link(const IR::LocationDescriptor &l) {   // chain: a tail call to the next block unless a halt is asked for
                 uint64_t to = A64::LocationDescriptor{l}.PC();
                 if (!e.linkable || !e.linkable->count(to)) { pc(l); return; }
-                snprintf(e.buf, sizeof e.buf, "%sc->pc = 0x%llxull; if (*c->halt_request) return; { extern void B_%llx(wt_ctx *); __attribute__((musttail)) return B_%llx(c); }\n",
+                // c->pc is only read once a block returns (jit.cpp), so a chained block leaves it for the next one to set
+                snprintf(e.buf, sizeof e.buf, "%sif (*c->halt_request) { c->pc = 0x%llxull; return; } { extern void B_%llx(wt_ctx *); __attribute__((musttail)) return B_%llx(c); }\n",
                          ind.c_str(), (unsigned long long)to, (unsigned long long)to, (unsigned long long)to);
                 e.body += e.buf;
             }
@@ -581,7 +611,12 @@ struct Emitter {
         }
         term(b.GetTerminal(), 1);
         snprintf(buf, sizeof buf, "void B_%llx(wt_ctx *c) {\n", (unsigned long long)pc);
-        out += buf; out += body; out += "}\n";
+        out += buf;
+        if (flags_local) {   // no successor reads the flags this block leaves (flags_dead_at_exit)
+            for (size_t i = 0; (i = body.find("c->nzcv", i)) != std::string::npos; i += 3) body.replace(i, 7, "nz_");
+            out += "    uint32_t nz_ = c->nzcv;\n";
+        }
+        out += body; out += "}\n";
         return true;
     }
 };
@@ -635,12 +670,13 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     // pass 1: every reachable block; pass 2: emit them in address order, one file per 2^per_file bytes of guest code.
     // Files are named by address and only change when their blocks do, so build_native.py's object cache can reuse the
     // compiled ones across rebuilds.
-    std::unordered_set<uint64_t> seen;
+    std::unordered_set<uint64_t> seen, wfirst;   // wfirst: blocks that set NZCV before reading it
     std::vector<uint64_t> next;
     while (!work.empty()) {
         uint64_t pc = work.back(); work.pop_back();
         if (!in_scope(pc) || !seen.insert(pc).second) continue;
         IR::Block b = translate(p, pc, uc);
+        if (writes_flags_first(b)) wfirst.insert(pc);
         for (auto &inst : b)
             if (inst.GetOpcode() == IR::Opcode::PushRSB) work.push_back(A64::LocationDescriptor{IR::LocationDescriptor{inst.GetArg(0).GetU64()}}.PC());
         next.clear(); successors(b.GetTerminal(), next);
@@ -654,7 +690,7 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     em.linkable = &seen;
     std::string cur;
     size_t files = 0;
-    uint64_t total = all.size(), chunk = ~0ull;
+    uint64_t total = all.size(), chunk = ~0ull, n_local = 0;
     auto flush = [&]() {
         if (cur.empty()) return;
         char name[64]; snprintf(name, sizeof name, "/blocks_%llx.c", (unsigned long long)chunk);
@@ -665,6 +701,8 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     for (uint64_t pc : all) {
         if (pc >> per_file != chunk) { flush(); chunk = pc >> per_file; }
         IR::Block b = translate(p, pc, uc);
+        em.flags_local = flags_dead_at_exit(b, [&](uint64_t n) { return wfirst.count(n) != 0; });
+        n_local += em.flags_local;
         if (!em.block(b, pc, cur)) {   // left to dynarmic: a stub that hands the pc back, for blocks that chain to it
             missing[em.why]++;
             snprintf(em.buf, sizeof em.buf, "void B_%llx(wt_ctx *c) { c->pc = 0x%llxull; }\n", (unsigned long long)pc, (unsigned long long)pc);
@@ -684,7 +722,8 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     for (uint64_t pc : done) fprintf(f, "    {0x%llxull, B_%llx},\n", (unsigned long long)pc, (unsigned long long)pc);
     fputs("};\n", f);
     fclose(f);
-    printf("%llu blocks, %zu emitted (%.1f%%) in %zu files\n", (unsigned long long)total, done.size(), 100.0 * done.size() / total, files);
+    printf("%llu blocks, %zu emitted (%.1f%%) in %zu files; flags kept local in %llu\n", (unsigned long long)total, done.size(),
+           100.0 * done.size() / total, files, (unsigned long long)n_local);
     std::vector<std::pair<uint64_t, std::string>> v;
     for (auto &[k, n] : missing) v.emplace_back(n, k);
     std::sort(v.rbegin(), v.rend());
@@ -831,7 +870,8 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
         for (int i = 0; i < 31; i++) if (regs2[i] != n.x[i]) { diff += " x" + std::to_string(i); }
         if (j.GetSP() != n.sp) diff += " sp";
         if (j.GetPC() != n.pc && n.halt != WT_HALT_EXCEPTION && cb.exc == -1) diff += " pc";
-        if ((j.GetPstate() & 0xF0000000u) != n.nzcv) diff += " nzcv";
+        auto wf = [&](uint64_t x) { return p.code(x) && writes_flags_first(translate(p, x, tc)); };
+        if ((j.GetPstate() & 0xF0000000u) != n.nzcv && !flags_dead_at_exit(translate(p, e.pc, tc), wf)) diff += " nzcv";   // dead flags are left as they were
         auto vec2 = j.GetVectors();
         for (int i = 0; i < 32; i++) {
             uint64_t a[2] = {vec2[i][0], vec2[i][1]}, b[2] = {n.v[i].lo, n.v[i].hi};
