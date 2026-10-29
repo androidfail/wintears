@@ -115,7 +115,8 @@ static int boot(const char *root, int trace) {
             uint64_t b[3];
             for (unsigned i = 0; i < 3; i++) b[i] = ldr_module_at(mods, i)->base;
             char dir[1100], nerr[256];
-            snprintf(dir, sizeof dir, "%s/native", root);
+            const char *nd = pal_getenv("TOTK_NATIVE_DIR");   /* another folder of DLLs (made for the same dump) */
+            if (nd && *nd) snprintf(dir, sizeof dir, "%s", nd); else snprintf(dir, sizeof dir, "%s/native", root);
             size_t n = jit_native_load(dir, b, nerr, sizeof nerr);
             if (n || nerr[0]) LOG("Direct Native: %zu recompiled blocks from %s%s%s", n, dir, nerr[0] ? "; " : "", nerr);
             else LOG("Direct Native: off, no recompiled blocks in %s (tools/recomp/build_native.py makes them); game code runs in the JIT", dir);

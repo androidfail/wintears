@@ -1,13 +1,21 @@
 #include "jit/jit.h"
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 
+/* WT_NATIVE_ONLY (cmake -DWINTEARS_NATIVE_ONLY=ON): Direct Native without dynarmic. Every block must come from the
+   recompiled DLLs; a block missing from them stops the game with its address (to add to native/misses.txt). */
+#ifndef WT_NATIVE_ONLY
+#define WT_DYNARMIC 1
 #include <dynarmic/interface/A64/a64.h>
 #include <dynarmic/interface/A64/config.h>
 #include <dynarmic/interface/exclusive_monitor.h>
 #include "dynarmic/common/memory_pool.h"
+#else
+#define WT_DYNARMIC 0
+#endif
 
 #include <cstdlib>
 #include <mutex>
@@ -22,11 +30,10 @@
 #include <xmmintrin.h>
 #include <unordered_map>
 
-using Dynarmic::A64::Vector;
-
 /* Direct Native, hybrid mode: blocks recompiled ahead of time (tools/recomp/wt_recomp, DLLs under <game>/native) run
    from a table; a block missing from it runs in dynarmic, one block at a time (cycle counting with a budget of one
-   instruction makes Run return after a single block). */
+   instruction makes Run return after a single block). A core's dynarmic is made at its first missed block, so a run
+   with full coverage never allocates the JIT's code caches. */
 namespace {
 struct NativeTable {
     std::vector<uint64_t> keys;
@@ -43,7 +50,11 @@ inline wt_block_fn nat_find(uint64_t pc) {
         if (!k) return nullptr;
     }
 }
+std::atomic<uint64_t> g_pools{0}, g_slabs_new{0}, g_compile_ns{0};
 }  // namespace
+
+#if WT_DYNARMIC
+using Dynarmic::A64::Vector;
 using VAddr = Dynarmic::A64::VAddr;
 
 /* Dynarmic's IR instruction pool, replaced at link time (this file always links before libdynarmic, so its
@@ -54,7 +65,6 @@ using VAddr = Dynarmic::A64::VAddr;
 namespace {
 std::mutex g_slab_mu;
 std::vector<std::pair<size_t, char *>> g_slab_spare;
-std::atomic<uint64_t> g_pools{0}, g_slabs_new{0}, g_compile_ns{0};
 thread_local uint64_t t_compile_t0;   /* one pool per compiled block, alive from translation to emitted code */
 char *slab_take(size_t bytes) {
     {
@@ -129,28 +139,42 @@ bool cas(VAddr a, T value, T expected) {
                                        __ATOMIC_SEQ_CST);
 }
 
+}  // namespace
+#else
+struct jit_monitor {};   /* recompiled exclusives keep their monitor in wt_ctx */
+#endif
+
+namespace {
 uint64_t default_cntpct(void *) {
     /* 19.2 MHz = ns * 12 / 625; split to avoid overflow */
     uint64_t ns = pal_now_ns();
     return ns / 625 * 12 + ns % 625 * 12 / 625;
 }
-
 }  // namespace
 
-struct jit_core final : Dynarmic::A64::UserCallbacks {
+struct jit_dyn;
+struct jit_core {
     jit_config cfg{};
     jit_monitor *monitor = nullptr;
+    size_t core_id = 0;
     uint64_t tpidr_el0 = 0, tpidrro_el0 = 0;
     uint32_t svc = 0;
     int exc_kind = 0;
     uint64_t exc_pc = 0;
-    std::unique_ptr<Dynarmic::A64::Jit> jit;
     bool hybrid = false;         /* recompiled blocks loaded: the guest state lives in nc, dynarmic gets it per missed block */
     wt_ctx nc{};
     volatile int halt_req = 0;
     uint64_t n_native = 0, n_missed = 0, n_fpcr = 0, last_fpcr = 0;   /* blocks run (read racily for the log) */
-    std::unordered_map<uint64_t, uint64_t> *misses = nullptr;
-    struct { uint64_t pc; wt_block_fn fn; } lc[8192] = {};   /* recent pc -> block (128 KiB) */   /* TOTK_NATIVE_MISSES: missed pc -> count */
+    std::unordered_map<uint64_t, uint64_t> *misses = nullptr;   /* TOTK_NATIVE_MISSES: missed pc -> count */
+    struct { uint64_t pc; wt_block_fn fn; } lc[8192] = {};   /* recent pc -> block (128 KiB) */
+    std::atomic<jit_dyn *> dyn{nullptr};   /* made on first use (hybrid: the first missed block) */
+    ~jit_core();
+};
+
+#if WT_DYNARMIC
+struct jit_dyn final : Dynarmic::A64::UserCallbacks {
+    jit_core *c;
+    std::unique_ptr<Dynarmic::A64::Jit> jit;
 
     std::uint8_t MemoryRead8(VAddr a) override { return load<uint8_t>(a); }
     std::uint16_t MemoryRead16(VAddr a) override { return load<uint16_t>(a); }
@@ -174,7 +198,7 @@ struct jit_core final : Dynarmic::A64::UserCallbacks {
 
     void InterpreterFallback(VAddr pc, size_t) override { stop_exception(pc, JIT_EXC_UNDEFINED); }
     void CallSVC(std::uint32_t imm) override {
-        svc = imm;
+        c->svc = imm;
         jit->HaltExecution(kHaltSvc);
     }
     void ExceptionRaised(VAddr pc, Dynarmic::A64::Exception e) override {
@@ -190,46 +214,31 @@ struct jit_core final : Dynarmic::A64::UserCallbacks {
         }
     }
     void AddTicks(std::uint64_t) override {}
-    std::uint64_t GetTicksRemaining() override { return hybrid ? 1 : 0; }   /* hybrid: one block per Run */
-    std::uint64_t GetCNTPCT() override { return cfg.cntpct(cfg.user); }
+    std::uint64_t GetTicksRemaining() override { return c->hybrid ? 1 : 0; }   /* hybrid: one block per Run */
+    std::uint64_t GetCNTPCT() override { return c->cfg.cntpct(c->cfg.user); }
 
     void stop_exception(VAddr pc, int kind) {
-        exc_pc = pc;
-        exc_kind = kind;
+        c->exc_pc = pc;
+        c->exc_kind = kind;
         jit->HaltExecution(kHaltException);
     }
 };
 
-extern "C" {
-
-jit_monitor *jit_monitor_create(size_t cores) { return new jit_monitor(cores); }
-void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs) { *blocks = g_pools.load(); *new_slabs = g_slabs_new.load(); }
-uint64_t jit_compile_ns(void) { return g_compile_ns.load(); }
-void jit_monitor_destroy(jit_monitor *m) { delete m; }
-
-jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id) {
-    auto *c = new jit_core;
-    if (cfg) c->cfg = *cfg;
-    if (!c->cfg.cntpct) c->cfg.cntpct = default_cntpct;
-    c->monitor = m;
-
+/* The core's dynarmic, made by the thread that runs the core (jit_halt from other threads only reads the pointer). */
+static Dynarmic::A64::Jit &J(jit_core *c) {
+    if (jit_dyn *d = c->dyn.load(std::memory_order_acquire)) return *d->jit;
+    auto *d = new jit_dyn;
+    d->c = c;
     Dynarmic::A64::UserConfig uc;
-    uc.callbacks = c;
-    uc.processor_id = core_id;
-    uc.global_monitor = m ? &m->m : nullptr;
+    uc.callbacks = d;
+    uc.processor_id = c->core_id;
+    uc.global_monitor = c->monitor ? &c->monitor->m : nullptr;
     uc.tpidr_el0 = &c->tpidr_el0;
     uc.tpidrro_el0 = &c->tpidrro_el0;
     uc.cntfrq_el0 = 19200000;          /* Switch counter frequency */
     uc.dczid_el0 = 4;                  /* DC ZVA zeroes 64 bytes, as on the Switch's Cortex-A57 */
     uc.ctr_el0 = 0x8444c004;
-    c->hybrid = g_nat.n != 0;
     uc.enable_cycle_counting = c->hybrid;  /* JIT only: runs until halted (preemption uses jit_halt) */
-    c->nc.halt_request = &c->halt_req;
-    c->nc.lc = reinterpret_cast<const wt_lce *>(c->lc); c->nc.lc_mask = sizeof c->lc / sizeof c->lc[0] - 1; c->nc.disp_fpcr = ~0u;
-    static_assert(sizeof c->lc[0] == sizeof(wt_lce), "the cache entry generated code reads");
-    c->nc.cntpct = c->cfg.cntpct;
-    c->nc.cntpct_user = c->cfg.user;
-    if (c->hybrid && pal_getenv("TOTK_NATIVE_MISSES")) c->misses = new std::unordered_map<uint64_t, uint64_t>;
     /* Architecturally unpredictable forms run as the hardware does them instead of stopping: TOTK main+0x12497b8 has
        "stlxr wzr, xzr, [x8]" (status register = data register), executed as the store with the status discarded. */
     uc.define_unpredictable_behaviour = true;
@@ -238,7 +247,7 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
         uc.unsafe_optimizations = true;
         uc.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN;
     }
-    if (!cfg || cfg->fastmem) {
+    if (c->cfg.fastmem) {
         uc.fastmem_pointer = uintptr_t{0};     /* identity mapping: host address == guest address */
         uc.fastmem_address_space_bits = 39;
         uc.silently_mirror_fastmem = false;
@@ -246,26 +255,68 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
         uc.fastmem_exclusive_access = true;
         uc.recompile_on_exclusive_fastmem_failure = true;
     }
-    c->jit = std::make_unique<Dynarmic::A64::Jit>(uc);
+    d->jit = std::make_unique<Dynarmic::A64::Jit>(uc);
+    if (c->hybrid) fprintf(stderr, "[wintears] Direct Native: core %zu made its JIT for the block at %#llx\n", c->core_id,
+                           (unsigned long long)c->nc.pc);
+    c->dyn.store(d, std::memory_order_release);
+    return *d->jit;
+}
+jit_core::~jit_core() { delete dyn.load(); delete misses; }
+#else
+jit_core::~jit_core() { delete misses; }
+#endif
+
+extern "C" {
+
+jit_monitor *jit_monitor_create(size_t cores) {
+#if WT_DYNARMIC
+    return new jit_monitor(cores);
+#else
+    (void)cores; return new jit_monitor;
+#endif
+}
+void jit_compile_stats(uint64_t *blocks, uint64_t *new_slabs) { *blocks = g_pools.load(); *new_slabs = g_slabs_new.load(); }
+uint64_t jit_compile_ns(void) { return g_compile_ns.load(); }
+void jit_monitor_destroy(jit_monitor *m) { delete m; }
+
+jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id) {
+    auto *c = new jit_core;
+    if (cfg) c->cfg = *cfg;
+    else c->cfg.fastmem = 1;
+    if (!c->cfg.cntpct) c->cfg.cntpct = default_cntpct;
+    c->monitor = m;
+    c->core_id = core_id;
+    c->hybrid = g_nat.n != 0;
+    c->nc.halt_request = &c->halt_req;
+    c->nc.lc = reinterpret_cast<const wt_lce *>(c->lc); c->nc.lc_mask = sizeof c->lc / sizeof c->lc[0] - 1; c->nc.disp_fpcr = ~0u;
+    static_assert(sizeof c->lc[0] == sizeof(wt_lce), "the cache entry generated code reads");
+    c->nc.cntpct = c->cfg.cntpct;
+    c->nc.cntpct_user = c->cfg.user;
+    if (c->hybrid && pal_getenv("TOTK_NATIVE_MISSES")) c->misses = new std::unordered_map<uint64_t, uint64_t>;
+#if WT_DYNARMIC
+    if (!c->hybrid) J(c);   /* JIT only: needed at once, and jit_halt must find it */
+#endif
     return c;
 }
 
 void jit_core_destroy(jit_core *c) { delete c; }
 
+#if WT_DYNARMIC
 static void to_jit(jit_core *c) {   /* hybrid: the state of nc into dynarmic for one block */
-    auto &j = *c->jit; const wt_ctx &n = c->nc;
+    auto &j = J(c); const wt_ctx &n = c->nc;
     std::array<uint64_t, 31> r; memcpy(r.data(), n.x, sizeof r); j.SetRegisters(r);
     std::array<Vector, 32> v; for (size_t i = 0; i < 32; i++) v[i] = Vector{n.v[i].lo, n.v[i].hi}; j.SetVectors(v);
     j.SetSP(n.sp); j.SetPC(n.pc); j.SetFpcr(n.fpcr); j.SetFpsr(n.fpsr); j.SetPstate(n.nzcv);
     c->tpidr_el0 = n.tpidr; c->tpidrro_el0 = n.tpidrro;
 }
 static void from_jit(jit_core *c) {
-    auto &j = *c->jit; wt_ctx &n = c->nc;
+    auto &j = J(c); wt_ctx &n = c->nc;
     auto r = j.GetRegisters(); memcpy(n.x, r.data(), sizeof n.x);
     auto v = j.GetVectors(); for (size_t i = 0; i < 32; i++) n.v[i] = wt_v128{v[i][0], v[i][1]};
     n.sp = j.GetSP(); n.pc = j.GetPC(); n.fpcr = j.GetFpcr(); n.fpsr = j.GetFpsr(); n.nzcv = j.GetPstate() & 0xF0000000u;
     n.tpidr = c->tpidr_el0;
 }
+#endif
 
 void jit_load(jit_core *c, const jit_context *ctx) {
     if (c->hybrid) {
@@ -275,10 +326,13 @@ void jit_load(jit_core *c, const jit_context *ctx) {
         n.fpcr = ctx->fpcr; n.fpsr = ctx->fpsr; n.nzcv = ctx->pstate & 0xF0000000u;
         n.tpidr = ctx->tpidr_el0; n.tpidrro = ctx->tpidrro_el0; n.excl_valid = 0;
         c->tpidr_el0 = ctx->tpidr_el0; c->tpidrro_el0 = ctx->tpidrro_el0;
-        c->jit->ClearExclusiveState();
+#if WT_DYNARMIC
+        if (jit_dyn *d = c->dyn.load(std::memory_order_relaxed)) d->jit->ClearExclusiveState();
+#endif
         return;
     }
-    auto &j = *c->jit;
+#if WT_DYNARMIC
+    auto &j = J(c);
     for (size_t i = 0; i < 31; i++) j.SetRegister(i, ctx->x[i]);
     j.SetSP(ctx->sp);
     j.SetPC(ctx->pc);
@@ -289,6 +343,9 @@ void jit_load(jit_core *c, const jit_context *ctx) {
     c->tpidr_el0 = ctx->tpidr_el0;
     c->tpidrro_el0 = ctx->tpidrro_el0;
     j.ClearExclusiveState();
+#else
+    c->nc.pc = ctx->pc;   /* no recompiled blocks: jit_run reports the miss */
+#endif
 }
 
 void jit_save(jit_core *c, jit_context *ctx) {
@@ -300,7 +357,8 @@ void jit_save(jit_core *c, jit_context *ctx) {
         ctx->tpidr_el0 = n.tpidr; ctx->tpidrro_el0 = n.tpidrro;
         return;
     }
-    auto &j = *c->jit;
+#if WT_DYNARMIC
+    auto &j = J(c);
     for (size_t i = 0; i < 31; i++) ctx->x[i] = j.GetRegister(i);
     ctx->sp = j.GetSP();
     ctx->pc = j.GetPC();
@@ -310,45 +368,78 @@ void jit_save(jit_core *c, jit_context *ctx) {
     ctx->pstate = j.GetPstate();
     ctx->tpidr_el0 = c->tpidr_el0;
     ctx->tpidrro_el0 = c->tpidrro_el0;
+#endif
 }
 
+#if WT_DYNARMIC
 static int stop_of(jit_core *c, Dynarmic::HaltReason r) {
     using HR = Dynarmic::HaltReason;
     auto has = [&](HR x) { return (static_cast<uint32_t>(r) & static_cast<uint32_t>(x)) != 0; };
     int stop = has(kHaltException) ? JIT_STOP_EXCEPTION : has(kHaltSvc) ? JIT_STOP_SVC
              : has(kHaltExternal) ? JIT_STOP_HALT : JIT_STOP_STEP;
-    c->jit->ClearHalt(kHaltSvc);
-    c->jit->ClearHalt(kHaltException);
-    c->jit->ClearHalt(kHaltExternal);
+    auto &j = J(c);
+    j.ClearHalt(kHaltSvc);
+    j.ClearHalt(kHaltException);
+    j.ClearHalt(kHaltExternal);
     return stop;
 }
+#endif
 
-static int exc_kind_of(uint32_t e) {   /* dynarmic A64::Exception to jit_exception_kind, as ExceptionRaised */
-    using E = Dynarmic::A64::Exception;
-    switch (static_cast<E>(e)) {
-    case E::WaitForInterrupt: case E::WaitForEvent: return JIT_EXC_WAIT;
-    case E::Breakpoint: return JIT_EXC_BREAKPOINT;
-    case E::NoExecuteFault: return JIT_EXC_NO_EXECUTE;
-    case E::UnallocatedEncoding: case E::ReservedValue: case E::UnpredictableInstruction: return JIT_EXC_UNDEFINED;
+static int exc_kind_of(uint32_t e) {   /* dynarmic A64::Exception numbers (as wt_native.h raises them) to jit_exception_kind */
+    switch (e) {
+    case 0: case 1: case 2: return JIT_EXC_UNDEFINED;    /* UnallocatedEncoding, ReservedValue, UnpredictableInstruction */
+    case 3: case 4: return JIT_EXC_WAIT;                 /* WaitForInterrupt, WaitForEvent */
+    case 8: return JIT_EXC_BREAKPOINT;
+    case 9: return JIT_EXC_NO_EXECUTE;
     default: return JIT_EXC_OTHER;
     }
+}
+#if WT_DYNARMIC
+static_assert(static_cast<uint32_t>(Dynarmic::A64::Exception::UnallocatedEncoding) == 0 &&
+              static_cast<uint32_t>(Dynarmic::A64::Exception::ReservedValue) == 1 &&
+              static_cast<uint32_t>(Dynarmic::A64::Exception::UnpredictableInstruction) == 2 &&
+              static_cast<uint32_t>(Dynarmic::A64::Exception::WaitForInterrupt) == 3 &&
+              static_cast<uint32_t>(Dynarmic::A64::Exception::WaitForEvent) == 4 &&
+              static_cast<uint32_t>(Dynarmic::A64::Exception::Breakpoint) == 8 &&
+              static_cast<uint32_t>(Dynarmic::A64::Exception::NoExecuteFault) == 9,
+              "exc_kind_of's numbers");
+#endif
+
+/* FPCR to MXCSR for the recompiled blocks: FZ (24) -> FTZ + DAZ; native-only builds also take the rounding mode
+   (FPCR RMode 23:22 = nearest, +inf, -inf, zero; MXCSR RC 14:13 = nearest, -inf, +inf, zero). */
+static unsigned mxcsr_of(unsigned host, uint32_t fpcr) {
+    unsigned m = (host & ~0x8040u) | (fpcr & 0x01000000u ? 0x8040u : 0);
+#if !WT_DYNARMIC
+    static const unsigned rc[4] = {0, 2, 1, 3};
+    m = (m & ~0x6000u) | rc[fpcr >> 22 & 3] << 13;
+#endif
+    return m;
 }
 
 /* per-core cache markers for the host's stubs (never real block addresses) */
 static const wt_block_fn kStubSvc = reinterpret_cast<wt_block_fn>(uintptr_t{1}), kStubRet = reinterpret_cast<wt_block_fn>(uintptr_t{2});
 int jit_run(jit_core *c) {
-    if (!c->hybrid) return stop_of(c, c->jit->Run());
-    wt_ctx &n = c->nc;
+#if WT_DYNARMIC
+    if (!c->hybrid) return stop_of(c, J(c).Run());
     const auto stops = kHaltSvc | kHaltException | kHaltExternal;
+#endif
+    wt_ctx &n = c->nc;
     /* Recompiled blocks are the same for every FPCR whose only bits are FZ (24) and DN (25): flush-to-zero is
        MXCSR FTZ + DAZ while they run (TOTK's threads run with FZ), NaNs are not bit-exact anyway. Other bits
-       (rounding modes, trap enables) go to dynarmic. The host's MXCSR is restored before returning. */
+       (rounding modes, trap enables) go to dynarmic, or with no dynarmic become the MXCSR rounding mode. The host's
+       MXCSR is restored before returning. */
     const unsigned host_mxcsr = _mm_getcsr();
     unsigned mx_fpcr = ~0u;
     int stop;
     for (;;) {
-        if (c->halt_req) { c->halt_req = 0; c->jit->ClearHalt(kHaltExternal); stop = JIT_STOP_HALT; break; }
-        bool ok_fpcr = (n.fpcr & ~0x03000000u) == 0;
+        if (c->halt_req) {
+            c->halt_req = 0;
+#if WT_DYNARMIC
+            if (jit_dyn *d = c->dyn.load(std::memory_order_relaxed)) d->jit->ClearHalt(kHaltExternal);
+#endif
+            stop = JIT_STOP_HALT; break;
+        }
+        bool ok_fpcr = !WT_DYNARMIC || (n.fpcr & ~0x03000000u) == 0;
         wt_block_fn f = nullptr;
         if (ok_fpcr) {   /* a small per-core cache in front of the big table (megabytes: a cache miss each time) */
             auto &e = c->lc[(n.pc >> 2) & (sizeof c->lc / sizeof c->lc[0] - 1)];
@@ -363,10 +454,10 @@ int jit_run(jit_core *c) {
             if (f == kStubSvc) { uint32_t w; memcpy(&w, reinterpret_cast<const void *>(n.pc), 4); c->svc = w >> 5 & 0xFFFF; n.pc += 4; stop = JIT_STOP_SVC; break; }
             if (f == kStubRet) { n.pc = n.x[30]; continue; }
         }
-        if (!ok_fpcr) { c->n_fpcr++; c->last_fpcr = n.fpcr; }   /* counted: FPCR the blocks cannot take */
+        if (!ok_fpcr || (n.fpcr & ~0x03000000u)) { c->n_fpcr++; c->last_fpcr = n.fpcr; }   /* counted: FPCR other than FZ / DN */
         if (f) {
             c->n_native++;
-            if (n.fpcr != mx_fpcr) { mx_fpcr = n.fpcr; _mm_setcsr((host_mxcsr & ~0x8040u) | (n.fpcr & 0x01000000u ? 0x8040u : 0)); }
+            if (n.fpcr != mx_fpcr) { mx_fpcr = n.fpcr; _mm_setcsr(mxcsr_of(host_mxcsr, n.fpcr)); }
             n.disp_fpcr = mx_fpcr;   /* blocks may dispatch on by themselves while FPCR stays this (WT_DISPATCH) */
             n.halt = WT_RUN;
             f(&n);
@@ -383,20 +474,38 @@ int jit_run(jit_core *c) {
         }
         c->n_missed++;
         if (c->misses) (*c->misses)[n.pc]++;
+#if WT_DYNARMIC
         to_jit(c);
-        Dynarmic::HaltReason r = c->jit->Run();   /* dynarmic sets its own MXCSR and puts back the one it found */
+        Dynarmic::HaltReason r = J(c).Run();   /* dynarmic sets its own MXCSR and puts back the one it found */
         from_jit(c);
         if ((r & stops) != Dynarmic::HaltReason{}) { stop = stop_of(c, r); if (stop == JIT_STOP_HALT) c->halt_req = 0; break; }
+#else
+        fprintf(stderr, "[wintears] Direct Native (no JIT): no recompiled block at %#llx%s. Add the line \"%llx 1\" to "
+                "native/misses.txt and run tools/recomp/build_native.py again.\n", (unsigned long long)n.pc,
+                g_nat.n ? "" : " (no recompiled-code DLLs loaded)", (unsigned long long)n.pc);
+        c->exc_pc = n.pc; c->exc_kind = JIT_EXC_NO_EXECUTE; stop = JIT_STOP_EXCEPTION;
+        break;
+#endif
     }
     _mm_setcsr(host_mxcsr);
     n.disp_fpcr = ~0u;   /* MXCSR is the host's again */
     return stop;
 }
 int jit_step(jit_core *c) {
-    if (!c->hybrid) return stop_of(c, c->jit->Step());
-    to_jit(c); int s = stop_of(c, c->jit->Step()); from_jit(c); return s;
+#if WT_DYNARMIC
+    if (!c->hybrid) return stop_of(c, J(c).Step());
+    to_jit(c); int s = stop_of(c, J(c).Step()); from_jit(c); return s;
+#else
+    c->exc_pc = c->nc.pc; c->exc_kind = JIT_EXC_OTHER;   /* single steps need the JIT */
+    return JIT_STOP_EXCEPTION;
+#endif
 }
-void jit_halt(jit_core *c) { c->halt_req = 1; c->jit->HaltExecution(kHaltExternal); }
+void jit_halt(jit_core *c) {
+    c->halt_req = 1;
+#if WT_DYNARMIC
+    if (jit_dyn *d = c->dyn.load(std::memory_order_acquire)) d->jit->HaltExecution(kHaltExternal);
+#endif
+}
 void jit_native_misses(jit_core *const *cores, size_t n, const char *path) {
     std::unordered_map<uint64_t, uint64_t> all;   /* read racily: a diagnostic */
     for (size_t i = 0; i < n; i++) if (cores[i]->misses) for (auto &[pc, k] : *cores[i]->misses) all[pc] += k;
@@ -447,9 +556,17 @@ int jit_exception(jit_core *c, uint64_t *pc) {
     return c->exc_kind;
 }
 void jit_invalidate(jit_core *c, uint64_t addr, size_t size) {
-    c->jit->InvalidateCacheRange(addr, size);
+#if WT_DYNARMIC
+    if (jit_dyn *d = c->dyn.load(std::memory_order_relaxed)) d->jit->InvalidateCacheRange(addr, size);
+#endif
     for (auto &e : c->lc) if (e.pc >= addr && e.pc - addr < size) e = {};   /* stubs and blocks remembered there */
 }
-void jit_clear_cache(jit_core *c) { c->jit->ClearCache(); }
+void jit_clear_cache(jit_core *c) {
+#if WT_DYNARMIC
+    if (jit_dyn *d = c->dyn.load(std::memory_order_relaxed)) d->jit->ClearCache();
+#else
+    (void)c;
+#endif
+}
 
 }  // extern "C"
