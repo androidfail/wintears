@@ -8,7 +8,9 @@
    - *_UI2F / *_I2F (integer storage read as float) are the USCALED / SSCALED formats.
    - 16-bit packed formats follow upstream's component order, read as least significant bits first; like upstream,
      not checked against real game data.
-   - ASTC: the ASTC format when the GPU samples it, else decoded on upload (convert = 3, vk_tex.c). */
+   - ASTC: the ASTC format when the GPU samples it, else decoded on upload (convert = 3, vk_tex.c), and on GPUs that
+     share system RAM or have little of their own also encoded as BC3 (convert = 5: a quarter of RGBA8's memory and
+     bandwidth; TOTK_ASTC_BC3=0/1). */
 #include "gfx/vk/vk.h"
 
 #define R VK_COMPONENT_SWIZZLE_R
@@ -66,7 +68,7 @@ static const VkFormat ASTC[14] = {VK_FORMAT_ASTC_4x4_UNORM_BLOCK, VK_FORMAT_ASTC
     VK_FORMAT_ASTC_8x8_UNORM_BLOCK, VK_FORMAT_ASTC_10x5_UNORM_BLOCK, VK_FORMAT_ASTC_10x6_UNORM_BLOCK, VK_FORMAT_ASTC_10x8_UNORM_BLOCK,
     VK_FORMAT_ASTC_10x10_UNORM_BLOCK, VK_FORMAT_ASTC_12x10_UNORM_BLOCK, VK_FORMAT_ASTC_12x12_UNORM_BLOCK};
 
-static int astc_sampled = -1;
+static int astc_sampled = -1, astc_bc3 = -1;
 int vk_fmt_of(int f, vk_fmt *out) {
     ent e = {0};
     if (f >= 0x79 && f <= 0x94) {
@@ -76,7 +78,12 @@ int vk_fmt_of(int f, vk_fmt *out) {
             astc_sampled = (p.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
         }
         if (astc_sampled) e = (ent){(VkFormat)(ASTC[k] + srgb), 0, 0, 0, 0, 0};   /* each _SRGB_BLOCK follows its _UNORM_BLOCK */
-        else e = (ent){srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 3, 0, 0};
+        else {
+            if (astc_bc3 < 0) { const char *v = pal_getenv("TOTK_ASTC_BC3"); astc_bc3 = v ? atoi(v) != 0 : vk_integrated || vk_local_heap < (6ull << 30);
+                VLOG("ASTC textures (the GPU does not sample ASTC): decoded to %s (TOTK_ASTC_BC3=0/1)", astc_bc3 ? "BC3" : "RGBA8"); }
+            e = astc_bc3 ? (ent){srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK, 0, 0, 5, 0, 0}
+                         : (ent){srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 3, 0, 0};
+        }
     } else if (f > 0 && f < (int)(sizeof T / sizeof *T)) e = T[f];
     out->vk = e.f; out->depth = e.depth; out->stencil = e.stencil; out->convert = e.convert;
     out->swz[0] = e.rb ? B : R; out->swz[1] = G; out->swz[2] = e.rb ? R : B; out->swz[3] = e.noalpha ? ONE : A;

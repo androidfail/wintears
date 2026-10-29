@@ -608,6 +608,9 @@ static void copy_t2t(const p_copy_t2t *c) {
         if (ds.layerCount != ss.layerCount) ds.layerCount = ss.layerCount = ss.layerCount < ds.layerCount ? ss.layerCount : ds.layerCount;
         VkImageCopy r = {ss, so, ds, dof, sx};
         vkCmdCopyImage(vk_cmd(), vt_image(s), VK_IMAGE_LAYOUT_GENERAL, vt_image(d), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    } else if (vk_fmt_block_compressed(vt_vkformat(s)) || vk_fmt_block_compressed(vt_vkformat(d))) {   /* no blit to or from blocks */
+        VK_ONCE("copy between formats %d and %d (blocks on one side, not the same format): not possible in Vulkan, skipped", (int)vt_vkformat(s), (int)vt_vkformat(d));
+        return;
     } else if (int_format(vt_vkformat(s)) != int_format(vt_vkformat(d))) {   /* integer <-> float or signed <-> unsigned of another size: neither a copy nor a blit */
         VK_ONCE("copy between formats %d and %d (texel sizes %u / %u): not possible in Vulkan, skipped", (int)vt_vkformat(s), (int)vt_vkformat(d), vt_texel_size(s), vt_texel_size(d));
         return;

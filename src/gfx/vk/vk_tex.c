@@ -19,6 +19,7 @@
 #include "nvn_hmap.h"
 
 int vk_astc_decode(const uint8_t *src, size_t n, unsigned bw, unsigned bh, unsigned w, unsigned h, int srgb, uint8_t *dst);   /* vk_astc.cpp */
+int vk_astc_decode_bc3(const uint8_t *src, size_t n, unsigned bw, unsigned bh, unsigned w, unsigned h, int srgb, uint8_t *dst);
 
 typedef struct { uint64_t mem, size; uint32_t w, h, d, levels, target, samples, cls, pad; } stor_key;   /* 48 bytes, no padding holes */
 typedef struct { VkFormat f; VkImageViewType type; uint32_t base_level, levels, base_layer, layers; VkComponentSwizzle swz[4]; VkImageAspectFlags aspect; } view_key;
@@ -234,7 +235,7 @@ static unsigned mip_drop_of(const tex_t *t, const vk_fmt *f) {
         on = e ? atoi(e) != 0 : vk_integrated || vk_local_heap < (6ull << 30); minside = m ? (unsigned)atoi(m) : pal_total_memory() && pal_total_memory() < (12ull << 30) ? 256 : 512;   /* 256 under 12 GiB of memory */
         VLOG("large decoded ASTC textures leave out their top mip level: %s (both sides >= %u; TOTK_MIP_DROP=0/1)", on ? "on" : "off", minside); }
     unsigned g = (unsigned)t->d.target;
-    if (!on || f->convert != 3 || !tex_mirrored(t) || t->d.levels < 2 || t->d.width < minside || t->d.height < minside) return 0;
+    if (!on || (f->convert != 3 && f->convert != 5) || !tex_mirrored(t) || t->d.levels < 2 || t->d.width < minside || t->d.height < minside) return 0;
     return g == NVN_TEXTURE_TARGET_2D || g == NVN_TEXTURE_TARGET_2D_ARRAY || g == NVN_TEXTURE_TARGET_CUBEMAP || g == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY;
 }
 void vt_memory(uint64_t out[4]) { out[0] = g_kind_bytes[0]; out[1] = g_kind_bytes[1]; out[2] = g_kind_bytes[2]; out[3] = g_drop_saved; }
@@ -243,7 +244,7 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     vtex *e = calloc(1, sizeof *e);
     e->k = *k; e->f = *f; e->fmt = f->vk; e->levels = k->levels;
     { int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
-      e->tsize = f->convert == 1 || f->convert == 3 ? 4 : f->convert == 2 ? (uint32_t)bpb / 3 * 4 : f->convert == 4 ? 8 : (uint32_t)bpb; }
+      e->tsize = f->convert == 1 || f->convert == 3 ? 4 : f->convert == 2 ? (uint32_t)bpb / 3 * 4 : f->convert == 4 ? 8 : f->convert == 5 ? 16 : (uint32_t)bpb; }
     shape(t, &e->type, &e->w, &e->h, &e->d, &e->layers);
     if ((e->drop = mip_drop_of(t, f))) { e->w = e->w >> 1 ? e->w >> 1 : 1; e->h = e->h >> 1 ? e->h >> 1 : 1; e->levels -= 1; }
     e->aspect = f->depth || f->stencil ? (f->depth ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (f->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0) : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -286,7 +287,7 @@ static vtex *create(const tex_t *t, const vk_fmt *f, const stor_key *k) {
     }
     e->mirrored = tex_mirrored(t);
     { VmaAllocationInfo ai; vmaGetAllocationInfo(vk_vma, e->al, &ai); e->bytes = ai.size;
-      e->kind = f->convert == 3 ? 0 : e->mirrored ? 1 : 2; g_kind_bytes[e->kind] += e->bytes;
+      e->kind = f->convert == 3 || f->convert == 5 ? 0 : e->mirrored ? 1 : 2; g_kind_bytes[e->kind] += e->bytes;
       if (e->drop) g_drop_saved += e->bytes * 3; }   /* the left-out level is about three times the rest */
     { static int near;   /* diagnostic: another layout already lives at this memory (the first 12): on hardware both descriptors read the same bytes */
       for (uint32_t i = 0; near < 12 && i < g_by_stor.cap; i++) {
@@ -344,10 +345,23 @@ static void put_linear(vtex *e, int format, const uint8_t *lin, size_t slice, ui
                        VkCommandBuffer c, uint32_t level, uint32_t layer, VkOffset3D o, uint8_t **out, size_t *out_n) {
     int bw, bh, bpb = nvn_fmt_bpb(format, &bw, &bh);
     size_t n = slice * d, texels = (size_t)w * h * d;
-    size_t dn = e->f.convert == 2 ? n / 3 * 4 : e->f.convert == 3 ? texels * 4 : e->f.convert == 4 ? n * 2 : n;
+    size_t dn = e->f.convert == 2 ? n / 3 * 4 : e->f.convert == 3 ? texels * 4 : e->f.convert == 4 ? n * 2
+              : e->f.convert == 5 ? (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16 * d : n;
+    if (e->f.convert == 5 && ((o.x | o.y) & 3)) {   /* BC3 blocks start every 4 texels: a region elsewhere cannot be written */
+        VK_ONCE("ASTC texture region at %d,%d (not on a 4-texel boundary) kept in BC3: left out", o.x, o.y);
+        if (out) { *out = NULL; *out_n = 0; }
+        return;
+    }
     VkBuffer sb; VkDeviceSize so;
     uint8_t *dst = vk_stage(dn, 16, &sb, &so);
-    if (e->f.convert == 3) {
+    if (e->f.convert == 5) {
+        size_t bs = (size_t)((w + 3) / 4) * ((h + 3) / 4) * 16;
+        for (uint32_t z = 0; z < d; z++)
+            if (vk_astc_decode_bc3(lin + z * slice, slice, (unsigned)bw, (unsigned)bh, w, h, format >= 0x87, dst + z * bs)) {
+                VK_ONCE("ASTC %dx%d texture %ux%u did not decode: left blank", bw, bh, w, h);
+                memset(dst + z * bs, 0, bs);
+            }
+    } else if (e->f.convert == 3) {
         for (uint32_t z = 0; z < d; z++)
             if (vk_astc_decode(lin + z * slice, slice, (unsigned)bw, (unsigned)bh, w, h, format >= 0x87, dst + (size_t)z * w * h * 4)) {
                 VK_ONCE("ASTC %dx%d texture %ux%u did not decode: left blank", bw, bh, w, h);
