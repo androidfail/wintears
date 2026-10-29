@@ -201,6 +201,15 @@ bool load(const std::string &path, Module &m) {
             seed(((a & ~0xFFFull) + page) + ((n >> 10 & 0xFFF) << ((n >> 22 & 1) * 12)));
         }
     }
+    // linear sweep: the word after an unconditional branch (b, br, ret) is reached some other way, if at all. Play found
+    // functions there that nothing above names (pointers built at run time); without the JIT each one stopped the game.
+    // Zero / udf padding is left out; any other word is an instruction, so a block from padding is only a spare block.
+    if (!getenv("WT_NO_SWEEP"))
+        for (uint64_t a = m.text_lo + 4; a < m.text_hi; a += 4) {
+            uint32_t p = rd32(I + a - 4), w = rd32(I + a);
+            if (w >> 16 == 0) continue;
+            if ((p & 0xFC000000) == 0x14000000 || (p & 0xFFFFFC1F) == 0xD61F0000 || p == 0xD65F03C0) seed(a);
+        }
     std::sort(m.seeds.begin(), m.seeds.end());
     m.seeds.erase(std::unique(m.seeds.begin(), m.seeds.end()), m.seeds.end());
     return true;
@@ -446,6 +455,9 @@ struct Emitter {
         XW(A64ExclusiveWriteMemory8, "uint8_t") XW(A64ExclusiveWriteMemory16, "uint16_t")
         XW(A64ExclusiveWriteMemory32, "uint32_t") XW(A64ExclusiveWriteMemory64, "uint64_t")
 #undef XW
+        case O::A64ExclusiveReadMemory128: line("wt_v128 " + r + "; WT_EXCL_READ128(c, " + a(1) + ", " + r + ");"); return true;
+        case O::A64ExclusiveWriteMemory128: line("uint32_t " + r + "; WT_EXCL_WRITE128(c, " + a(1) + ", " + a(2) + ", " + r + ");"); return true;
+        case O::A64InstructionCacheOperationRaised: return true;   // IC IVAU: the recompiled code never changes
         case O::GetCarryFromOp: case O::GetOverflowFromOp: case O::GetNZCVFromOp: {
             if (in.GetArg(0).IsImmediate()) {   // parent folded to a constant: N and Z from it, C and V clear (as the x64 back end)
                 if (in.GetOpcode() != O::GetNZCVFromOp) { why = "flag of a folded constant"; return false; }
@@ -550,7 +562,7 @@ struct Emitter {
         std::string name = IR::GetNameOf(in.GetOpcode());
         if (!T || !helpers.count(name)) { why = name; return false; }
         // conversions with a rounding argument: the helpers round to nearest only, which is what FPCR 0 gives
-        if ((name.rfind("FPFixed", 0) == 0 || name == "FPDoubleToSingle") && val(in.GetArg(in.NumArgs() - 1)) != "0u") {
+        if ((name.rfind("FPFixed", 0) == 0 || name == "FPDoubleToSingle" || name == "FPSingleToHalf" || name == "FPDoubleToHalf") && val(in.GetArg(in.NumArgs() - 1)) != "0u") {
             why = name + " (rounding mode)"; return false;
         }
         std::string call = "wt_op_" + name + "(";
@@ -757,7 +769,10 @@ struct DiffCb final : A64::UserCallbacks {
     bool MemoryWriteExclusive16(A64::VAddr a, std::uint16_t v, std::uint16_t e) override { return cas(a, v, e); }
     bool MemoryWriteExclusive32(A64::VAddr a, std::uint32_t v, std::uint32_t e) override { return cas(a, v, e); }
     bool MemoryWriteExclusive64(A64::VAddr a, std::uint64_t v, std::uint64_t e) override { return cas(a, v, e); }
-    bool MemoryWriteExclusive128(A64::VAddr, A64::Vector, A64::Vector) override { return false; }
+    bool MemoryWriteExclusive128(A64::VAddr a, A64::Vector v, A64::Vector e) override {   // as the runtime (jit.cpp): cmpxchg16b
+        unsigned __int128 nv = (unsigned __int128)v[1] << 64 | v[0], ne = (unsigned __int128)e[1] << 64 | e[0];
+        return __sync_bool_compare_and_swap(reinterpret_cast<unsigned __int128 *>(a), ne, nv);
+    }
     void InterpreterFallback(A64::VAddr pc, size_t) override { exc_pc = pc; exc = -2; jit->HaltExecution(HaltReason::UserDefined3); }
     void CallSVC(std::uint32_t imm) override { svc = imm; halted = 1; jit->HaltExecution(HaltReason::UserDefined1); }
     void ExceptionRaised(A64::VAddr pc, A64::Exception e) override {

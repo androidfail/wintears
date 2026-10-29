@@ -74,6 +74,7 @@ if(WINTEARS_JIT)
   target_link_libraries(wt_recomp PRIVATE dynarmic fmt::fmt merry::mcl tsl::robin_map)
   target_include_directories(wt_recomp PRIVATE externals/dynarmic/src src/cpu/native)
   target_link_options(wt_recomp PRIVATE -static)
+  target_compile_options(wt_recomp PRIVATE -mcx16)
 
   # ---- guest-to-host bridge ----
   set(NVN_DIR upstream/games/totk/third_party/d2r_gfx/gfx/nvn)

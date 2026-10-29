@@ -113,3 +113,10 @@ static inline uint32_t wt_extr32(uint32_t hi, uint32_t lo, unsigned n) { return 
         if (!(c)->excl_valid || (c)->excl_addr != (a)) (out) = 1; \
         else { T e_ = (T)(c)->excl_val.lo; (out) = !__atomic_compare_exchange_n((T *)(uintptr_t)(a), &e_, (T)(v), 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); } \
         (c)->excl_valid = 0; } while (0)
+/* LDXP / STXP of two doublewords: both halves remembered, the write a 16-byte compare-and-swap (cmpxchg16b) */
+#define WT_EXCL_READ128(c, a, out) do { (c)->excl_addr = (a); (out) = wt_ld128(a); (c)->excl_val = (out); (c)->excl_valid = 1; } while (0)
+#define WT_EXCL_WRITE128(c, a, v, out) do { \
+        if (!(c)->excl_valid || (c)->excl_addr != (a)) (out) = 1; \
+        else { unsigned __int128 e_ = (unsigned __int128)(c)->excl_val.hi << 64 | (c)->excl_val.lo, n_ = (unsigned __int128)(v).hi << 64 | (v).lo; \
+               (out) = !__sync_bool_compare_and_swap((unsigned __int128 *)(uintptr_t)(a), e_, n_); } \
+        (c)->excl_valid = 0; } while (0)
