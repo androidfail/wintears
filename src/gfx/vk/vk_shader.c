@@ -192,6 +192,7 @@ static int pk_put(pal_file *f, uint8_t *head, uint64_t *at, uint64_t *data, cons
 static void *pk_build(void *arg) {
     (void)arg;
     pal_thread_set_name("shader cache pack");
+    pal_thread_set_priority(PAL_PRIO_LOW);
     pal_dir *d = pal_dir_open(g_dir); if (!d) return NULL;
     typedef struct { char *name; uint64_t size; } loose;
     loose *v = NULL; size_t nv = 0, cv = 0; char name[512]; int is_dir; uint64_t size;

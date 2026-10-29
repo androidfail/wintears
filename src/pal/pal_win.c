@@ -359,6 +359,8 @@ void pal_thread_join(pal_thread *t) {
 void pal_thread_set_name(const char *name) { set_name_w(GetCurrentThread(), name); }
 
 void pal_thread_set_priority(int prio) {
+    /* low = Windows background mode: lower CPU and disk priority, so it never competes with the game's reads */
+    if (prio <= PAL_PRIO_LOW && SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN)) return;
     int p = prio <= PAL_PRIO_LOW ? THREAD_PRIORITY_BELOW_NORMAL : prio == PAL_PRIO_NORMAL ? THREAD_PRIORITY_NORMAL
           : prio == PAL_PRIO_HIGH ? THREAD_PRIORITY_ABOVE_NORMAL : THREAD_PRIORITY_TIME_CRITICAL;
     SetThreadPriority(GetCurrentThread(), p);
