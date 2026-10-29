@@ -77,7 +77,7 @@ extern "C" int vk_astc_decode(const uint8_t *src, size_t n, unsigned bw, unsigne
     astcenc_image img{};
     img.dim_x = w; img.dim_y = h; img.dim_z = 1; img.data_type = ASTCENC_TYPE_U8; img.data = slices;
     const astcenc_swizzle swz{ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A};
-    unsigned nt = (size_t)w * h >= 512u * 512u ? g_threads : 1;
+    unsigned nt = (size_t)w * h >= 128u * 128u ? g_threads : 1;   /* the helpers are made once: cheap to wake */
     astcenc_error err = ASTCENC_SUCCESS;
     if (nt == 1) err = astcenc_decompress_image(c, src, n, &img, &swz, 0);
     else {
@@ -144,7 +144,7 @@ extern "C" int vk_astc_decode_bc3(const uint8_t *src, size_t n, unsigned bw, uns
     int r = vk_astc_decode(src, n, bw, bh, w, h, srgb, rgba.data());
     unsigned rows = (h + 3) / 4;
     std::lock_guard<std::mutex> lock(g_mu);   /* the helper threads are shared with the decoder */
-    unsigned nt = (size_t)w * h >= 256u * 256u ? std::max(1u, g_threads) : 1;
+    unsigned nt = (size_t)w * h >= 128u * 128u ? std::max(1u, g_threads) : 1;
     if (nt == 1) bc3_rows(rgba.data(), w, h, dst, 0, rows);
     else run_on(nt, [&](unsigned i) { bc3_rows(rgba.data(), w, h, dst, rows * i / nt, rows * (i + 1) / nt); });
     return r;
