@@ -83,6 +83,8 @@ def main():
     ap.add_argument('--hot', metavar='SAMPLES', help='profile from a run with TOTK_SAMPLE=1 TOTK_SAMPLE_OUT=<file>: the files '
                     'holding --hot-share of the samples get -O2 (kept in native/hot_<module>.txt for later builds)')
     ap.add_argument('--hot-share', type=float, default=0.8)
+    ap.add_argument('--verify', action='store_true', help='compile every file again and replace objects that differ '
+                    '(MSYS2 GCC sometimes miscompiles silently, as it sometimes crashes)')
     a = ap.parse_args()
     if a.quick: FLAGS[0] = '-Og'
     tool = os.path.join(ROOT, 'build', 'wt_recomp.exe' if os.name == 'nt' else 'wt_recomp')
@@ -103,7 +105,7 @@ def main():
         inputs = inputs0.copy(); inputs.update(' '.join(sorted(hot)).encode()); inputs = inputs.hexdigest()
         t0 = time.time()
         dll = os.path.join(out, f'totk_{mod}.dll')
-        if not a.clean and os.path.exists(dll) and os.path.exists(dll + '.inputs') and open(dll + '.inputs').read() == inputs:
+        if not a.clean and not a.verify and os.path.exists(dll) and os.path.exists(dll + '.inputs') and open(dll + '.inputs').read() == inputs:
             print(f'{mod}: up to date ({os.path.getsize(dll) / 2**20:.0f} MiB)')
             continue
         # one cache folder per flag set: switching between -O1 and --quick keeps both
@@ -129,14 +131,26 @@ def main():
             err = compile_one(os.path.join(d, f), tmp, inc, hot_flags if f in hot else FLAGS)
             if not err: os.replace(tmp, obj[f])
             return err
+
+        def verify(f):   # gcc output is deterministic: an object that differs from a fresh compile was miscompiled
+            tmp = obj[f][:-2] + '.chk.o'
+            for _ in range(3):
+                err = compile_one(os.path.join(d, f), tmp, inc, hot_flags if f in hot else FLAGS)
+                if err: return err
+                if open(tmp, 'rb').read() == open(obj[f], 'rb').read(): os.remove(tmp); return None
+                bad.append(f); os.replace(tmp, obj[f])   # keep the new one; the next pass checks it against another
+            return f'{f}: three compiles of it all differ'
+        bad = []
         with cf.ThreadPoolExecutor(a.jobs) as ex:
             errs = [e for e in ex.map(build, todo) if e]
+            if a.verify and not errs: errs = [e for e in ex.map(verify, srcs) if e]
+        if bad: print(f'{mod}: {len(set(bad))} miscompiled objects replaced: {", ".join(sorted(set(bad))[:10])}')
         if errs: sys.exit('\n'.join(errs[:5]))
         t2 = time.time()
         dll = os.path.join(out, f'totk_{mod}.dll')
         stamp = hashlib.sha256('\n'.join(obj[f] for f in srcs).encode()).hexdigest()
         linked = 'skipped (unchanged)'
-        if not (os.path.exists(dll) and os.path.exists(dll + '.stamp') and open(dll + '.stamp').read() == stamp):
+        if bad or not (os.path.exists(dll) and os.path.exists(dll + '.stamp') and open(dll + '.stamp').read() == stamp):
             rsp = os.path.join(d, 'objs.rsp')
             open(rsp, 'w').write('\n'.join(obj[f].replace('\\', '/') for f in srcs))
             r = subprocess.run(['gcc', '-shared', '-s', '-o', dll, '@' + rsp], capture_output=True, text=True)
