@@ -54,9 +54,14 @@ static void *x_thread(void *unused) {
     return NULL;
 }
 static uint64_t push(job *j) {   /* the job's number (1-based) */
-    int away = runtime_core_away();   /* a guest thread waiting for room gives its virtual core back */
+    int away = 0;
     pthread_mutex_lock(&g_mu);
-    while (g_in - g_done >= XQ) pthread_cond_wait(&g_cv, &g_mu);
+    if (g_in - g_done >= XQ) {   /* full: a guest thread waiting for room gives its virtual core back (two locks of G; not when there is room) */
+        pthread_mutex_unlock(&g_mu);
+        away = runtime_core_away();
+        pthread_mutex_lock(&g_mu);
+        while (g_in - g_done >= XQ) pthread_cond_wait(&g_cv, &g_mu);
+    }
     if (j->kind == J_SUBMIT) j->sub = ++g_sub_in;
     g_q[g_in % XQ] = *j;
     uint64_t no = ++g_in;

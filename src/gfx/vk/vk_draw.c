@@ -134,10 +134,12 @@ static dpool *dp_new(void) {
     pthread_mutex_lock(&g_dp_mu); dpool *d = g_dp_free; if (d) g_dp_free = d->next; pthread_mutex_unlock(&g_dp_mu);
     if (d) return d;
     d = calloc(1, sizeof *d);
-    VkDescriptorPoolSize sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16384}, {VK_DESCRIPTOR_TYPE_SAMPLER, 16384},
-        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024}};
-    VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192, .poolSizeCount = 8, .pPoolSizes = sz};
+    /* a quarter as big where the GPU shares system RAM (its descriptors are RAM): a full pool moves on to the next (dset) */
+    uint32_t q = vk_integrated ? 4 : 1;
+    VkDescriptorPoolSize sz[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768 / q}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192 / q},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 65536 / q}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16384 / q}, {VK_DESCRIPTOR_TYPE_SAMPLER, 16384 / q},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 4096 / q}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 4096 / q}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024 / q}};
+    VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192 / q, .poolSizeCount = 8, .pPoolSizes = sz};
     VKC(vkCreateDescriptorPool(vk_dev, &ci, NULL, &d->p));
     return d;
 }
@@ -654,11 +656,13 @@ static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, in
             k.blend[i].dst_a = b->dst_a; k.blend[i].eq_rgb = b->eq_rgb; k.blend[i].eq_a = b->eq_a;
         }
     }
+    static gp_key last_k; static VkPipeline last_p;   /* draws in a row mostly use one pipeline: no hash, no lock */
+    if (last_p && !memcmp(&k, &last_k, sizeof k)) return last_p;
     pthread_mutex_lock(&g_pipes_mu);
     VkPipeline p = nvn_hm_get(&g_pipes, &k);
     pthread_mutex_unlock(&g_pipes_mu);
     if (p == PIPE_BUILDING) return VK_NULL_HANDLE;   /* still being built: the draw is left out this time */
-    if (p) return p;
+    if (p) { last_k = k; last_p = p; return p; }
 
     pbuild *b = calloc(1, sizeof *b);
     if (!b) die("Vulkan: pipeline");
