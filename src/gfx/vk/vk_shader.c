@@ -120,6 +120,137 @@ static int write_all(const char *path, const void *p, size_t n, int append) {
     return ok ? 0 : -1;
 }
 
+/* ---------- the cache packed into one file ----------
+   <cache>/pack.wtp holds the .variants, .wtr and .spv files, mapped once at start-up. Opening the cache's small files
+   one by one, on the replay thread at each program's first use, took over half of that thread's time on the PC (and
+   Windows Defender scans each open). Files missing from the pack, or grown since (a .variants list the runtime
+   appended to), are read from the loose files, which stay as they are; a thread at start-up writes pack.new with
+   them, and the next start-up puts it in place of pack.wtp. Layout: "WTPACK01", u32 count, then per file a u16 name
+   length, the name, u64 offset, u64 size; then the data. */
+typedef struct { const char *name; uint32_t nlen; uint64_t off, size; } pk_ent;
+static const uint8_t *g_pk;
+static pk_ent *g_pke; static uint32_t g_pkn, *g_pkh, g_pk_mask;   /* g_pkh: entry index + 1, open addressing */
+static uint32_t pk_hash(const char *s, size_t n) { uint32_t h = 2166136261u; while (n--) { h ^= (uint8_t)*s++; h *= 16777619u; } return h; }
+static const pk_ent *pk_find(const char *name) {
+    if (!g_pkh) return NULL;
+    size_t n = strlen(name);
+    for (uint32_t i = pk_hash(name, n) & g_pk_mask;; i = (i + 1) & g_pk_mask) {
+        uint32_t k = g_pkh[i];
+        if (!k) return NULL;
+        const pk_ent *e = &g_pke[k - 1];
+        if (e->nlen == n && !memcmp(e->name, name, n)) return e;
+    }
+}
+static uint32_t pk_parse(const uint8_t *p, uint64_t size, pk_ent **out) {   /* the entries, or 0 if not a pack */
+    uint32_t n; if (size < 12 || memcmp(p, "WTPACK01", 8)) return 0;
+    memcpy(&n, p + 8, 4);
+    if (!n || n > size / 18) return 0;
+    pk_ent *e = calloc(n, sizeof *e); uint64_t at = 12;
+    for (uint32_t i = 0; i < n; i++) {
+        uint16_t l; if (at + 2 > size) goto bad; memcpy(&l, p + at, 2); at += 2;
+        if (at + l + 16 > size) goto bad;
+        e[i].name = (const char *)p + at; e[i].nlen = l; at += l;
+        memcpy(&e[i].off, p + at, 8); memcpy(&e[i].size, p + at + 8, 8); at += 16;
+        if (e[i].off > size || e[i].size > size - e[i].off) goto bad;
+    }
+    *out = e; return n;
+bad: free(e); return 0;
+}
+static void pk_open(void) {
+    char path[1100], nw[1100];
+    snprintf(path, sizeof path, "%s/pack.wtp", g_dir); snprintf(nw, sizeof nw, "%s/pack.new", g_dir);
+    if (pal_path_exists(nw) && pal_rename_replace(nw, path)) VLOG("shader cache: pack.new could not replace pack.wtp");
+    pal_file *f = pal_file_open(path, PAL_FILE_READ); if (!f) return;
+    uint64_t size = 0; const uint8_t *p = pal_file_map(f, &size);
+    pal_file_close(f);
+    if (!p) return;
+    uint32_t n = pk_parse(p, size, &g_pke);
+    if (!n) { pal_file_unmap(p); VLOG("shader cache: pack.wtp is not a pack, left unused"); return; }
+    g_pk = p; g_pkn = n;
+    uint32_t cap = 1; while (cap < n * 2) cap <<= 1;
+    uint32_t *h = calloc(cap, sizeof *h);
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t j = pk_hash(g_pke[i].name, g_pke[i].nlen) & (cap - 1);
+        while (h[j]) j = (j + 1) & (cap - 1);
+        h[j] = i + 1;
+    }
+    g_pk_mask = cap - 1; g_pkh = h;
+    VLOG("shader cache: %u files from pack.wtp (%llu MiB)", n, (unsigned long long)(size >> 20));
+}
+static int pk_wanted(const char *name) {
+    const char *x = strrchr(name, '.');
+    return x && (!strcmp(x, ".wtr") || !strcmp(x, ".spv") || !strcmp(x, ".variants"));
+}
+static int pk_put(pal_file *f, uint8_t *head, uint64_t *at, uint64_t *data, const char *name, size_t nlen, const void *p, uint64_t n) {
+    uint16_t l = (uint16_t)nlen; memcpy(head + *at, &l, 2); memcpy(head + *at + 2, name, nlen); *at += 2 + nlen;
+    memcpy(head + *at, data, 8); memcpy(head + *at + 8, &n, 8); *at += 16;
+    int ok = !n || pal_file_pwrite(f, p, (size_t)n, *data) == (int64_t)n;
+    *data += n;
+    return ok;
+}
+/* start-up thread: pack.new = pack.wtp's files + the loose ones it lacks or that grew since */
+static void *pk_build(void *arg) {
+    (void)arg;
+    pal_thread_set_name("shader cache pack");
+    pal_dir *d = pal_dir_open(g_dir); if (!d) return NULL;
+    typedef struct { char *name; uint64_t size; } loose;
+    loose *v = NULL; size_t nv = 0, cv = 0; char name[512]; int is_dir; uint64_t size;
+    while (pal_dir_next(d, name, sizeof name, &is_dir, &size) == 1) {
+        if (is_dir || !pk_wanted(name) || strlen(name) > 400) continue;
+        const pk_ent *e = pk_find(name);
+        if (e && e->size == size) continue;
+        if (nv == cv) { cv = cv ? cv * 2 : 256; v = realloc(v, cv * sizeof *v); }
+        v[nv++] = (loose){_strdup(name), size};
+    }
+    pal_dir_close(d);
+    /* the pack is rewritten whole (over a GiB): only once enough files were left out of it, a few are read loose */
+    if (!nv || (g_pkn && nv < 512)) { for (size_t i = 0; i < nv; i++) free(v[i].name); free(v); return NULL; }
+    uint8_t *drop = calloc(g_pkn + 1, 1); uint32_t count = g_pkn;   /* pack entries a loose file replaces */
+    for (size_t i = 0; i < nv; i++) { const pk_ent *e = pk_find(v[i].name); if (e) { drop[e - g_pke] = 1; count--; } }
+    count += (uint32_t)nv;
+    uint64_t head = 12;
+    for (uint32_t i = 0; i < g_pkn; i++) if (!drop[i]) head += 2 + g_pke[i].nlen + 16;
+    for (size_t i = 0; i < nv; i++) head += 2 + strlen(v[i].name) + 16;
+    uint8_t *hb = malloc(head); memcpy(hb, "WTPACK01", 8); memcpy(hb + 8, &count, 4);
+    char tmp[1100], nw[1100];
+    snprintf(tmp, sizeof tmp, "%s/pack.tmp", g_dir); snprintf(nw, sizeof nw, "%s/pack.new", g_dir);
+    pal_file *f = pal_file_open(tmp, PAL_FILE_WRITE | PAL_FILE_CREATE | PAL_FILE_TRUNCATE);
+    int ok = f != NULL; uint64_t at = 12, data = head;
+    for (uint32_t i = 0; i < g_pkn && ok; i++)
+        if (!drop[i]) ok = pk_put(f, hb, &at, &data, g_pke[i].name, g_pke[i].nlen, g_pk + g_pke[i].off, g_pke[i].size);
+    for (size_t i = 0; i < nv && ok; i++) {
+        char fp[1100]; size_t n = 0; snprintf(fp, sizeof fp, "%s/%s", g_dir, v[i].name);
+        uint8_t *b = read_all(fp, &n);
+        ok = pk_put(f, hb, &at, &data, v[i].name, strlen(v[i].name), b, b ? n : 0);
+        free(b);
+    }
+    if (ok) ok = pal_file_pwrite(f, hb, (size_t)head, 0) == (int64_t)head;
+    if (f) pal_file_close(f);
+    if (ok && !pal_rename_replace(tmp, nw)) VLOG("shader cache: pack.new written (%u files, %zu new or grown), used from the next start", count, nv);
+    else if (f) pal_remove_file(tmp);
+    for (size_t i = 0; i < nv; i++) free(v[i].name);
+    free(v); free(hb); free(drop);
+    return NULL;
+}
+/* a cache file by name: from the pack, else the loose file (NUL-terminated; the caller frees it) */
+static uint8_t *cache_read(const char *name, size_t *n) {
+    const pk_ent *e = pk_find(name);
+    const char *x = strrchr(name, '.');
+    if (e && x && !strcmp(x, ".variants")) {   /* a list the runtime appends to: the pack's copy only if still that size */
+        char path[1400]; wchar_t w[1400]; WIN32_FILE_ATTRIBUTE_DATA a;
+        snprintf(path, sizeof path, "%s/%s", g_dir, name);
+        if (MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1400) && GetFileAttributesExW(w, GetFileExInfoStandard, &a) &&
+            ((uint64_t)a.nFileSizeHigh << 32 | a.nFileSizeLow) != e->size) e = NULL;
+    }
+    if (e) {
+        uint8_t *b = malloc((size_t)e->size + 1); if (!b) return NULL;
+        memcpy(b, g_pk + e->off, (size_t)e->size); b[e->size] = 0; *n = (size_t)e->size;
+        return b;
+    }
+    char path[1400]; snprintf(path, sizeof path, "%s/%s", g_dir, name);
+    return read_all(path, n);
+}
+
 /* ---------- answers from the bound state (upstream nvn_mtl.m rt_answers) ---------- */
 static const char *target_name(int t) {
     switch (t) { case 0: return "1d"; case 2: return "3d"; case 3: return "1darray"; case 4: return "2darray"; case 5: return "2dms";
@@ -236,11 +367,11 @@ static int word_index(const char *w, const char *const *names, int n) { for (int
 
 /* <variant>.wtr + .spv -> a shader; NULL when the files are missing or broken (it is translated again) */
 static vk_shader *load_variant(const char *variant, int stage, const uint8_t *c1, uint32_t c1n) {
-    char path[1400]; size_t n;
-    snprintf(path, sizeof path, "%s/%s.wtr", g_dir, variant);
-    char *txt = (char *)read_all(path, &n);
-    snprintf(path, sizeof path, "%s/%s.spv", g_dir, variant);
-    size_t spn; uint8_t *spv = read_all(path, &spn);
+    char name[200]; size_t n;
+    snprintf(name, sizeof name, "%s.wtr", variant);
+    char *txt = (char *)cache_read(name, &n);
+    snprintf(name, sizeof name, "%s.spv", variant);
+    size_t spn; uint8_t *spv = cache_read(name, &spn);
     if (!txt || !spv || strncmp(txt, "wt-vk 1\n", 8) || (spn & 3)) { free(txt); free(spv); return NULL; }
     vk_shader *s = calloc(1, sizeof *s);
     snprintf(s->name, sizeof s->name, "%s", variant); s->stage = stage;
@@ -300,8 +431,8 @@ static shader_key *key_get(const char *hex) {
     shader_key *k = nvn_hm_get(&g_keys, hex);
     if (k) return k;
     k = calloc(1, sizeof *k); memcpy(k->key, hex, 65);
-    char path[1200]; size_t n; snprintf(path, sizeof path, "%s/%s.variants", g_dir, hex);
-    char *txt = (char *)read_all(path, &n);
+    char name[200]; size_t n; snprintf(name, sizeof name, "%s.variants", hex);
+    char *txt = (char *)cache_read(name, &n);
     for (char *line = txt, *next; line && *line; line = next) {
         next = strchr(line, '\n'); if (next) *next++ = 0;
         line[strcspn(line, "\r")] = 0;   /* a list written with Windows line ends */
@@ -446,12 +577,12 @@ void vs_prog_release(uint64_t serial) { vk_prog *pr = nvn_hm_del(&g_progs, &seri
 /* The variant answers of a stage are worked out again only when what they depend on changed: the bound texture and
    image handles, a texture registration, the vertex formats (vertex stage), the targets' formats (fragment stage).
    Working them out takes the slot lock and copies every bound slot, at every draw (most of the replay's locking). */
-static struct { uint64_t raw; int valid; uint64_t sig; answers a; } g_memo[6];
+/* The bound handles are compared whole (memcmp, vectorised); a hash chained through all 160 of them was one multiply
+   after another at every draw, about a tenth of the replay thread's time. */
+static struct { uint64_t raw; int valid; uint64_t sig; uint64_t tex[128], img[32]; answers a; } g_memo[6];
 static inline uint64_t mixk(uint64_t h, uint64_t v) { h ^= v; h *= 0x9E3779B97F4A7C15ull; return h ^ (h >> 29); }
-static uint64_t raw_key(int st) {
+static uint64_t raw_key(int st) {   /* what the answers depend on besides the bound handles */
     uint64_t h = mixk(0x51ED27ull, vt_treg_version());
-    for (int r = 0; r < 128; r++) h = mixk(h, S.tex[st][r]);
-    for (int r = 0; r < 32; r++) h = mixk(h, S.img[st][r]);
     if (st == 0) { h = mixk(h, (uint64_t)S.nattr); for (int i = 0; i < S.nattr && i < 16; i++) h = mixk(h, S.attr[i]); }
     if (st == 1) { h = mixk(h, (uint64_t)S.has_rt); if (S.has_rt) for (int i = 0; i < S.rt.n && i < 8; i++)
         h = mixk(h, S.rt.color[i] ? (uint64_t)(S.rt.has_cview[i] && S.rt.cview[i].set_format ? S.rt.cview[i].format : S.rt.color[i]->d.format) + 1 : 0); }
@@ -461,7 +592,11 @@ vk_shader *vs_stage(vk_prog *pr, int st) {
     stage_t *t = &pr->st[st];
     if (!t->present) return NULL;
     uint64_t rk = raw_key(st);
-    if (!g_memo[st].valid || g_memo[st].raw != rk) { answers_of(st, &g_memo[st].a); g_memo[st].sig = answers_sig(&g_memo[st].a); g_memo[st].raw = rk; g_memo[st].valid = 1; }
+    if (!g_memo[st].valid || g_memo[st].raw != rk || memcmp(g_memo[st].tex, S.tex[st], sizeof g_memo[st].tex) ||
+        memcmp(g_memo[st].img, S.img[st], sizeof g_memo[st].img)) {
+        answers_of(st, &g_memo[st].a); g_memo[st].sig = answers_sig(&g_memo[st].a); g_memo[st].raw = rk; g_memo[st].valid = 1;
+        memcpy(g_memo[st].tex, S.tex[st], sizeof g_memo[st].tex); memcpy(g_memo[st].img, S.img[st], sizeof g_memo[st].img);
+    }
     uint64_t sig = g_memo[st].sig;
     for (int i = 0; i < t->nlast; i++) if (t->last[i].sig == sig) return t->last[i].s;
     answers a = g_memo[st].a;   /* not one of this stage's recent variants: the full answers */
@@ -494,4 +629,6 @@ void vs_init(void) {
     if (vk_sb_align == 16) snprintf(g_dir, sizeof g_dir, "%s/shader-cache/vk-1", host_profile_dir());
     else snprintf(g_dir, sizeof g_dir, "%s/shader-cache/vk-1-sb%u", host_profile_dir(), vk_sb_align);
     if (pal_mkdirs(g_dir)) die("cannot create the shader cache %s", g_dir);
+    pk_open();
+    { pthread_t t; if (!pthread_create(&t, NULL, pk_build, NULL)) pthread_detach(t); }
 }
