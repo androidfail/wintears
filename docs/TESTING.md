@@ -68,6 +68,21 @@ skipped). A shader it missed is translated the first time it appears (a 13-45 ms
 a window (nothing drawn); `--trace` logs every svc. Send the last 40 lines of the output when something stops: it has
 addresses and register values, nothing from the game.
 
+## Recompiled code and low-end machines
+
+`python tools/recomp/build_native.py D:/Games/TOTK/TOTK_win --verify` (about an hour on a desktop PC) builds the game's
+code into `TOTK_win/native/*.dll`; the game uses them whenever they are there. The JIT is made only if the game reaches
+a block the DLLs lack (the log says "made its JIT for the block at ..."). To add such blocks, run once with
+`TOTK_NATIVE_MISSES=D:/Games/TOTK/TOTK_win/native/misses.txt` and build again (only the changed files recompile).
+A `wintears.exe` configured with `-DWINTEARS_NATIVE_ONLY=ON` has no JIT at all: a missing block stops it with the line
+to add to `misses.txt`.
+
+On a laptop or a Steam Deck these are on by default: handheld mode (`TOTK_OPERATION_MODE=docked|handheld`), ASTC
+textures kept as BC3 (`TOTK_ASTC_BC3=0/1`), the top mip level of large textures left out (`TOTK_MIP_DROP=0/1`). To
+measure, play a minute with `TOTK_DIAG=1` set and send the lines of
+`%LOCALAPPDATA%\WinTears\totk\logs\last.log` that contain `presents`, `GPU busy`, `replay` and `memory:` (numbers
+only, nothing from the game). Close other programs first: on an 8 GB machine free memory matters most.
+
 ## If the build stops at "1/3 code"
 
 NSPs whose sections were decrypted by a conversion tool (encryption type 1) are supported, and so is a RomFS a

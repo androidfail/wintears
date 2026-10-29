@@ -15,7 +15,8 @@ retried (MSYS2 GCC sometimes crashes at random).
 Code reached only through pointers can be missed by discovery: run the game with
 TOTK_NATIVE_MISSES=<TOTK_win>/native/misses.txt and the next build adds the block starts recorded there.
 
-Everything under native/ is derived from the game: it stays on this machine. Run the game with TOTK_NATIVE=1.
+Everything under native/ is derived from the game: it stays on this machine. The game loads the DLLs whenever they are
+there (TOTK_NATIVE=0: the JIT only); a wintears.exe built with -DWINTEARS_NATIVE_ONLY=ON has no JIT at all and needs them.
 """
 import argparse, concurrent.futures as cf, glob, hashlib, os, shutil, subprocess, sys, time
 

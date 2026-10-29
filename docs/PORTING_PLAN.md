@@ -19,7 +19,7 @@ Upstream reference: MNG at commit `4fdda41562a1c783fb1aacd18891ad4f48b8c360` (20
 | 6. In-game correctness | in progress: playable at ~30 fps with sound, cutscenes play (`src/host/movie.c`, libvpx VP9), saves are handled. Open (from play): in some scenes the background never loads and the characters stand in a black void for the whole scene; on the Great Sky Island the light is far too bright and the sky/clouds show through objects and Link (as if fog or the sky pass ignored depth); menu backgrounds are mostly blue, sometimes black. Left: MNG game patches (`game_patches.c`), guest sync tests |
 | 7. Performance and polish | started: `tools/prepare_shaders.py` translates the shaders ahead of play; per-frame barriers cut by inlining uniform updates (~510→285). Left: FSR, `VK_EXT_graphics_pipeline_library`, the 60 FPS patch, the HUD overlay, the mods folder |
 | 8. Packaging and release | not started |
-| 9. Ahead-of-time translation (Direct Native) | planned in the SwitchNativityPorts vault (`wiki/concepts/Wintears Direct Native Plan.md`); phase 0 done (go) |
+| 9. Ahead-of-time translation (Direct Native) | done: `tools/recomp` recompiles the game's code into DLLs on the player's machine, loaded by default; dynarmic is made only for a missing block, and `-DWINTEARS_NATIVE_ONLY=ON` leaves it out (vault: `wiki/concepts/Wintears Direct Native Plan.md`) |
 
 ## Decisions
 

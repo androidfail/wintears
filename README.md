@@ -1,12 +1,13 @@
 # wintears
 
-A planned Windows port of [MacNativeGames](https://github.com/ly05010419/macnativegames) for *The Legend of Zelda:
+A Windows port of [MacNativeGames](https://github.com/ly05010419/macnativegames) for *The Legend of Zelda:
 Tears of the Kingdom*: your own copy of the game, with the Switch system services answered by a small host and its
 NVN graphics on Vulkan.
 
-**Status:** early bring-up. The Windows platform layer and the ARM64-to-x86 JIT run their tests; the data build for
-version 1.0.0 is ready for its first real run. The game does not start yet. See [the porting plan](docs/PORTING_PLAN.md)
-and [how to test on your PC](docs/TESTING.md).
+**Status:** playable from your own 1.0.0 dump at about 30 fps on a desktop PC, also on the Steam Deck (Proton) and,
+slowly, on 8 GB laptops. The game's ARM64 code runs from DLLs recompiled on your machine (`tools/recomp/build_native.py
+<TOTK_win> --verify`), with the dynarmic JIT as a fallback made only when a block is missing (`-DWINTEARS_NATIVE_ONLY=ON`
+builds without it). See [the porting plan](docs/PORTING_PLAN.md) and [how to test on your PC](docs/TESTING.md).
 
 ## Building (developers)
 
