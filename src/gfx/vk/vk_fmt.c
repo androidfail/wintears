@@ -79,9 +79,14 @@ int vk_fmt_of(int f, vk_fmt *out) {
         }
         if (astc_sampled) e = (ent){(VkFormat)(ASTC[k] + srgb), 0, 0, 0, 0, 0};   /* each _SRGB_BLOCK follows its _UNORM_BLOCK */
         else {
-            if (astc_bc3 < 0) { const char *v = pal_getenv("TOTK_ASTC_BC3"); astc_bc3 = v ? atoi(v) != 0 : vk_integrated || vk_local_heap < (6ull << 30);
-                VLOG("ASTC textures (the GPU does not sample ASTC): decoded to %s (TOTK_ASTC_BC3=0/1)", astc_bc3 ? "BC3" : "RGBA8"); }
-            e = astc_bc3 ? (ent){srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK, 0, 0, 5, 0, 0}
+            /* BC3 shares one colour line across RGB: fine for colour (sRGB) textures, but packed linear data (roughness /
+               metalness / AO channels, normals) loses its independent channels, and surfaces turned glossy. 1: colour
+               only (default where BC3 is used, with 12 GiB of RAM or more); 2: all ASTC (machines with less, the
+               8 GB laptop: memory first); 0: none. */
+            if (astc_bc3 < 0) { const char *v = pal_getenv("TOTK_ASTC_BC3");
+                astc_bc3 = v ? atoi(v) : !(vk_integrated || vk_local_heap < (6ull << 30)) ? 0 : pal_total_memory() < (12ull << 30) ? 2 : 1;
+                VLOG("ASTC textures (the GPU does not sample ASTC): decoded to %s (TOTK_ASTC_BC3=0/1/2)", astc_bc3 == 2 ? "BC3" : astc_bc3 ? "BC3 for colour, RGBA8 for data" : "RGBA8"); }
+            e = astc_bc3 == 2 || (astc_bc3 && srgb) ? (ent){srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK, 0, 0, 5, 0, 0}
                          : (ent){srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM, 0, 0, 3, 0, 0};
         }
     } else if (f > 0 && f < (int)(sizeof T / sizeof *T)) e = T[f];
