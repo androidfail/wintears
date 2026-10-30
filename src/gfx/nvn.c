@@ -12,6 +12,8 @@
      - the rest stop the run with their name when called.
    GPU address = CPU address: memory pools are the game's own memory. */
 #include <pthread.h>
+#include <stdlib.h>
+#include "host/host.h"
 #include <stdatomic.h>
 
 #include "gfx/nvn_reg.h"
@@ -1258,9 +1260,50 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
         o->ntex ? (int)CTX(o->tex[0])->d.width : 0, o->ntex ? (int)CTX(o->tex[0])->d.height : 0, o->ntex ? CTX(o->tex[0])->d.format : 0);
     return 1;
 }
+/* TOTK: the game picks its present interval (main+0x8f6bec) from its main thread's frame work time: system object +0x118 =
+   19.2 MHz ticks from the end of the previous frame function to after its update / draw calls, present not included
+   (upstream hle_nvn.c). The controller's frame (return address main+0x8f6cbc) holds the system object at x29 + 0x38.
+   Logged every 300 frames with the time the game spent blocked in AcquireTexture (counted in that work time). */
+static uint64_t g_game_sys, g_acq_ns; static void *g_main_thr;
+static void find_game_sys(void) {
+    const jit_context *c = host_guest_regs(); if (!c) return;
+    g_main_thr = host_thread_self();
+    uint64_t ret = host_code_base() + 0x8f6cbc, fp = c->x[29];
+    if (c->x[30] == ret) { g_game_sys = *(const uint64_t *)(fp + 0x38); LOG("[nvn] game system object %#llx (lr)", (unsigned long long)g_game_sys); return; }
+    static int told; if (!told++) LOG("[nvn] game system object: lr %#llx, controller return %#llx", (unsigned long long)c->x[30], (unsigned long long)ret);
+    for (int i = 0; i < 24 && fp && !(fp & 7) && fp < (1ull << 39); i++) {
+        uint64_t f0 = *(const uint64_t *)fp, f1 = *(const uint64_t *)(fp + 8);
+        if (f1 == ret) { g_game_sys = *(const uint64_t *)(f0 + 0x38); LOG("[nvn] game system object %#llx", (unsigned long long)g_game_sys); return; }
+        if (f0 <= fp) return; fp = f0;
+    }
+}
+static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+static void game_work_tick(uint64_t frame) {
+    static double win[300], acq[300]; static int n; static uint64_t last_acq;
+    if (!g_game_sys) return;
+    double ms = *(volatile int64_t *)(g_game_sys + 0x118) / 19200.0;
+    if (ms >= 0 && ms < 10000 && n < 300) { acq[n] = (g_acq_ns - last_acq) / 1e6; win[n++] = ms; }
+    last_acq = g_acq_ns;
+    if (frame % 300 || n < 30) { if (!(frame % 300)) n = 0; return; }
+    int over = 0; double a = 0; for (int i = 0; i < n; i++) { over += win[i] > 33.333; a += acq[i]; }
+    qsort(win, n, sizeof *win, dcmp); qsort(acq, n, sizeof *acq, dcmp);
+    const int32_t *k = (const int32_t *)(g_game_sys + 0x248); const uint8_t *b = (const uint8_t *)g_game_sys;
+    LOG("[nvn] game work time (+0x118, decides 20/30 fps) to frame %llu: p50 %.1f p90 %.1f max %.1f ms, %d of %d over 33.3; "
+        "AcquireTexture wait p50 %.1f p90 %.1f avg %.1f ms; controller %d..%d bias %.3f now %d; frame-end wait for GPU (+0x223) %u",
+        (unsigned long long)frame, win[n / 2], win[n * 9 / 10], win[n - 1], over, n, acq[n / 2], acq[n * 9 / 10], a / n,
+        k[0], k[1], *(const float *)&k[2], k[5], b[0x223]);
+    {   /* the main (controller) thread's waits per frame since the last line */
+        static uint64_t prev[3], pf; uint64_t t[3]; host_thread_times(g_main_thr, t); double nf = (double)(frame - pf);
+        LOG("[nvn] main thread per frame: waiting for a core %.1f ms, guest waits %.1f ms, NVN host calls %.1f ms",
+            (t[0] - prev[0]) / 1e6 / nf, (t[1] - prev[1]) / 1e6 / nf, (t[2] - prev[2]) / 1e6 / nf);
+        memcpy(prev, t, sizeof t); pf = frame;
+    }
+    n = 0;
+}
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
     if (((win_t *)w)->interval != v) LOG("[nvn] the game sets the present interval %d -> %d", ((win_t *)w)->interval, v);
     ((win_t *)w)->interval = v;
+    if (!g_game_sys) find_game_sys();
 }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
@@ -1289,11 +1332,12 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     *idx = o->active ? o->next++ % o->active : 0;
     /* Vsync blocks here (real NVN: when every swapchain image waits for display, wait for the next to be released), not
        in present: the game often presents while holding a lock. */
-    uint64_t at = *idx < 4 ? o->avail[*idx] : 0;
-    if (at > now_ns()) sleep_until_ns(at);
+    uint64_t acq0 = now_ns(), at = *idx < 4 ? o->avail[*idx] : 0;
+    if (at > acq0) sleep_until_ns(at);
     /* that image's previous present has been processed */
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) gpu_present_wait(tk);
+    g_acq_ns += now_ns() - acq0;
     /* The acquire sync means "this swapchain texture is no longer read by the display path": the wait above already
        ensured that, and every later use of it is ordered after the present on the one queue. Bit 1 of fenced marks
        acquire syncs. */
@@ -1314,6 +1358,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     o->pace = pc.target;
     if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
     g_frame++;
+    game_work_tick(g_frame);
     static uint64_t t300;
     if (g_frame == 1) { LOG("[nvn] first present (swapchain image %d)", idx); t300 = now; }
     else if (g_frame % 300 == 0) {

@@ -49,6 +49,8 @@ typedef struct thr {
     int no_preempt;            /* yield to any thread: wait for a core to come free, displacing no one */
     uint64_t cseq, core_since; struct thr *cnext;
     uint32_t wh[4]; int nwh;
+    _Atomic uint64_t ns_t[3];  /* waiting for a core, blocked in guest waits, in host calls away from the core (TOTK_DIAG) */
+    uint64_t away_at;
     jit_context *ctx;          /* the registers the thread runs now (nested host-to-guest calls replace it) */
     void *osh;                 /* host thread handle for the sampler (never closed: the sampler may still hold it) */
 } thr_t;
@@ -157,6 +159,9 @@ static void *h_get(uint32_t h, int type) {
     return o;
 }
 static thr_t *me_or_null(void) { return g_key_ok ? pthread_getspecific(g_keythr) : NULL; }
+void *host_thread_self(void) { return me_or_null(); }
+void host_thread_times(void *t, uint64_t out[3]) { for (int i = 0; i < 3; i++) out[i] = atomic_load(&((thr_t *)t)->ns_t[i]); }
+const jit_context *host_guest_regs(void) { thr_t *t = me_or_null(); return t ? t->ctx : NULL; }
 static thr_t *cur(void) {
     thr_t *t = me_or_null();
     if (!t) die("thread svc from a host thread that is not a guest thread");
@@ -191,6 +196,8 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns);
    track the cores are always on: a core is also the jit_core the thread runs on. */
 static thr_t *g_core_owner[NCORE];
 static thr_t *g_core_wait;
+/* Masks are kept even with cores free: letting threads run on any core (tried 2026-10-30) put two threads of one home
+   core at once into the game's per-core command recording and crashed at the first frames. */
 static int core_allowed(const thr_t *t, int c) { return (int)((t->mask >> c) & 1); }
 static void core_grant(int c) {   /* holding G: give free core c to the best waiter */
     thr_t *b = NULL, **bp = NULL;
@@ -231,17 +238,18 @@ static void core_take(thr_t *t) {   /* holding G; waits until a core in t's mask
     if (!g_diag) return;
     uint64_t t1 = pal_now_ns();
     if (other_free) atomic_fetch_add(&g_ns_mask_wait[t->mask & 7], t1 - t0);
-    atomic_fetch_add(&g_ns_core, t1 - t0); atomic_fetch_add(&g_n_core_wait, 1);
+    atomic_fetch_add(&g_ns_core, t1 - t0); atomic_fetch_add(&g_n_core_wait, 1); atomic_fetch_add(&t->ns_t[0], t1 - t0);
     if (t1 > t->core_since) atomic_fetch_add(&g_ns_handoff, t1 - t->core_since);
 }
 uint32_t runtime_thread_current_handle(void) { thr_t *t = me_or_null(); return t ? t->handle : 0; }
 /* Host services that wait for other threads give the core up around the wait (no host locks held). */
 int runtime_core_away(void) {
     thr_t *t = me_or_null(); if (!t || t->cur_core < 0) return 0;
-    G_lock(); core_put(t); pthread_mutex_unlock(&G); return 1;
+    G_lock(); core_put(t); pthread_mutex_unlock(&G); t->away_at = pal_now_ns(); return 1;
 }
 void runtime_core_back(int *away) {
     thr_t *t = me_or_null(); if (!*away || !t) return;
+    atomic_fetch_add(&t->ns_t[2], pal_now_ns() - t->away_at);
     G_lock(); core_take(t); pthread_mutex_unlock(&G);
 }
 /* Preemption point at svc entry and at a JIT halt: a better thread waits for this core. */
@@ -275,13 +283,13 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
         uint64_t end = t0 + (uint64_t)ns;
         while (!t->woke) {
             uint64_t now = pal_now_ns();
-            if (now >= end) { wait_unlink(t); t->wkind = 0; if (g_diag) { uint64_t d = now - t0; atomic_fetch_add(&g_ns_block, d); slp_note(1, (uint64_t)ns, d); } return R_TIMEOUT; }
+            if (now >= end) { wait_unlink(t); t->wkind = 0; if (g_diag) { uint64_t d = now - t0; atomic_fetch_add(&g_ns_block, d); atomic_fetch_add(&t->ns_t[1], d); slp_note(1, (uint64_t)ns, d); } return R_TIMEOUT; }
             pthread_mutex_unlock(&G);
             pal_event_wait_ns(t->ev, end - now);   /* a set left over from an earlier wake only makes this loop look again */
             pthread_mutex_lock(&G);
         }
     } else while (!t->woke) pthread_cond_wait(&t->cv, &G);
-    if (g_diag) atomic_fetch_add(&g_ns_block, pal_now_ns() - t0);
+    if (g_diag) { uint64_t d = pal_now_ns() - t0; atomic_fetch_add(&g_ns_block, d); atomic_fetch_add(&t->ns_t[1], d); }
     return t->wres;
 }
 
