@@ -1281,6 +1281,11 @@ static int dcmp(const void *a, const void *b) { double x = *(const double *)a, y
 static void game_work_tick(uint64_t frame) {
     static double win[300], acq[300]; static int n; static uint64_t last_acq;
     if (!g_game_sys) return;
+    {   /* TOTK_MAX_INTERVAL=2: cap the controller's maximum interval (+0x24c), so it never picks 20 fps; game time then
+           runs slow while frames take over 33 ms (its step follows the interval) */
+        static int mx = -1; if (mx < 0) { const char *e = getenv("TOTK_MAX_INTERVAL"); mx = e && *e ? atoi(e) : 0; }
+        if (mx > 0) *(volatile int32_t *)(g_game_sys + 0x24c) = mx;
+    }
     double ms = *(volatile int64_t *)(g_game_sys + 0x118) / 19200.0;
     if (ms >= 0 && ms < 10000 && n < 300) { acq[n] = (g_acq_ns - last_acq) / 1e6; win[n++] = ms; }
     last_acq = g_acq_ns;
