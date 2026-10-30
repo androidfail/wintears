@@ -29,7 +29,8 @@ static void *encode_thread(void *unused) {
     for (;;) {
         uint64_t r = atomic_load_explicit(&g_r, memory_order_relaxed), w = atomic_load_explicit(&g_w, memory_order_acquire);
         if (r == w) {
-            for (int i = 0; i < 4000 && r == atomic_load_explicit(&g_w, memory_order_acquire); i++) __builtin_ia32_pause();
+            /* a short spin only: the Steam Deck's CPU and GPU share 15 W, and spinning took power the GPU clock needed */
+            for (int i = 0; i < 200 && r == atomic_load_explicit(&g_w, memory_order_acquire); i++) __builtin_ia32_pause();
             if (r == atomic_load_explicit(&g_w, memory_order_acquire)) {
                 pthread_mutex_lock(&g_mu);
                 atomic_store(&g_sleeping, 1);
