@@ -423,7 +423,18 @@ static vk_shader *load_variant1(const char *variant, int stage, const uint8_t *c
     if (r != VK_SUCCESS) { VLOG("shader %s: vkCreateShaderModule failed (%d)", variant, (int)r); free(s->b); free(s->dep); free(s); return NULL; }
     VkShaderStageFlags sf = stage == 0 ? VK_SHADER_STAGE_VERTEX_BIT : stage == 1 ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_COMPUTE_BIT;
     VkDescriptorSetLayoutBinding lb[96]; int nl = 0;
-    for (int i = 0; i < s->nb && nl < 96; i++) lb[nl++] = (VkDescriptorSetLayoutBinding){s->b[i].binding, DESC[s->b[i].type], s->b[i].count, sf, NULL};
+    /* Uniform buffers dynamic (at most 8 a stage: vertex + fragment stay within the layout limit): a set then holds no
+       offsets, and draws that differ only in where their uniforms are (most of them: per-object constants) share it */
+    {   uint32_t nubo = 0, lim = vk_props.limits.maxDescriptorSetUniformBuffersDynamic / 2; if (lim > 8) lim = 8;
+        for (int i = 0; i < s->nb; i++) if (s->b[i].type == DT_UBO) nubo += s->b[i].count;
+        static int dyn_on = -1; if (dyn_on < 0) { const char *e = pal_getenv("TOTK_DYN_UBO"); dyn_on = !(e && *e == '0'); }
+        if (dyn_on && nubo && nubo <= lim) {
+            s->ndyn = (int)nubo; uint32_t at = 0;   /* offsets go in binding order */
+            for (int b = 0; b < 65536 && at < nubo; b++) for (int i = 0; i < s->nb; i++)
+                if (s->b[i].type == DT_UBO && s->b[i].binding == b) { s->b[i].dyn = (uint8_t)at; at += s->b[i].count; }
+        } }
+    for (int i = 0; i < s->nb && nl < 96; i++) lb[nl++] = (VkDescriptorSetLayoutBinding){s->b[i].binding,
+        s->ndyn && s->b[i].type == DT_UBO ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : DESC[s->b[i].type], s->b[i].count, sf, NULL};
     VkDescriptorSetLayoutCreateInfo li = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = (uint32_t)nl, .pBindings = lb};
     VKC(vkCreateDescriptorSetLayout(vk_dev, &li, NULL, &s->dsl));
     if (c1) c1_place(s, c1, c1n);   /* NULL: the caller places it (it records into the current submission: the replay only) */
@@ -594,7 +605,7 @@ void vs_prog_release(uint64_t serial) { vk_prog *pr = nvn_hm_del(&g_progs, &seri
    Working them out takes the slot lock and copies every bound slot, at every draw (most of the replay's locking). */
 /* The bound handles are compared whole (memcmp, vectorised); a hash chained through all 160 of them was one multiply
    after another at every draw, about a tenth of the replay thread's time. */
-static struct { uint64_t raw; int valid; uint64_t sig; uint64_t tex[128], img[32]; answers a; } g_memo[6];
+static struct { uint64_t raw, gen; int valid; uint64_t sig; uint64_t tex[128], img[32]; answers a; } g_memo[6];
 static inline uint64_t mixk(uint64_t h, uint64_t v) { h ^= v; h *= 0x9E3779B97F4A7C15ull; return h ^ (h >> 29); }
 static uint64_t raw_key(int st) {   /* what the answers depend on besides the bound handles */
     uint64_t h = mixk(0x51ED27ull, vt_treg_version());
@@ -606,12 +617,17 @@ static uint64_t raw_key(int st) {   /* what the answers depend on besides the bo
 vk_shader *vs_stage(vk_prog *pr, int st) {
     stage_t *t = &pr->st[st];
     if (!t->present) return NULL;
-    uint64_t rk = raw_key(st);
-    if (!g_memo[st].valid || g_memo[st].raw != rk || memcmp(g_memo[st].tex, S.tex[st], sizeof g_memo[st].tex) ||
-        memcmp(g_memo[st].img, S.img[st], sizeof g_memo[st].img)) {
+    static uint64_t rk_gen[6], rk_treg[6], rk_val[6]; static int rk_ok[6];   /* raw_key changes only with the vertex formats / targets / slots */
+    uint64_t tv = vt_treg_version(), rk;
+    if (rk_ok[st] && rk_gen[st] == S.key_gen && rk_treg[st] == tv) rk = rk_val[st];
+    else { rk = raw_key(st); rk_val[st] = rk; rk_gen[st] = S.key_gen; rk_treg[st] = tv; rk_ok[st] = 1; }
+    /* bind_gen unchanged: no bind since, the handles are the same (the compare is skipped) */
+    if (!g_memo[st].valid || g_memo[st].raw != rk || (g_memo[st].gen != S.bind_gen[st] &&
+        (memcmp(g_memo[st].tex, S.tex[st], sizeof g_memo[st].tex) || memcmp(g_memo[st].img, S.img[st], sizeof g_memo[st].img)))) {
         answers_of(st, &g_memo[st].a); g_memo[st].sig = answers_sig(&g_memo[st].a); g_memo[st].raw = rk; g_memo[st].valid = 1;
         memcpy(g_memo[st].tex, S.tex[st], sizeof g_memo[st].tex); memcpy(g_memo[st].img, S.img[st], sizeof g_memo[st].img);
     }
+    g_memo[st].gen = S.bind_gen[st];
     uint64_t sig = g_memo[st].sig;
     for (int i = 0; i < t->nlast; i++) if (t->last[i].sig == sig) return t->last[i].s;
     answers a = g_memo[st].a;   /* not one of this stage's recent variants: the full answers */

@@ -23,6 +23,9 @@ typedef struct {
     p_poly_offset po;
     float blend_color[4];
     int depth_clamp, raster_discard;
+    uint64_t bind_gen[6];
+    uint64_t tex_gen[6];
+    uint64_t key_gen;       /* moves on when the vertex formats or the render targets change (shader variant keys) */    /* the same without uniform buffer binds (their offsets are dynamic: stage_set reuse) */   /* moves on at every texture / sampler / image / buffer bind of the stage (cheap "unchanged" tests) */
 } vx_state;
 extern vx_state S;
 

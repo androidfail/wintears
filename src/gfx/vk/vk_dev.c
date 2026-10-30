@@ -182,6 +182,7 @@ static int create_device(void) {
     VkResult r = vkCreateDevice(vk_phys, &ci, NULL, &vk_dev);
     if (r != VK_SUCCESS) { VLOG("vkCreateDevice failed (%d)", (int)r); return -1; }
     volkLoadDevice(vk_dev);
+    vk_encode_install();
     vkGetDeviceQueue(vk_dev, vk_qfam, 0, &vk_q);
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
     VkPhysicalDeviceVulkan13Properties p13 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES, .pNext = &hp};
@@ -514,7 +515,7 @@ typedef struct chunk { VkBuffer buf; VmaAllocation al; uint8_t *map; VkDeviceSiz
 typedef struct { void (*fn)(void *); void *arg; } act_t;
 typedef struct sub {
     VkCommandPool pool; VkCommandBuffer pre, main;
-    uint64_t fence, t_submit, t_game, frame; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
+    uint64_t fence, t_submit, t_game, frame, t_enc, t_qs0, t_qs1; int frame_end; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
     int slot;   /* its two timestamp queries: 2 * slot, 2 * slot + 1 (GPU time of the submission) */
 } sub;
 #define CHUNK_SIZE (16ull << 20)   /* staging: larger requests get a chunk of their own size */
@@ -578,19 +579,32 @@ static void ts_begin(sub *s) {
 static void ts_end(sub *s) { if (g_ts && s->slot < TS_SLOTS) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, 2 * (uint32_t)s->slot + 1); }
 /* The completing submission's GPU end timestamp and the CPU time it was seen done: the anchor that turns the game's
    timestamp reports in it into the game's clock (vk_exec.c do_counter; completion thread only). */
-static uint64_t g_anchor_gpu, g_anchor_ns, g_anchor_t0, g_anchor_before, g_anchor_game; static int g_anchor_ok;
+static uint64_t g_anchor_gpu, g_anchor_ns, g_anchor_t0, g_anchor_before, g_anchor_game; static int g_anchor_ok;   /* g_anchor_t0: the frame's first GPU start; g_anchor_before: idle GPU time between its parts (ns) */
 int vk_done_anchor(uint64_t *gpu_end, uint64_t *cpu_ns) { if (!g_anchor_ok) return 0; *gpu_end = g_anchor_gpu; *cpu_ns = g_anchor_ns; return 1; }
 /* A GPU timestamp g of the completing submission in CPU time, as the Switch would have it: on the Switch the GPU
    starts on a frame when the game submits it, here only once the replay has translated it (15-35 ms on the Steam Deck).
    TOTK turns its frame's GPU timestamps into "GPU done, ticks after the CPU frame start" and raises its present
    interval when that is long (upstream nvn_mtl.m), so it ran at 20 fps for a delay the Switch does not have. Reported:
-   the game's submit time + the GPU time of the frame's earlier parts + the GPU time into this part (never later than
-   the real time). TOTK_TS_REBASE=0: the real time. */
+   the game's submit time + the GPU time since the frame's first part began, less the GPU's idle gaps between the
+   frame's parts (never later than the real time). Not a sum of each part's span: a part's top-of-pipe timestamp may
+   be written while the part before is still running, so the spans overlap (the game then measured ~37 ms for ~15 ms
+   of GPU work and stayed at 20 fps). TOTK_TS_REBASE=0: the real time. */
 int vk_done_rebase(uint64_t g, uint64_t *ns_out) {
     static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_TS_REBASE"); on = !(e && *e == '0'); VLOG("GPU timestamps reported from the game's submit (TOTK_TS_REBASE=%d)", on); }
-    if (!on || !g_anchor_ok || !g_anchor_game || g < g_anchor_t0 || g > g_anchor_gpu) return 0;
+    static uint64_t nok, nfail[4], last; uint64_t tn = pal_now_ns();   /* TOTK_DIAG */
+    if (tn - last > 10000000000ull) { if (last && (nok || nfail[0] || nfail[1] || nfail[2] || nfail[3])) VLOG("timestamps rebased %llu; left as they are: no anchor %llu, no submit time %llu, before the frame %llu, after the part %llu",
+        (unsigned long long)nok, (unsigned long long)nfail[0], (unsigned long long)nfail[1], (unsigned long long)nfail[2], (unsigned long long)nfail[3]); last = tn; nok = 0; memset(nfail, 0, sizeof nfail); }
+    if (!on) return 0;
+    if (!g_anchor_ok) { nfail[0]++; return 0; }
+    if (!g_anchor_game) { nfail[1]++; return 0; }
+    if (g < g_anchor_t0) { nfail[2]++; return 0; }
+    if (g > g_anchor_gpu) { nfail[3]++; return 0; }
+    nok++;
     uint64_t real = g_anchor_ns - (uint64_t)((double)(g_anchor_gpu - g) * vk_props.limits.timestampPeriod);
-    uint64_t r = g_anchor_game + g_anchor_before + (uint64_t)((double)(g - g_anchor_t0) * vk_props.limits.timestampPeriod);
+    uint64_t span = (uint64_t)((double)(g - g_anchor_t0) * vk_props.limits.timestampPeriod);
+    uint64_t r = g_anchor_game + (span > g_anchor_before ? span - g_anchor_before : 0);
+    {   static uint64_t mx, sum, n, lastl; uint64_t d = r - g_anchor_game; if (d > mx) mx = d; sum += d; n++;
+        if (tn - lastl > 10000000000ull) { if (lastl) VLOG("rebased timestamps: %.1f ms after the game's submit on average, %.1f at most (span %.1f, gaps %.1f now)", sum / 1e6 / (n ? n : 1), mx / 1e6, span / 1e6, g_anchor_before / 1e6); lastl = tn; mx = sum = n = 0; } }
     *ns_out = r < real ? r : real;
     return 1;
 }
@@ -600,10 +614,11 @@ static void ts_read(sub *s) {   /* the submission has completed */
     if (g_ts && s->slot < TS_SLOTS && vkGetQueryPoolResults(vk_dev, g_ts, 2 * (uint32_t)s->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
         atomic_fetch_add(&g_gpu_busy_ns, (uint64_t)((double)(t[1] - t[0]) * vk_props.limits.timestampPeriod));
         g_anchor_gpu = t[1]; g_anchor_ns = pal_now_ns(); g_anchor_ok = 1;
-        static uint64_t frame, before;   /* GPU time of the frame's earlier parts (completions come in order) */
-        if (s->frame != frame) { frame = s->frame; before = 0; }
-        g_anchor_t0 = t[0]; g_anchor_before = before; g_anchor_game = s->t_game;
-        before += (uint64_t)((double)(t[1] - t[0]) * vk_props.limits.timestampPeriod);
+        static uint64_t frame, f_t0, last_t1, gaps;   /* the frame's first GPU start, its last part's end, idle time between parts */
+        if (s->frame != frame) { frame = s->frame; f_t0 = t[0]; gaps = 0; }
+        else if (t[0] > last_t1) gaps += (uint64_t)((double)(t[0] - last_t1) * vk_props.limits.timestampPeriod);
+        last_t1 = t[1];
+        g_anchor_t0 = f_t0; g_anchor_before = gaps; g_anchor_game = s->t_game;
     }
 }
 
@@ -734,7 +749,7 @@ void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *
    page of every imported range a submission uses (amdgpu user pointers), about 10 ms a submission on the Steam Deck,
    and the game's render thread used to wait for that twice a frame (its work, then the present). Fences are timeline
    values given out at vk_flush, so waiting for one works whether it was submitted yet or not. */
-typedef struct qitem { struct qitem *next; int present; VkCommandBuffer cb[2]; VkSemaphoreSubmitInfo wait, sig[2]; int has_wait, nsig; } qitem;
+typedef struct qitem { struct qitem *next; struct sub *s; int present; VkCommandBuffer cb[2]; VkSemaphoreSubmitInfo wait, sig[2]; int has_wait, nsig; } qitem;
 static qitem *g_q_head, *g_q_tail;
 static int g_q_busy;
 static pthread_mutex_t g_q_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -748,11 +763,13 @@ static void q_push(qitem *it) {
     pthread_mutex_unlock(&g_q_mu);
 }
 void vk_submit_drain(void) {   /* everything asked for so far handed to the driver */
+    vk_encode_drain();
     pthread_mutex_lock(&g_q_mu);
     while (g_q_head || g_q_busy) pthread_cond_wait(&g_q_cv, &g_q_mu);
     pthread_mutex_unlock(&g_q_mu);
 }
-void vk_queue_present(void) { qitem *it = calloc(1, sizeof *it); if (!it) die("Vulkan: present"); it->present = 1; q_push(it); }
+static void q_push_v(void *it) { if (((qitem *)it)->s) ((qitem *)it)->s->t_enc = pal_now_ns(); q_push(it); }   /* on the encode thread, after the calls recorded before it */
+void vk_queue_present(void) { qitem *it = calloc(1, sizeof *it); if (!it) die("Vulkan: present"); it->present = 1; vk_encode_call(q_push_v, it); }
 void vp_do_present(void);   /* vk_present.c: acquire, copy, present (this thread) */
 static void *submit_thread(void *unused) {
     (void)unused;
@@ -772,6 +789,7 @@ static void *submit_thread(void *unused) {
             uint64_t tq = pal_now_ns();
             VkResult r = vkQueueSubmit2(vk_q, 1, &si, VK_NULL_HANDLE);
             atomic_fetch_add(&vk_ns_qsubmit, pal_now_ns() - tq);
+            if (it->s) { it->s->t_qs0 = tq; it->s->t_qs1 = pal_now_ns(); }
             if (n++ < 3) VLOG("submission %llu: %s", (unsigned long long)it->sig[0].value, r == VK_SUCCESS ? "accepted" : "refused");
             if (r != VK_SUCCESS) vk_lost(r), die("Vulkan: vkQueueSubmit2 failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
         }
@@ -787,6 +805,7 @@ static void *submit_thread(void *unused) {
 uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo *signal) {
     vk_open();
     if (!g_carry) { for (int i = 0; i < g_nfa; i++) vk_after(g_fa[i].fn, g_fa[i].arg); g_nfa = 0; }   /* the frame ends here */
+    g_cur->frame_end = !g_carry;
     sub *s = g_cur;
     if (g_bar_lazy) vk_barrier(s->main);
     VkMemoryBarrier2 hb ={VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -798,11 +817,11 @@ uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo
     if (!g_fence) { pthread_mutex_lock(&g_pool_mu); imports_describe(); pthread_mutex_unlock(&g_pool_mu); }
     qitem *it = calloc(1, sizeof *it);
     if (!it) die("Vulkan: submission");
-    it->cb[0] = s->pre; it->cb[1] = s->main;
+    it->cb[0] = s->pre; it->cb[1] = s->main; it->s = s; s->t_enc = s->t_qs0 = s->t_qs1 = 0;
     it->sig[0] = (VkSemaphoreSubmitInfo){VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_tl, .value = g_fence + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     it->nsig = 1; if (signal) it->sig[it->nsig++] = *signal;
     if (wait) { it->wait = *wait; it->has_wait = 1; }
-    q_push(it);
+    vk_encode_call(q_push_v, it);
     s->fence = ++g_fence; s->next = NULL; s->t_submit = pal_now_ns();
     g_cur = NULL;
     pthread_mutex_lock(&g_done_mu);
@@ -848,6 +867,17 @@ static void *done_thread(void *unused) {
         VkResult r = vkWaitSemaphores(vk_dev, &wi, UINT64_MAX);
         if (r != VK_SUCCESS) vk_lost(r), die("Vulkan: waiting for the GPU failed (%d)%s", (int)r, r == VK_ERROR_DEVICE_LOST ? ": the GPU stopped (device lost)" : "");
         lat_note(pal_now_ns() - s->t_submit); ts_read(s);
+        if (s->frame_end && s->t_game) {   /* TOTK_DIAG: the game's submit to its frame seen done here */
+            static uint64_t sum, mx, n, last, rep, sub_q, enc, qw, qs, gpu; uint64_t now = pal_now_ns(), d = now - s->t_game; sum += d; n++; if (d > mx) mx = d;
+            rep += s->t_submit > s->t_game ? s->t_submit - s->t_game : 0; sub_q += s->t_submit ? now - s->t_submit : 0;
+            if (s->t_enc && s->t_qs1 && s->t_enc >= s->t_submit && s->t_qs0 >= s->t_enc && now >= s->t_qs1) { enc += s->t_enc - s->t_submit; qw += s->t_qs0 - s->t_enc; qs += s->t_qs1 - s->t_qs0; gpu += now - s->t_qs1; }
+            {   static int nslow; 
+                static uint64_t t_first_frame; if (!t_first_frame) t_first_frame = now;
+                if (d > 40000000ull && nslow < 40 && now - t_first_frame > 150000000000ull) { nslow++; VLOG("slow frame: done %.1f ms after the game's submit: replay %.1f, then %.1f (submit queue %.1f, vkQueueSubmit2 %.1f, GPU %.1f)",
+                    d / 1e6, (s->t_submit - s->t_game) / 1e6, (now - s->t_submit) / 1e6, s->t_qs0 > s->t_enc ? (s->t_qs0 - s->t_enc) / 1e6 : 0.0, (s->t_qs1 - s->t_qs0) / 1e6, now > s->t_qs1 ? (now - s->t_qs1) / 1e6 : 0.0); } }
+            if (now - last > 10000000000ull) { if (last && n) VLOG("frames done %.1f ms after the game's submit on average (at most %.1f): replayed and handed over after %.1f, then %.1f to done (encoded %.1f, waited for the submit thread %.1f, vkQueueSubmit2 %.1f, GPU and wake-up %.1f)",
+                sum / 1e6 / n, mx / 1e6, rep / 1e6 / n, sub_q / 1e6 / n, enc / 1e6 / n, qw / 1e6 / n, qs / 1e6 / n, gpu / 1e6 / n); last = now; sum = mx = n = rep = sub_q = enc = qw = qs = gpu = 0; }
+        }
         for (int i = 0; i < s->nact; i++) s->acts[i].fn(s->acts[i].arg);
         s->nact = 0;
         pthread_mutex_lock(&g_done_mu);
@@ -997,7 +1027,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
         { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu imports alive (%.0f MiB), of them %llu windows (%.0f MiB, %d over physical memory)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6,
                                      (unsigned long long)g_import_all, g_import_bytes / 1048576.0, (unsigned long long)g_win_n, g_win_bytes / 1048576.0, g_aw_live); vk_ns_hash = 0; }
-        { extern uint64_t vk_ns_draw, vk_ns_sets, vk_ns_dsmake, vk_ns_emit; extern uint64_t vk_ub_copies, vk_ub_copy_bytes; VLOG("of the replay: draws %.0f ms (descriptor sets %.0f, of them made %.0f; commands %.0f); uniform copies %llu (%.0f MiB)", vk_ns_draw / 1e6, vk_ns_sets / 1e6, vk_ns_dsmake / 1e6, vk_ns_emit / 1e6, (unsigned long long)vk_ub_copies, vk_ub_copy_bytes / 1048576.0); vk_ub_copies = vk_ub_copy_bytes = 0; vk_ns_draw = vk_ns_sets = vk_ns_dsmake = vk_ns_emit = 0; }
+        { extern uint64_t vk_ns_draw, vk_ns_sets, vk_ns_dsmake, vk_ns_emit; extern uint64_t vk_ub_copies, vk_ub_copy_bytes, g_early_hits, g_early_miss[5]; VLOG("of the replay: sets reused without resolving %llu; not: shader not eligible %llu, other shader %llu, new frame or slots %llu, binds changed %llu, uniforms moved %llu", (unsigned long long)g_early_hits, (unsigned long long)g_early_miss[0], (unsigned long long)g_early_miss[1], (unsigned long long)g_early_miss[2], (unsigned long long)g_early_miss[3], (unsigned long long)g_early_miss[4]); g_early_hits = 0; memset(g_early_miss, 0, sizeof g_early_miss); VLOG("of the replay: draws %.0f ms (descriptor sets %.0f, of them made %.0f; commands %.0f); uniform copies %llu (%.0f MiB)", vk_ns_draw / 1e6, vk_ns_sets / 1e6, vk_ns_dsmake / 1e6, vk_ns_emit / 1e6, (unsigned long long)vk_ub_copies, vk_ub_copy_bytes / 1048576.0); vk_ub_copies = vk_ub_copy_bytes = 0; vk_ns_draw = vk_ns_sets = vk_ns_dsmake = vk_ns_emit = 0; }
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average, GPU busy %.0f ms; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, atomic_exchange(&g_gpu_busy_ns, 0) / 1e6, w / 1e6, g_sh_bytes / 1048576.0);
         if (vk_n_pass) { char pe[400]; vx_pass_end_report(pe, sizeof pe); VLOG("pass ends by place (last 10 s): %s", pe); }

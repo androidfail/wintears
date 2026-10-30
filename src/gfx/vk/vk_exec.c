@@ -330,11 +330,12 @@ static int begin_pass(void) {
     for (int i = 0; i < n; i++) {
         ca[i] = (VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = cv[i], .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                                             .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-        if (col[i]) { snprintf(vt_writer, sizeof vt_writer, "render pass %ux%u, target %d NVN format %#x", w, h, i, S.rt.color[i]->d.format); vt_written(col[i]); }
+        if (col[i]) { if (vt_prov_strings()) snprintf(vt_writer, sizeof vt_writer, "render pass %ux%u, target %d NVN format %#x", w, h, i, S.rt.color[i]->d.format); vt_written(col[i]); }
     }
     int has_d = dep && (vt_aspect(dep) & VK_IMAGE_ASPECT_DEPTH_BIT), has_s = dep && (vt_aspect(dep) & VK_IMAGE_ASPECT_STENCIL_BIT);
     if (dep) {
-        snprintf(vt_writer, sizeof vt_writer, "render pass %ux%u (depth)", w, h); vt_written(dep);
+        if (vt_prov_strings()) snprintf(vt_writer, sizeof vt_writer, "render pass %ux%u (depth)", w, h);
+        vt_written(dep);
         da.imageView = dv; da.imageLayout = VK_IMAGE_LAYOUT_GENERAL; da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     }
     sa = da;
@@ -739,7 +740,7 @@ void vx_run(const uint8_t *p) {
         case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); copy_b2b(s, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, a + 16, n); break; }
         case OP_SET_RT:   /* the game often sets the targets it already has: keep the pass (records are zeroed, pins are per texture) */
-            if (!S.has_rt || memcmp(&S.rt, a, sizeof S.rt)) { vx_end_pass(); if (vk_split_due()) vk_split(1); memcpy(&S.rt, a, sizeof S.rt); }
+            if (!S.has_rt || memcmp(&S.rt, a, sizeof S.rt)) { vx_end_pass(); if (vk_split_due()) vk_split(1); memcpy(&S.rt, a, sizeof S.rt); S.key_gen++; }
             S.has_rt = 1; break;
         case OP_CLEAR_COLOR: clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: clear_ds((const p_clear_ds *)a); break;

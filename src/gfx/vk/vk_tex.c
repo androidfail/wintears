@@ -59,11 +59,14 @@ void vt_size(const vtex *e, unsigned level, uint32_t *w, uint32_t *h, uint32_t *
     *w = mip(e->w, level); *h = e->type == VK_IMAGE_TYPE_1D ? 1 : mip(e->h, level); *d = e->type == VK_IMAGE_TYPE_3D ? mip(e->d, level) : 1;
 }
 char vt_writer[96];
+/* who last wrote a texture, as text: read by the pass log, captures (F9) and TOTK_PROVENANCE=1 dumps only, and
+   formatting it at every pass and upload was ~4% of the Steam Deck's replay */
+int vt_prov_strings(void) { extern int vk_passlog_on; static int env = -1; if (env < 0) { const char *e = pal_getenv("TOTK_PROVENANCE"); env = e && *e == '1'; } return env || vk_passlog_on; }
 void vt_written(vtex *e) {
     if (!e) return;
     if (e->drop) VK_ONCE("a texture uploaded without its top mip level is written by the GPU (%s): it may look wrong; TOTK_MIP_DROP=0 avoids it", vt_writer);
     e->owned = 1;
-    snprintf(e->writer, sizeof e->writer, "%s (submission %llu)", vt_writer[0] ? vt_writer : "?", (unsigned long long)vk_sub_serial());
+    if (vt_prov_strings()) snprintf(e->writer, sizeof e->writer, "%s (submission %llu)", vt_writer[0] ? vt_writer : "?", (unsigned long long)vk_sub_serial());
     memset(&e->prov, 0, sizeof e->prov);
     uint64_t vk_present_count(void); e->prov.present = vk_present_count();
 }
@@ -74,7 +77,7 @@ static uint64_t stor_mem(const tex_t *t);
 static struct { uint64_t mem; uint32_t w, h, fmt; } g_pin[8]; static int g_npin;
 void vt_prov_reset(void) { g_npin = 0; }
 void vt_prov_input(const tex_t *t) {   /* a texture the coming draw samples */
-    if (!t || !t->mem) return;
+    if (!t || !t->mem || !vt_prov_strings()) return;
     uint64_t m = stor_mem(t);
     for (int i = 0; i < g_npin; i++) if (g_pin[i].mem == m && g_pin[i].fmt == (uint32_t)t->d.format) return;
     if (g_npin < 8) g_pin[g_npin++] = (typeof(g_pin[0])){m, t->d.width, t->d.height, (uint32_t)t->d.format};
@@ -86,7 +89,7 @@ static void prov_add(vtex *e, uint64_t mem, uint32_t w, uint32_t h, uint32_t fmt
 void vt_prov_drop(vtex *e, const char *why) { if (e) { e->prov.ndrop++; snprintf(e->prov.drop, sizeof e->prov.drop, "%s", why); } }
 void vt_prov_copy(vtex *e, const tex_t *src) { if (e && src) prov_add(e, stor_mem(src), src->d.width, src->d.height, (uint32_t)src->d.format); }
 void vt_prov_draw(vtex *e, const char *vs, const char *fs) {   /* a draw into e (a target of the open pass) read the pending inputs */
-    if (!e) return;
+    if (!e || !vt_prov_strings()) return;   /* diagnostics only (the chains): a string and compares at every draw */
     e->prov.ndraws++;
     char nm[40]; snprintf(nm, sizeof nm, "%.18s+%.18s", vs ? vs : "-", fs ? fs : "-");
     int have = 0; for (int i = 0; i < e->prov.nsh; i++) if (!strcmp(e->prov.sh[i], nm)) have = 1;
@@ -526,7 +529,7 @@ static void upload(vtex *e, const tex_t *t) {
     g_uploads++; g_upload_bytes += t->L.size; if (e->uploaded) g_reuploads++;
     if (!nvn_dirty_tracked(t->mem, (size_t)t->L.size)) g_untracked++;
     e->stamp = nvn_dirty_now();
-    snprintf(e->writer, sizeof e->writer, "upload from pool memory (submission %llu)", (unsigned long long)vk_sub_serial());
+    if (vt_prov_strings()) snprintf(e->writer, sizeof e->writer, "upload from pool memory (submission %llu)", (unsigned long long)vk_sub_serial());
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* before copying: a write from here on is seen at the next check */
     if (!nvn_dirty_protecting()) content_note(e, t, vk_frame_serial());
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -837,14 +840,25 @@ void vt_init(void) {
 }
 
 void vt_set_pool_n(int n) { (void)n; }
+/* Readers (every texture and sampler binding of every draw) take no lock: a sequence count, odd while a writer is at
+   work, and a read that saw it change is made again. Under Wine the shared lock was ~10% of the Steam Deck's replay
+   (the game registers textures from other threads all the time, and each meeting is a wait and a wake). Arrays that
+   grow are not freed: a reader may still be copying from the old one (its read is then made again). */
+static _Atomic uint64_t g_rseq;
+static void wr_begin(void) { atomic_fetch_add_explicit(&g_rseq, 1, memory_order_acq_rel); atomic_thread_fence(memory_order_release); }
+static void wr_end(void) { atomic_thread_fence(memory_order_release); atomic_fetch_add_explicit(&g_rseq, 1, memory_order_release); }
 void vt_reg_tex(int id, const tex_t *t, const view_t *v) {
     if (id < 0 || id >= (1 << 20)) return;
     pal_mutex_lock(&g_rmu);
     if (id >= g_ntreg) {
         int n = g_ntreg ? g_ntreg : 1024; while (n <= id) n *= 2;
-        g_treg = realloc(g_treg, (size_t)n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (size_t)(n - g_ntreg) * sizeof *g_treg); g_ntreg = n;
+        treg *nt = calloc((size_t)n, sizeof *nt); if (!nt) die("texture slots");
+        if (g_ntreg) memcpy(nt, g_treg, (size_t)g_ntreg * sizeof *nt);
+        wr_begin(); g_treg = nt; g_ntreg = n; wr_end();   /* the old array stays (a reader may be in it) */
     }
+    wr_begin();
     g_treg[id].t = *t; g_treg[id].has_v = v != NULL; if (v) g_treg[id].v = *v; g_treg[id].ok = 1;
+    wr_end();
     atomic_fetch_add_explicit(&g_treg_ver, 1, memory_order_relaxed);
     pal_mutex_unlock(&g_rmu);
 }
@@ -853,26 +867,36 @@ void vt_reg_samp(int id, const samp_par *p) {
     pal_mutex_lock(&g_rmu);
     if (id >= g_nsreg) {
         int n = g_nsreg ? g_nsreg : 256; while (n <= id) n *= 2;
-        g_sreg = realloc(g_sreg, (size_t)n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, (size_t)n);
-        memset(g_sreg_ok + g_nsreg, 0, (size_t)(n - g_nsreg)); g_nsreg = n;
+        samp_par *ns = calloc((size_t)n, sizeof *ns); uint8_t *nok = calloc((size_t)n, 1); if (!ns || !nok) die("sampler slots");
+        if (g_nsreg) { memcpy(ns, g_sreg, (size_t)g_nsreg * sizeof *ns); memcpy(nok, g_sreg_ok, (size_t)g_nsreg); }
+        wr_begin(); g_sreg = ns; g_sreg_ok = nok; g_nsreg = n; wr_end();
     }
-    g_sreg[id] = *p; g_sreg_ok[id] = 1;
+    wr_begin(); g_sreg[id] = *p; g_sreg_ok[id] = 1; wr_end();
+    atomic_fetch_add_explicit(&g_treg_ver, 1, memory_order_relaxed);
     pal_mutex_unlock(&g_rmu);
 }
 /* The registered texture / sampler of a slot (copies, so the game may re-register meanwhile). */
 int vt_slot_tex(int id, tex_t *t, view_t *v, int *has_v) {
-    pal_mutex_lock_shared(&g_rmu);
-    int ok = id >= 0 && id < g_ntreg && g_treg[id].ok;
-    if (ok) { *t = g_treg[id].t; *v = g_treg[id].v; *has_v = g_treg[id].has_v; }
-    pal_mutex_unlock_shared(&g_rmu);
-    return ok;
+    for (;;) {
+        uint64_t s = atomic_load_explicit(&g_rseq, memory_order_acquire);
+        if (s & 1) { pal_yield(); continue; }
+        treg *r = g_treg; int n = g_ntreg;
+        int ok = id >= 0 && id < n && r[id].ok;
+        if (ok) { *t = r[id].t; *v = r[id].v; *has_v = r[id].has_v; }
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&g_rseq, memory_order_relaxed) == s) return ok;
+    }
 }
 int vt_slot_samp(int id, samp_par *p) {
-    pal_mutex_lock_shared(&g_rmu);
-    int ok = id >= 0 && id < g_nsreg && g_sreg_ok[id];
-    if (ok) *p = g_sreg[id];
-    pal_mutex_unlock_shared(&g_rmu);
-    return ok;
+    for (;;) {
+        uint64_t s = atomic_load_explicit(&g_rseq, memory_order_acquire);
+        if (s & 1) { pal_yield(); continue; }
+        const samp_par *r = g_sreg; const uint8_t *ok_ = g_sreg_ok; int n = g_nsreg;
+        int ok = id >= 0 && id < n && ok_[id];
+        if (ok) *p = r[id];
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&g_rseq, memory_order_relaxed) == s) return ok;
+    }
 }
 
 static VkSamplerAddressMode wrap(int m) {

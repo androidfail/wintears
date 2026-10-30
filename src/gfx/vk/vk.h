@@ -148,6 +148,10 @@ VkBufferView vt_texel_view_copy(const tex_t *t);   /* sampled use only: a view o
 
 /* vk_exec.c ----------------------------------------------------------------------------------------------------- */
 void vx_run(const uint8_t *list);   /* replay one recording into the open submission */
+int vt_prov_strings(void);   /* the texture writer texts are wanted (pass log, capture, TOTK_PROVENANCE=1) */
+void vk_encode_install(void);   /* vk_encode.c: Vulkan command calls made on their own thread */
+void vk_encode_drain(void);
+void vk_encode_call(void (*fn)(void *), void *arg);
 uint64_t vk_frame_serial(void);   /* moves on per frame, not at a timed split (vk_split(1)) */
 void vk_after_frame(void (*fn)(void *), void *arg);   /* run when the frame's last submission is done */
 int vk_split_due(void);   /* TOTK_SPLIT_MS of replay since the submission began */

@@ -6,10 +6,12 @@
 
 enum { RB_SUPPORT, RB_C1, RB_DRV0, RB_DRV2, RB_CBUF, RB_SBUF, RB_UBOPTR, RB_SBUFUBO, RB_TEX, RB_SAMP, RB_IMG, RB_NONE };
 enum { DT_UBO, DT_SSBO, DT_CIS, DT_SI, DT_SAMP, DT_UTB, DT_SIMG, DT_STB };
-typedef struct { uint16_t binding, count; uint8_t type, kind, rw, view; int16_t reg, sreg; uint16_t off; } vs_bind;   /* view: VkImageViewType */
+typedef struct { uint16_t binding, count; uint8_t type, kind, rw, view; int16_t reg, sreg; uint16_t off; uint8_t dyn; } vs_bind;   /* dyn: first dynamic offset index (uniform buffers of a ndyn shader) */   /* view: VkImageViewType */
 typedef struct vk_shader {
     char name[112]; int stage;   /* NVN stage: 0 vertex, 1 fragment, 5 compute */
     VkShaderModule mod; VkDescriptorSetLayout dsl;
+    int ndyn;   /* uniform buffers are dynamic: their offsets are given at bind time (0: plain) */
+    int early;  /* stage_set may reuse its last set when no binding but uniforms changed: 0 not decided, 1 yes, 2 no */
     int nb; vs_bind *b;
     uint32_t in_mask, out_mask, local[3]; int writes_depth;
     VkBuffer c1_buf; VkDeviceSize c1_off; uint32_t c1_size;   /* the shader's own constants (bank c1), in the c1 arena */
