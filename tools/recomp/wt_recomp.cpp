@@ -16,6 +16,7 @@
 #include <optional>
 #include <string>
 #include <unordered_set>
+#include "../../src/host/game_patch.h"
 #include <vector>
 
 #include <array>
@@ -937,6 +938,7 @@ int main(int argc, char **argv) {
         Module m; m.name = n;
         if (!load(std::string(argv[1]) + "/data/v0/exefs/" + n, m)) { fprintf(stderr, "cannot load %s\n", n); return 1; }
         m.base = at;
+        if (!strcmp(n, "main")) printf("real-time frame step: %d instructions patched\n", gp_apply_realtime(m.img.data(), m.base, m.text_hi));
         at = (at + ((m.img.size() + 0xfff) & ~0xfffull) + 0x1fffff) & ~0x1fffffull;
         printf("%s at 0x%llx, %zu function starts\n", n, (unsigned long long)m.base, m.seeds.size());
         p.mods.push_back(std::move(m));

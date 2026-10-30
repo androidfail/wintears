@@ -11,6 +11,8 @@
    own entry, nn::init::Start(main thread handle, 0, loader_ready, module_inits, module_finis), in the JIT on this
    thread, which becomes the guest main thread. The Horizon host (src/host) answers the svcs it has ported; the first
    one it cannot answer ends the run with the guest's registers and call chain. --trace logs every svc. */
+#include "host/game_patch.h"
+uint64_t host_object_page(void);   /* hos.h */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +92,14 @@ static int load_modules(const char *root) {
         ldr_module *m = ldr_map(mods, names[i], nso, size, at, err, sizeof err);
         free(nso);
         if (!m) { LOG("%s", err); return -1; }
+        if (i == 0) {   /* before linking: the text is still writable */
+            if (m->base + GP_STEP_OFF != host_object_page() + 0x1000) { LOG("real-time frame step: runtime page moved"); return -1; }
+            int n = gp_apply_realtime((uint8_t *)(uintptr_t)m->base, m->base, m->text_off + m->text_size);
+            float sec = 1.0f / 30, ratio = 1.0f; uint32_t lo, hi; memcpy(&lo, &ratio, 4); memcpy(&hi, &sec, 4);   /* until the first present */
+            *(volatile uint64_t *)(uintptr_t)(m->base + GP_STEP_OFF) = (uint64_t)lo | (uint64_t)hi << 32;
+            if (n) LOG("real-time frame step: %d instructions patched (game time follows the measured frame time)", n);
+            else LOG("real-time frame step: original instructions not found (another game version), left off");
+        }
         LOG("mapped %-7s at 0x%llx size 0x%llx, %u symbols", m->name, (unsigned long long)m->base,
             (unsigned long long)m->size, m->nsym);
         at = (at + need + 0x1fffff) & ~0x1fffffull;

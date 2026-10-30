@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include "host/host.h"
+#include "host/game_patch.h"
 #include <stdatomic.h>
 
 #include "gfx/nvn_reg.h"
@@ -1294,9 +1295,9 @@ static void game_work_tick(uint64_t frame) {
     qsort(win, n, sizeof *win, dcmp); qsort(acq, n, sizeof *acq, dcmp);
     const int32_t *k = (const int32_t *)(g_game_sys + 0x248); const uint8_t *b = (const uint8_t *)g_game_sys;
     LOG("[nvn] game work time (+0x118, decides 20/30 fps) to frame %llu: p50 %.1f p90 %.1f max %.1f ms, %d of %d over 33.3; "
-        "AcquireTexture wait p50 %.1f p90 %.1f avg %.1f ms; controller %d..%d bias %.3f now %d; frame-end wait for GPU (+0x223) %u",
+        "AcquireTexture wait p50 %.1f p90 %.1f avg %.1f ms; controller %d..%d bias %.3f now %d; frame-end wait for GPU (+0x223) %u; game time step %.1f ms",
         (unsigned long long)frame, win[n / 2], win[n * 9 / 10], win[n - 1], over, n, acq[n / 2], acq[n * 9 / 10], a / n,
-        k[0], k[1], *(const float *)&k[2], k[5], b[0x223]);
+        k[0], k[1], *(const float *)&k[2], k[5], b[0x223], *(const float *)(host_code_base() + GP_STEP_OFF + 4) * 1e3);
     {   /* the main (controller) thread's waits per frame since the last line */
         static uint64_t prev[3], pf; uint64_t t[3]; host_thread_times(g_main_thr, t); double nf = (double)(frame - pf);
         LOG("[nvn] main thread per frame: waiting for a core %.1f ms, guest waits %.1f ms, NVN host calls %.1f ms",
@@ -1304,6 +1305,25 @@ static void game_work_tick(uint64_t frame) {
         memcpy(prev, t, sizeof t); pf = frame;
     }
     n = 0;
+}
+/* Real-time frame step (host/game_patch.h): {ratio = seconds * 30, seconds} the patched game reads each frame, from the
+   last 5 present intervals (upstream runtime_frame_step_update). TOTK_REALTIME=0: the game's own step, interval / 60. */
+static void frame_step_update(uint64_t now, int interval) {
+    static uint64_t last; static double smp[5]; static unsigned cnt, nxt; static int off = -1;
+    if (off < 0) { const char *e = getenv("TOTK_REALTIME"); off = e && *e == '0'; }
+    volatile uint64_t *d = (volatile uint64_t *)(host_code_base() + GP_STEP_OFF);
+    double dt = (interval > 0 ? interval : 2) / 60.0;
+    if (!off && last) {
+        double m = (now - last) * 1e-9;
+        if (m > 0.25 || m < 0.001) cnt = nxt = 0;
+        else {
+            smp[nxt++ % 5] = m < 1.0 / 120 ? 1.0 / 120 : m > 1.0 / 15 ? 1.0 / 15 : m; if (cnt < 5) cnt++;
+            double s = 0; for (unsigned i = 0; i < cnt; i++) s += smp[i]; dt = s / cnt;
+        }
+    }
+    last = now;
+    float sec = (float)dt, ratio = sec * 30.0f; uint32_t lo, hi; memcpy(&lo, &ratio, 4); memcpy(&hi, &sec, 4);
+    __atomic_store_n(d, (uint64_t)lo | (uint64_t)hi << 32, __ATOMIC_RELEASE);
 }
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
     if (((win_t *)w)->interval != v) LOG("[nvn] the game sets the present interval %d -> %d", ((win_t *)w)->interval, v);
@@ -1363,6 +1383,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     o->pace = pc.target;
     if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
     g_frame++;
+    frame_step_update(now, o->interval);
     game_work_tick(g_frame);
     static uint64_t t300;
     if (g_frame == 1) { LOG("[nvn] first present (swapchain image %d)", idx); t300 = now; }
