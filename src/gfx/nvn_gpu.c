@@ -31,6 +31,7 @@ void nvn_pin_step_now(void);   /* nvn.c: free texture copies no recording refers
 static void *x_thread(void *unused) {
     (void)unused;
     pal_thread_set_name("translation");
+    pal_thread_pin(1);
     pal_thread_set_priority(PAL_PRIO_HIGH);   /* on the critical path of every frame: ahead of the game's workers (upstream: real-time) */
     for (;;) {
         pthread_mutex_lock(&g_mu);

@@ -366,6 +366,29 @@ void pal_thread_set_priority(int prio) {
     SetThreadPriority(GetCurrentThread(), p);
 }
 
+/* TOTK_PIN=<core>: the translation thread gets that core (both hardware threads) and the game's threads stay off it;
+   TOTK_PIN_SPLIT=1: translation on the core's first hardware thread, the Vulkan call thread on the second. Wine ignores
+   thread priorities but passes affinity to Linux. Assumes a core's hardware threads are adjacent (Steam Deck, most PCs). */
+void pal_thread_pin(int role) {
+    static int core = -2, split;
+    if (core == -2) {   /* Steam Deck default (Steam sets SteamDeck=1): core 3 split, measured 41 -> 25 ms per frame */
+        const char *e = pal_getenv("TOTK_PIN"), *s = pal_getenv("TOTK_PIN_SPLIT"), *d = pal_getenv("SteamDeck");
+        int deck = d && *d == '1';
+        if (!deck) {   /* Proton maps / to Z:; Deck LCD is "Jupiter", OLED "Galileo" */
+            char n[16] = {0}; FILE *f = fopen("Z:\\sys\\class\\dmi\\id\\product_name", "r");
+            if (f) { fgets(n, sizeof n, f); fclose(f); deck = !strncmp(n, "Jupiter", 7) || !strncmp(n, "Galileo", 7); }
+        }
+        core = e && *e ? atoi(e) : deck ? 3 : -1;
+        split = s && *s ? *s == '1' : deck;
+    }
+    if (core < 0) return;
+    DWORD_PTR all, sys, mine = (DWORD_PTR)3 << (2 * core);
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &all, &sys)) return;
+    DWORD_PTR first = (DWORD_PTR)1 << (2 * core), second = first << 1;
+    DWORD_PTR m = role == 1 ? (split ? first : mine) : role == 2 && split ? second : all & ~mine;
+    if (m & all) SetThreadAffinityMask(GetCurrentThread(), m & all);
+}
+
 uint64_t pal_thread_id(void) { return GetCurrentThreadId(); }
 void pal_yield(void) { SwitchToThread(); }
 

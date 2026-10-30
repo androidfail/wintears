@@ -78,6 +78,7 @@ void pal_thread_join(pal_thread *t);
 void pal_thread_set_name(const char *name);
 enum { PAL_PRIO_LOW = -1, PAL_PRIO_NORMAL = 0, PAL_PRIO_HIGH = 1, PAL_PRIO_REALTIME = 2 };
 void pal_thread_set_priority(int prio);
+void pal_thread_pin(int role);   /* TOTK_PIN: 1 translation, 2 Vulkan calls, 0 the game's threads */
 uint64_t pal_thread_id(void);
 void pal_yield(void);
 

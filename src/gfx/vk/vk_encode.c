@@ -25,7 +25,7 @@ static _Atomic int g_sleeping, g_on;
 static uint64_t g_resv_at; static uint32_t g_resv_n, g_resv_used;   /* the record being written (producer lock held) */
 
 static void *encode_thread(void *unused) {
-    (void)unused; pal_thread_set_name("vk encode"); pal_thread_set_priority(PAL_PRIO_HIGH);
+    (void)unused; pal_thread_set_name("vk encode"); pal_thread_set_priority(PAL_PRIO_HIGH); pal_thread_pin(2);
     for (;;) {
         uint64_t r = atomic_load_explicit(&g_r, memory_order_relaxed), w = atomic_load_explicit(&g_w, memory_order_acquire);
         if (r == w) {

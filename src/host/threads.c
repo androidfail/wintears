@@ -397,6 +397,7 @@ static void *thread_main(void *p) {
     pthread_setspecific(g_keythr, t);
     pthread_setspecific(runtime_keys[2], (void *)(uintptr_t)t->tls);
     { char nm[32]; snprintf(nm, sizeof nm, "guest %#x p%d", t->handle, t->prio); pal_thread_set_name(nm); }
+    pal_thread_pin(0);
     t->osh = pal_thread_handle_self();
     G_lock(); while (!t->started) pthread_cond_wait(&t->cv, &G); core_take(t); pthread_mutex_unlock(&G);
     jit_context c;
