@@ -148,8 +148,11 @@ VkBufferView vt_texel_view_copy(const tex_t *t);   /* sampled use only: a view o
 
 /* vk_exec.c ----------------------------------------------------------------------------------------------------- */
 void vx_run(const uint8_t *list);   /* replay one recording into the open submission */
+uint64_t vk_frame_serial(void);   /* moves on per frame, not at a timed split (vk_split(1)) */
+void vk_after_frame(void (*fn)(void *), void *arg);   /* run when the frame's last submission is done */
+int vk_split_due(void);   /* TOTK_SPLIT_MS of replay since the submission began */
 int vk_stage_heavy(void);   /* the open submission holds a lot of staging: split it (vk_split) at the next command */
-void vk_split(void);
+void vk_split(int carry);   /* carry: a timed split (the frame stays open) */
 void vx_end_pass_at(const char *file, int line);   /* the render pass in progress ends (before copies, uploads, present) */
 #define vx_end_pass() vx_end_pass_at(__FILE__, __LINE__)   /* TOTK_DIAG counts pass ends by where they happen */
 void vx_pass_end_report(char *out, size_t cap);

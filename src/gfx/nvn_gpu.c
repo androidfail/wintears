@@ -16,7 +16,9 @@ static const gpu_ops *B = &gpu_null_ops;
 static int A;   /* the translation thread is on */
 
 enum { J_SUBMIT = 1, J_PRESENT, J_TEXREL, J_PROGREL, J_POOL_ADD, J_POOL_DEL };
-typedef struct { int kind, n; uint64_t *h; const tex_t *t; double period; int crop[4]; void *obj; const void *mem; uint64_t size, sub; } job;
+typedef struct { int kind, n; uint64_t *h; const tex_t *t; double period; int crop[4]; void *obj; const void *mem; uint64_t size, sub, t_ns; } job;
+uint64_t gpu_game_submit_ns;
+static uint64_t g_last_present_ns, g_sub_after_present_ns, g_sub_after_present_n;   /* TOTK_DIAG: where in its frame the game submits */   /* when the game submitted the work being replayed (vk_dev.c: GPU timestamps are reported from there) */
 #define XQ 64     /* queued jobs at most (the game waits for room) */
 #define XF 4096   /* fences / present tickets remembered */
 static job g_q[XQ];
@@ -37,7 +39,7 @@ static void *x_thread(void *unused) {
         pthread_mutex_unlock(&g_mu);
         uint64_t ticket = 0, fence = 0;
         switch (j.kind) {
-        case J_SUBMIT: nvn_pin_step_now(); fence = B->submit(j.h, j.n); free(j.h); break;
+        case J_SUBMIT: nvn_pin_step_now(); gpu_game_submit_ns = j.t_ns; fence = B->submit(j.h, j.n); free(j.h); break;
         case J_PRESENT: ticket = B->present(j.t, j.period, j.crop); break;
         case J_TEXREL: B->tex_release(j.obj); free(j.obj); break;
         case J_PROGREL: B->prog_release(j.obj); free(j.obj); break;
@@ -118,8 +120,9 @@ void gpu_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
 void gpu_write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img) { drain(); B->write_texels(t, level, layer0, r, src, row, img); }
 void gpu_pin_refs(void (*mark)(const void *)) { B->pin_refs(mark); }
 uint64_t gpu_submit(const uint64_t *handles, int n) {
-    if (!A) return B->submit(handles, n);
-    job j = {.kind = J_SUBMIT, .n = n, .h = dup_obj(handles, sizeof *handles * (size_t)(n > 0 ? n : 1))};
+    if (!A) { gpu_game_submit_ns = pal_now_ns(); return B->submit(handles, n); }
+    job j = {.kind = J_SUBMIT, .n = n, .h = dup_obj(handles, sizeof *handles * (size_t)(n > 0 ? n : 1)), .t_ns = pal_now_ns()};
+    if (g_last_present_ns) { g_sub_after_present_ns += j.t_ns - g_last_present_ns; g_sub_after_present_n++; }
     push(&j);
     return j.sub;
 }
@@ -145,7 +148,19 @@ int gpu_wait(uint64_t k, uint64_t timeout_ns) {
     return B->wait(f, timeout_ns > used ? timeout_ns - used : 0);
 }
 void gpu_finish(void) { drain(); B->finish(); }
+static void present_note(void) {
+    uint64_t now = pal_now_ns(); static uint64_t last_log, frames, sum_iv; static int diag = -1;
+    if (diag < 0) { const char *d = pal_getenv("TOTK_DIAG"); diag = d && *d == '1'; }
+    if (g_last_present_ns) { sum_iv += now - g_last_present_ns; frames++; }
+    g_last_present_ns = now;
+    if (diag && now - last_log > 10000000000ull) {
+        if (last_log && frames) LOG("[gpu] game frames (last 10 s): %.1f ms apart; submits %.1f ms after the last present on average (%llu)", sum_iv / 1e6 / frames,
+                                    g_sub_after_present_n ? g_sub_after_present_ns / 1e6 / g_sub_after_present_n : 0.0, (unsigned long long)g_sub_after_present_n);
+        last_log = now; frames = sum_iv = g_sub_after_present_ns = g_sub_after_present_n = 0;
+    }
+}
 uint64_t gpu_present(const tex_t *t, double period_s, const int crop[4]) {
+    present_note();
     if (!A) return B->present(t, period_s, crop);
     job j = {.kind = J_PRESENT, .t = t, .period = period_s};
     memcpy(j.crop, crop, sizeof j.crop);

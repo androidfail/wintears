@@ -514,7 +514,7 @@ typedef struct chunk { VkBuffer buf; VmaAllocation al; uint8_t *map; VkDeviceSiz
 typedef struct { void (*fn)(void *); void *arg; } act_t;
 typedef struct sub {
     VkCommandPool pool; VkCommandBuffer pre, main;
-    uint64_t fence, t_submit; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
+    uint64_t fence, t_submit, t_game, frame; chunk *chunks; act_t *acts; int nact, cact; struct sub *next;
     int slot;   /* its two timestamp queries: 2 * slot, 2 * slot + 1 (GPU time of the submission) */
 } sub;
 #define CHUNK_SIZE (16ull << 20)   /* staging: larger requests get a chunk of their own size */
@@ -578,18 +578,47 @@ static void ts_begin(sub *s) {
 static void ts_end(sub *s) { if (g_ts && s->slot < TS_SLOTS) vkCmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_ts, 2 * (uint32_t)s->slot + 1); }
 /* The completing submission's GPU end timestamp and the CPU time it was seen done: the anchor that turns the game's
    timestamp reports in it into the game's clock (vk_exec.c do_counter; completion thread only). */
-static uint64_t g_anchor_gpu, g_anchor_ns; static int g_anchor_ok;
+static uint64_t g_anchor_gpu, g_anchor_ns, g_anchor_t0, g_anchor_before, g_anchor_game; static int g_anchor_ok;
 int vk_done_anchor(uint64_t *gpu_end, uint64_t *cpu_ns) { if (!g_anchor_ok) return 0; *gpu_end = g_anchor_gpu; *cpu_ns = g_anchor_ns; return 1; }
+/* A GPU timestamp g of the completing submission in CPU time, as the Switch would have it: on the Switch the GPU
+   starts on a frame when the game submits it, here only once the replay has translated it (15-35 ms on the Steam Deck).
+   TOTK turns its frame's GPU timestamps into "GPU done, ticks after the CPU frame start" and raises its present
+   interval when that is long (upstream nvn_mtl.m), so it ran at 20 fps for a delay the Switch does not have. Reported:
+   the game's submit time + the GPU time of the frame's earlier parts + the GPU time into this part (never later than
+   the real time). TOTK_TS_REBASE=0: the real time. */
+int vk_done_rebase(uint64_t g, uint64_t *ns_out) {
+    static int on = -1; if (on < 0) { const char *e = pal_getenv("TOTK_TS_REBASE"); on = !(e && *e == '0'); VLOG("GPU timestamps reported from the game's submit (TOTK_TS_REBASE=%d)", on); }
+    if (!on || !g_anchor_ok || !g_anchor_game || g < g_anchor_t0 || g > g_anchor_gpu) return 0;
+    uint64_t real = g_anchor_ns - (uint64_t)((double)(g_anchor_gpu - g) * vk_props.limits.timestampPeriod);
+    uint64_t r = g_anchor_game + g_anchor_before + (uint64_t)((double)(g - g_anchor_t0) * vk_props.limits.timestampPeriod);
+    *ns_out = r < real ? r : real;
+    return 1;
+}
 static void ts_read(sub *s) {   /* the submission has completed */
     uint64_t t[2];
     g_anchor_ok = 0;
     if (g_ts && s->slot < TS_SLOTS && vkGetQueryPoolResults(vk_dev, g_ts, 2 * (uint32_t)s->slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0]) {
         atomic_fetch_add(&g_gpu_busy_ns, (uint64_t)((double)(t[1] - t[0]) * vk_props.limits.timestampPeriod));
         g_anchor_gpu = t[1]; g_anchor_ns = pal_now_ns(); g_anchor_ok = 1;
+        static uint64_t frame, before;   /* GPU time of the frame's earlier parts (completions come in order) */
+        if (s->frame != frame) { frame = s->frame; before = 0; }
+        g_anchor_t0 = t[0]; g_anchor_before = before; g_anchor_game = s->t_game;
+        before += (uint64_t)((double)(t[1] - t[0]) * vk_props.limits.timestampPeriod);
     }
 }
 
-static uint64_t g_cur_t0;   /* when the open submission began */
+static uint64_t g_cur_t0, g_staged0;   /* when the open submission began; g_cur_staged then */
+/* A frame (vk_frame_serial): the submissions from one replay start to its end. A timed split (vk_split(1)) hands its
+   staging to the next part and leaves the frame open, so caches of staged data and descriptor sets stay valid, and the
+   descriptor pools (vk_after_frame) go back only when the frame's last part is done. */
+static uint64_t g_frame; static int g_carry;
+typedef struct { void (*fn)(void *); void *arg; } fact_t;
+static fact_t *g_fa; static int g_nfa, g_cfa;
+void vk_after_frame(void (*fn)(void *), void *arg) {
+    if (g_nfa == g_cfa) { g_cfa = g_cfa ? g_cfa * 2 : 16; g_fa = realloc(g_fa, (size_t)g_cfa * sizeof *g_fa); if (!g_fa) die("Vulkan: frame completion list"); }
+    g_fa[g_nfa++] = (fact_t){fn, arg};
+}
+uint64_t vk_frame_serial(void) { return g_frame; }
 void vk_open(void) {
     if (g_cur) return;
     sub *s = take_sub();
@@ -598,7 +627,8 @@ void vk_open(void) {
     ts_begin(s);
     vk_barrier(s->pre);    /* after everything submitted earlier */
     vk_barrier(s->main);   /* after this submission's uploads */
-    g_cur = s; g_serial++; g_cur_staged = 0; g_cur_t0 = pal_now_ns();
+    g_cur = s; g_serial++; if (!g_carry) g_frame++; g_cur_staged = g_staged0 = 0; g_cur_t0 = pal_now_ns();
+    { extern uint64_t gpu_game_submit_ns; s->t_game = gpu_game_submit_ns; s->frame = g_frame; }
 }
 VkCommandBuffer vk_cmd(void) { vk_open(); if (g_bar_lazy) vk_barrier(g_cur->main); return g_cur->main; }
 VkCommandBuffer vk_pre(void) { vk_open(); return g_cur->pre; }
@@ -663,23 +693,30 @@ static chunk *new_chunk(VkDeviceSize size) {
    the driver refused more host memory (out of memory, a stop). Past STAGE_SPLIT the replay ends the submission between
    two commands (vx_run, vk_split) so that its staging goes back once the GPU is done. */
 #define STAGE_SPLIT (256ull << 20)
-/* Also past TOTK_SPLIT_MS of replay (experimental, off by default: on the Steam Deck a split mid-frame lost the device
-   with a GPUVM read fault, cause not found yet): the GPU starts on the first part while the rest is replayed. The game
+/* Also past TOTK_SPLIT_MS of replay (default 8, at render-target changes): the GPU starts on the first part while the rest is replayed. The game
    waits for its frames' fences; on the Steam Deck replay (~15-40 ms a frame), handing over (~5 ms) and the GPU (~15 ms)
    ran one after the other, ~40 ms from the game's submit to done, and the game dropped to 20 fps (present interval 3).
    On the PC a frame replays in ~3 ms: no split. */
-int vk_stage_heavy(void) {
+int vk_stage_heavy(void) { return g_cur && g_cur_staged > STAGE_SPLIT; }
+int vk_split_due(void) {   /* asked at render-target changes only */
     if (!g_cur) return 0;
-    if (g_cur_staged > STAGE_SPLIT) return 1;
-    static unsigned tick; if (++tick & 31) return 0;
     static int64_t lim = -1;
-    if (lim < 0) { const char *e = pal_getenv("TOTK_SPLIT_MS"); lim = (int64_t)((e && *e ? atof(e) : 0.0) * 1e6); if (lim) VLOG("submissions split after %.1f ms of replay (TOTK_SPLIT_MS; 0: off)", lim / 1e6); }
-    return lim > 0 && g_cur_staged < (8ull << 20) && pal_now_ns() - g_cur_t0 > (uint64_t)lim;   /* not in loads: a split there lost the device */
+    if (lim < 0) { const char *e = pal_getenv("TOTK_SPLIT_MS"); lim = (int64_t)((e && *e ? atof(e) : 8.0) * 1e6); if (lim) VLOG("submissions split after %.1f ms of replay, at render-target changes (TOTK_SPLIT_MS; 0: off)", lim / 1e6); }
+    return lim > 0 && g_cur_staged - g_staged0 < (8ull << 20) && pal_now_ns() - g_cur_t0 > (uint64_t)lim;
 }
-void vk_split(void) {   /* vk_mu held, between two commands of the replay: as at the end of a submission */
+void vk_split(int carry) {   /* vk_mu held, between two commands of the replay: as at the end of a submission */
     static unsigned long long n; if (!n++ || n % 100 == 0) VLOG("submission split after %llu MiB of staging, %.1f ms of replay (%llu so far)", (unsigned long long)(g_cur_staged >> 20), (pal_now_ns() - g_cur_t0) / 1e6, n);
     vx_submit_done(); vx_end_pass(); vt_eager_writebacks();
-    vk_flush(NULL, NULL);
+    chunk *keep = NULL; uint64_t staged = g_cur_staged;
+    if (carry) { keep = g_cur->chunks; g_cur->chunks = NULL; g_carry = 1; }   /* the staging goes back with the frame's last part */
+    uint64_t f = vk_flush(NULL, NULL);
+    static int wait = -1; if (wait < 0) { const char *e = pal_getenv("TOTK_SPLIT_WAIT"); wait = e && *e == '1'; }   /* diagnosis */
+    if (wait) vk_wait_done(f);
+    /* the next submission now, as the replay does at its start: vk_sub_serial() moves on here, and the caches keyed
+       by it (descriptor sets and their pool, uniform copies, driver constants) must not hand the next draws the
+       finished part's sets, whose pool is reused once that part is done (a GPUVM fault on AMD) */
+    vk_open();
+    if (carry) { g_cur->chunks = keep; g_cur_staged = g_staged0 = staged; g_carry = 0; }
 }
 void *vk_stage(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize *off) {
     vk_open();
@@ -749,6 +786,7 @@ static void *submit_thread(void *unused) {
 
 uint64_t vk_flush(const VkSemaphoreSubmitInfo *wait, const VkSemaphoreSubmitInfo *signal) {
     vk_open();
+    if (!g_carry) { for (int i = 0; i < g_nfa; i++) vk_after(g_fa[i].fn, g_fa[i].arg); g_nfa = 0; }   /* the frame ends here */
     sub *s = g_cur;
     if (g_bar_lazy) vk_barrier(s->main);
     VkMemoryBarrier2 hb ={VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -904,7 +942,7 @@ static uint64_t mem_total(void) {
 static void mem_guard(void) {
     extern int vt_pressure;
     vt_pressure = 0;
-    if (vk_sub_serial() % 64) return;
+    if (vk_frame_serial() % 64) return;
     if (!g_mem_budget) {
         const char *e = pal_getenv("TOTK_MEMORY_BUDGET_MB"); uint64_t ram = pal_total_memory();
         g_mem_budget = e ? (uint64_t)atoll(e) << 20 : 7ull << 30;
@@ -959,7 +997,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
         { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu imports alive (%.0f MiB), of them %llu windows (%.0f MiB, %d over physical memory)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6,
                                      (unsigned long long)g_import_all, g_import_bytes / 1048576.0, (unsigned long long)g_win_n, g_win_bytes / 1048576.0, g_aw_live); vk_ns_hash = 0; }
-        { extern uint64_t vk_ns_draw, vk_ns_sets, vk_ns_dsmake, vk_ns_emit; VLOG("of the replay: draws %.0f ms (descriptor sets %.0f, of them made %.0f; commands %.0f)", vk_ns_draw / 1e6, vk_ns_sets / 1e6, vk_ns_dsmake / 1e6, vk_ns_emit / 1e6); vk_ns_draw = vk_ns_sets = vk_ns_dsmake = vk_ns_emit = 0; }
+        { extern uint64_t vk_ns_draw, vk_ns_sets, vk_ns_dsmake, vk_ns_emit; extern uint64_t vk_ub_copies, vk_ub_copy_bytes; VLOG("of the replay: draws %.0f ms (descriptor sets %.0f, of them made %.0f; commands %.0f); uniform copies %llu (%.0f MiB)", vk_ns_draw / 1e6, vk_ns_sets / 1e6, vk_ns_dsmake / 1e6, vk_ns_emit / 1e6, (unsigned long long)vk_ub_copies, vk_ub_copy_bytes / 1048576.0); vk_ub_copies = vk_ub_copy_bytes = 0; vk_ns_draw = vk_ns_sets = vk_ns_dsmake = vk_ns_emit = 0; }
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average, GPU busy %.0f ms; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, atomic_exchange(&g_gpu_busy_ns, 0) / 1e6, w / 1e6, g_sh_bytes / 1048576.0);
         if (vk_n_pass) { char pe[400]; vx_pass_end_report(pe, sizeof pe); VLOG("pass ends by place (last 10 s): %s", pe); }

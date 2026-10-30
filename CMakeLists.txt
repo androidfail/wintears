@@ -17,6 +17,7 @@ endif()
 option(WINTEARS_TESTS "Build the game-free tests" ON)
 option(WINTEARS_JIT "Build the ARM64-to-x86 JIT backend (dynarmic)" ON)
 option(WINTEARS_NATIVE_ONLY "Direct Native: game code only from the recompiled DLLs, no dynarmic in wintears.exe" OFF)
+option(WINTEARS_FRAME_POINTERS "Keep frame pointers in the graphics code (call stacks for perf profiles under Proton)" OFF)
 
 add_compile_definitions(_WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000005 WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
@@ -156,6 +157,9 @@ if(WINTEARS_JIT)
                              externals/Vulkan-Headers/include externals/volk externals/VulkanMemoryAllocator/include)
   target_compile_definitions(gfx PUBLIC VK_NO_PROTOTYPES)
   target_compile_options(gfx PRIVATE -Wno-missing-field-initializers)   # Vulkan structs: {sType, .field = ...}
+  if(WINTEARS_FRAME_POINTERS)
+    target_compile_options(gfx PRIVATE -fno-omit-frame-pointer)
+  endif()
   set_source_files_properties(src/gfx/vk/vk_mem.cpp PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-unused-variable;-Wno-missing-field-initializers")
   target_link_libraries(gfx PUBLIC host SDL3::SDL3-static astcdec-sse4.1-static)
   # alloc.cpp: operator new / delete and malloc / free with per-thread and large-block caches (Wine's heap lock and

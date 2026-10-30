@@ -87,6 +87,7 @@ static uint32_t rts_write(int top) {   /* replay: a timestamp query at this poin
 static uint64_t report_ticks(const ctr_act *c) {   /* completion thread */
     uint64_t g, end, ns;
     if (c->tsq && vk_done_anchor(&end, &ns) && vkGetQueryPoolResults(vk_dev, g_rts, c->tsq - 1, 1, 8, &g, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && g <= end) {
+        { int vk_done_rebase(uint64_t g, uint64_t *ns_out); uint64_t r; if (vk_done_rebase(g, &r)) return r / 625 * 12 + r % 625 * 12 / 625; }
         uint64_t back = (uint64_t)((double)(end - g) * vk_props.limits.timestampPeriod);   /* ns before the submission's end */
         if (back < ns) { ns -= back; return ns / 625 * 12 + ns % 625 * 12 / 625; }
     }
@@ -697,7 +698,7 @@ static int cond_eval(const p_render_cond *c) {
 
 void vx_run(const uint8_t *p) {
     for (;;) {
-        if (__builtin_expect(vk_stage_heavy(), 0)) vk_split();
+        if (__builtin_expect(vk_stage_heavy(), 0)) vk_split(0);
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) die("Vulkan replay: corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
         const uint8_t *a = p + 8;
@@ -738,7 +739,7 @@ void vx_run(const uint8_t *p) {
         case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); copy_b2b(s, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, a + 16, n); break; }
         case OP_SET_RT:   /* the game often sets the targets it already has: keep the pass (records are zeroed, pins are per texture) */
-            if (!S.has_rt || memcmp(&S.rt, a, sizeof S.rt)) { vx_end_pass(); memcpy(&S.rt, a, sizeof S.rt); }
+            if (!S.has_rt || memcmp(&S.rt, a, sizeof S.rt)) { vx_end_pass(); if (vk_split_due()) vk_split(1); memcpy(&S.rt, a, sizeof S.rt); }
             S.has_rt = 1; break;
         case OP_CLEAR_COLOR: clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: clear_ds((const p_clear_ds *)a); break;

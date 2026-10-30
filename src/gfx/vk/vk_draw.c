@@ -145,12 +145,12 @@ static dpool *dp_new(void) {
 }
 static uint64_t g_dp_sub;
 static VkDescriptorSet dset(VkDescriptorSetLayout l) {
-    if (g_dp_sub != vk_sub_serial() || !g_dp_cur) { g_dp_cur = dp_new(); vk_after(dp_return, g_dp_cur); g_dp_sub = vk_sub_serial(); }
+    if (g_dp_sub != vk_frame_serial() || !g_dp_cur) { g_dp_cur = dp_new(); vk_after_frame(dp_return, g_dp_cur); g_dp_sub = vk_frame_serial(); }
     VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_dp_cur->p, .descriptorSetCount = 1, .pSetLayouts = &l};
     VkDescriptorSet s;
     VkResult r = vkAllocateDescriptorSets(vk_dev, &ai, &s);
     if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
-        g_dp_cur = dp_new(); vk_after(dp_return, g_dp_cur);
+        g_dp_cur = dp_new(); vk_after_frame(dp_return, g_dp_cur);
         ai.descriptorPool = g_dp_cur->p;
         r = vkAllocateDescriptorSets(vk_dev, &ai, &s);
     }
@@ -280,12 +280,14 @@ static void ub_read(uint64_t lo, uint8_t *out, uint64_t len) {
     }
     ub_apply(g_upd, g_nupd, lo, out, len);
 }
+uint64_t vk_ub_copies, vk_ub_copy_bytes;   /* TOTK_DIAG */
 static VkDescriptorBufferInfo ub_copy_of(uint64_t lo, uint64_t n, VkDeviceSize align) {
     for (unsigned i = 0; i < 64; i++) { ub_copy *c = &g_ubc[i];
-        if (c->lo == lo && c->n == n && c->seq == g_upd_seq && c->sub == vk_sub_serial() && !(c->off % align)) return (VkDescriptorBufferInfo){c->b, c->off, n}; }
+        if (c->lo == lo && c->n == n && c->seq == g_upd_seq && c->sub == vk_frame_serial() && !(c->off % align)) return (VkDescriptorBufferInfo){c->b, c->off, n}; }
     ub_copy *c = &g_ubc[g_ubc_next++ & 63];
+    vk_ub_copies++; vk_ub_copy_bytes += n;
     ub_read(lo, vk_stage(n, align, &c->b, &c->off), n);
-    c->lo = lo; c->n = n; c->seq = g_upd_seq; c->sub = vk_sub_serial();
+    c->lo = lo; c->n = n; c->seq = g_upd_seq; c->sub = vk_frame_serial();
     return (VkDescriptorBufferInfo){c->b, c->off, n};
 }
 int vd_ub_update(uint64_t dst, const void *data, uint64_t n) {
@@ -428,9 +430,9 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             case RB_DRV0: case RB_DRV2: {
                 drv_ent *de = &g_drv[b->kind == RB_DRV2][st == 5 ? 2 : st == 1 ? 1 : 0];
                 uint8_t tmp[0xA00]; drv_fill(tmp, b->kind == RB_DRV2 ? 2 : 0, st);
-                if (de->serial != vk_sub_serial() || memcmp(tmp, de->bytes, sizeof tmp)) {
+                if (de->serial != vk_frame_serial() || memcmp(tmp, de->bytes, sizeof tmp)) {
                     uint8_t *p = vk_stage(0xA00, vk_props.limits.minUniformBufferOffsetAlignment, &de->b, &de->o);
-                    memcpy(p, tmp, sizeof tmp); memcpy(de->bytes, tmp, sizeof tmp); de->serial = vk_sub_serial();
+                    memcpy(p, tmp, sizeof tmp); memcpy(de->bytes, tmp, sizeof tmp); de->serial = vk_frame_serial();
                 }
                 d = (VkDescriptorBufferInfo){de->b, de->o, 0xA00};
                 break;
@@ -513,7 +515,7 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             x->pImageInfo = &ii[ni]; ni += (int)cnt;
         }
     }
-    uint64_t key = mix64(0x9E3779B97F4A7C15ull, (uint64_t)(uintptr_t)sh->dsl), sr = vk_sub_serial();
+    uint64_t key = mix64(0x9E3779B97F4A7C15ull, (uint64_t)(uintptr_t)sh->dsl), sr = vk_frame_serial();
     for (int i = 0; i < nw; i++) {
         key = mix64(key, (uint64_t)w[i].dstBinding << 32 | (uint64_t)w[i].descriptorType << 16 | w[i].descriptorCount);
         if (w[i].pBufferInfo) key = mix_bytes(key, w[i].pBufferInfo, w[i].descriptorCount * sizeof *w[i].pBufferInfo);

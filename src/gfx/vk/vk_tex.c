@@ -487,18 +487,20 @@ static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
     uint64_t t0 = pal_now_ns(), n = t->L.size;
     unsigned every = n > (1u << 20) ? 64 : 16, phase = (unsigned)((uintptr_t)e >> 6);
     /* 8-bit textures up to 16 MiB (the font glyph caches: a few glyphs written at a time, which sampling misses: letters
-       and whole save-screen text missing on the Steam Deck) and textures up to 1 MiB (save thumbnails, UI) are hashed
-       whole at every check, never sampled */
+       and whole save-screen text missing on the Steam Deck) and textures up to 64 KiB are hashed whole at every check,
+       never sampled. Up to 1 MiB were before (save thumbnails, UI): ~150 a frame, 4 GB per 10 s, the largest part of
+       the Steam Deck's replay; a change sampling misses is caught by the next whole hash and the texture is then always
+       hashed whole (whole_only). */
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     int glyphs = (bpb == 1 && bw == 1 && bh == 1 && n <= (16u << 20)) || e->whole_only;   /* TOTK's save-menu font: 2048x4096, 8 MiB */
     /* cold: looked at every 4th submission. Not glyph caches: text drawn once into a cached image (menus, dialogue)
        in a submission that missed new glyphs kept those letters missing on the Steam Deck. */
     if (n > (16u << 10) && !e->hot && !glyphs && (sub + phase) % 4) return 0;
-    int whole = n <= (1u << 20) || glyphs || e->hot || (sub + phase) % every == 0;
+    int whole = n <= (64u << 10) || glyphs || e->hot || (sub + phase) % every == 0;
     {   /* TOTK_DIAG: whole-hashed bytes by reason, every 10 s */
         static uint64_t by[5], cnt[5], last; static int diag = -1;
         if (diag < 0) { const char *d = pal_getenv("TOTK_DIAG"); diag = d && *d == '1'; }
-        if (diag && whole) { int r = e->whole_only ? 0 : glyphs ? 1 : e->hot ? 2 : n <= (1u << 20) ? 3 : 4; by[r] += n; cnt[r]++; }
+        if (diag && whole) { int r = e->whole_only ? 0 : glyphs ? 1 : e->hot ? 2 : n <= (64u << 10) ? 3 : 4; by[r] += n; cnt[r]++; }
         uint64_t now = pal_now_ns();
         if (diag && now - last > 10000000000ull) {
             if (last) VLOG("[tex] whole hashes (last 10 s): missed-by-sampling %llu MiB (%llu), 8-bit %llu MiB (%llu), recently changed %llu MiB (%llu), small %llu MiB (%llu), periodic %llu MiB (%llu)",
@@ -526,7 +528,7 @@ static void upload(vtex *e, const tex_t *t) {
     e->stamp = nvn_dirty_now();
     snprintf(e->writer, sizeof e->writer, "upload from pool memory (submission %llu)", (unsigned long long)vk_sub_serial());
     nvn_dirty_protect(t->mem, (size_t)t->L.size);   /* before copying: a write from here on is seen at the next check */
-    if (!nvn_dirty_protecting()) content_note(e, t, vk_sub_serial());
+    if (!nvn_dirty_protecting()) content_note(e, t, vk_frame_serial());
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     VkCommandBuffer c = vk_pre();
     for (unsigned lv = 0; lv < e->levels; lv++) {
@@ -564,7 +566,7 @@ vtex *vt_get(const tex_t *t) {
     if (!key_of(t, &f, &k)) return NULL;
     vtex *e = nvn_hm_get(&g_by_stor, &k);
     if (!e && !(e = create(t, &f, &k))) return NULL;
-    uint64_t sub = vk_sub_serial();
+    uint64_t sub = vk_frame_serial();
     e->used_sub = sub;
     { stor_key *held = nvn_hm_get(&g_ser, &t->serial);
       if (!held) { held = malloc(sizeof *held); if (held) { *held = e->k; nvn_hm_put(&g_ser, &t->serial, held); } }
@@ -785,7 +787,7 @@ static int pressure_idle(const vtex *e, const void *arg) {
     return 1;
 }
 void vt_end_submission(void) {
-    uint64_t now = vk_sub_serial();
+    uint64_t now = vk_frame_serial();
     static uint64_t last_log;
     uint64_t t = pal_now_ns();
     if (!last_log) last_log = t;
