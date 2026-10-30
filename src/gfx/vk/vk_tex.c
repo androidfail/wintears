@@ -495,6 +495,18 @@ static int content_changed(vtex *e, const tex_t *t, uint64_t sub) {
        in a submission that missed new glyphs kept those letters missing on the Steam Deck. */
     if (n > (16u << 10) && !e->hot && !glyphs && (sub + phase) % 4) return 0;
     int whole = n <= (1u << 20) || glyphs || e->hot || (sub + phase) % every == 0;
+    {   /* TOTK_DIAG: whole-hashed bytes by reason, every 10 s */
+        static uint64_t by[5], cnt[5], last; static int diag = -1;
+        if (diag < 0) { const char *d = pal_getenv("TOTK_DIAG"); diag = d && *d == '1'; }
+        if (diag && whole) { int r = e->whole_only ? 0 : glyphs ? 1 : e->hot ? 2 : n <= (1u << 20) ? 3 : 4; by[r] += n; cnt[r]++; }
+        uint64_t now = pal_now_ns();
+        if (diag && now - last > 10000000000ull) {
+            if (last) VLOG("[tex] whole hashes (last 10 s): missed-by-sampling %llu MiB (%llu), 8-bit %llu MiB (%llu), recently changed %llu MiB (%llu), small %llu MiB (%llu), periodic %llu MiB (%llu)",
+                           (unsigned long long)(by[0] >> 20), (unsigned long long)cnt[0], (unsigned long long)(by[1] >> 20), (unsigned long long)cnt[1], (unsigned long long)(by[2] >> 20), (unsigned long long)cnt[2],
+                           (unsigned long long)(by[3] >> 20), (unsigned long long)cnt[3], (unsigned long long)(by[4] >> 20), (unsigned long long)cnt[4]);
+            memset(by, 0, sizeof by); memset(cnt, 0, sizeof cnt); last = now;
+        }
+    }
     int changed = whole ? hash_content(t->mem, n) != e->hash : hash_sampled(t->mem, n) != e->shash;
     /* a whole hash saw a change that sampling would have missed (a few texels written: glyphs in a large atlas,
        broken save-menu text on the Steam Deck): this texture is never sampled again */
@@ -877,8 +889,13 @@ VkSampler vt_sampler(const samp_par *p) {
     VkSamplerReductionModeCreateInfo rd = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO,
         .reductionMode = p->reduction == NVN_SAMPLER_REDUCTION_MIN ? VK_SAMPLER_REDUCTION_MODE_MIN : p->reduction == NVN_SAMPLER_REDUCTION_MAX ? VK_SAMPLER_REDUCTION_MODE_MAX : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE};
     const float *bc = p->border;
-    VkBorderColor border = bc[3] < 0.5f ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK : bc[0] + bc[1] + bc[2] > 1.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-    VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .pNext = g_minmax && p->reduction ? &rd : NULL,
+    /* Without exact borders, upstream's rule: a depth compare reads R, so (1,0,0,1) must stay white (lit), not black */
+    VkBorderColor border = bc[3] > 0.5f ? (bc[0] > 0.5f ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK) : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    int fixed = !memcmp(bc, (float[4]){0, 0, 0, 0}, 16) || !memcmp(bc, (float[4]){0, 0, 0, 1}, 16) || !memcmp(bc, (float[4]){1, 1, 1, 1}, 16);
+    VkSamplerCustomBorderColorCreateInfoEXT cb = {VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT, .pNext = g_minmax && p->reduction ? &rd : NULL};
+    static int n_custom;   /* samplers are cached per parameters, so few; the driver caps how many may exist */
+    if (vk_custom_border && !fixed && n_custom < 1024) { memcpy(cb.customBorderColor.float32, bc, 16); border = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT; n_custom++; }
+    VkSamplerCreateInfo ci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .pNext = border == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT ? (void *)&cb : g_minmax && p->reduction ? (void *)&rd : NULL,
         .magFilter = p->magf == NVN_MAG_FILTER_LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .minFilter = p->minf == NVN_MIN_FILTER_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
         .mipmapMode = p->minf == NVN_MIN_FILTER_NEAREST_MIPMAP_LINEAR || p->minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST,

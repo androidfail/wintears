@@ -1,0 +1,23 @@
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+index bb2dd67..330fd04 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/Instructions.cs
+@@ -1283,6 +1283,18 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             if (isShadow)
+             {
+                 dRef = Src(AggregateType.FP32);
++
++                // WinTears: Maxwell rounds the compare reference to the depth texture's precision. TOTK's cascaded shadow
++                // maps (the shadow arrays) are Depth16Unorm, so the reference is rounded to 1/65535 as upstream's Metal
++                // service does (its issue #89); otherwise a lit surface fails its own compare by a fraction of a step
++                // and gets dark patches on GPUs that compare the full float (AMD).
++                if (isArray)
++                {
++                    SpvInstruction f32 = context.TypeFP32();
++                    SpvInstruction r = context.GlslFClamp(f32, dRef, context.Constant(f32, 0f), context.Constant(f32, 1f));
++                    r = context.GlslFloor(f32, context.FAdd(f32, context.FMul(f32, r, context.Constant(f32, 65535f)), context.Constant(f32, 0.5f)));
++                    dRef = context.FMul(f32, r, context.Constant(f32, 1f / 65535f));
++                }
+             }
+ 
+             SpvInstruction[] derivatives = null;

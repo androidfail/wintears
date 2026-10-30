@@ -130,7 +130,8 @@ static class ShaderService
         var tx = res["textures"].AsArray().ToDictionary(b => Long(b["binding"]), b => b.AsObject());
         var im = res["images"].AsArray().ToDictionary(b => Long(b["binding"]), b => b.AsObject());
         long sbBase = stage switch { "vs" => 0x110, "cs" => 0x310, _ => 0x510 };
-        var lines = new List<string> { "wt-vk 1", "stage " + stage };
+        // "fix d16": translated with the shadow-array compare reference rounded (patch 0002); older ones are redone
+        var lines = new List<string> { "wt-vk 1", "stage " + stage, "fix d16" };
         var texSlots = new SortedSet<long>(res["tex_queried"].AsArray().Select(Long));
         foreach (var kv in spv.Binding.OrderBy(kv => kv.Value))
         {

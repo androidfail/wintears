@@ -240,10 +240,28 @@ static ub_upd *g_upd, *g_inf; static int g_nupd, g_cupd, g_ninf, g_cinf;   /* th
 static uint64_t g_upd_lo = UINT64_MAX, g_upd_hi, g_upd_seq;
 typedef struct { uint64_t lo, n, seq, sub; VkBuffer b; VkDeviceSize off; } ub_copy;
 static ub_copy g_ubc[64]; static unsigned g_ubc_next;
+/* The union of this submission's updated ranges, sorted and merged: ub_hit runs for every uniform binding of every draw,
+   and a scan of the update log (hundreds a submission) was the largest cost of the Steam Deck's replay. */
+typedef struct { uint64_t lo, hi; } ub_span;
+static ub_span *g_uni; static int g_nuni, g_cuni;
+static int uni_first_end_after(uint64_t lo) {   /* first span with hi > lo */
+    int a = 0, b = g_nuni;
+    while (a < b) { int m = (a + b) / 2; if (g_uni[m].hi > lo) b = m; else a = m + 1; }
+    return a;
+}
+static void uni_add(uint64_t lo, uint64_t hi) {
+    int i = uni_first_end_after(lo ? lo - 1 : 0), j = i;   /* touching spans merge too */
+    while (j < g_nuni && g_uni[j].lo <= hi) { if (g_uni[j].lo < lo) lo = g_uni[j].lo; if (g_uni[j].hi > hi) hi = g_uni[j].hi; j++; }
+    if (i == j) {   /* no overlap: insert at i */
+        if (g_nuni == g_cuni) { g_cuni = g_cuni ? g_cuni * 2 : 64; g_uni = realloc(g_uni, (size_t)g_cuni * sizeof *g_uni); }
+        memmove(g_uni + i + 1, g_uni + i, (size_t)(g_nuni - i) * sizeof *g_uni); g_nuni++;
+    } else if (j - i > 1) { memmove(g_uni + i + 1, g_uni + j, (size_t)(g_nuni - j) * sizeof *g_uni); g_nuni -= j - i - 1; }
+    g_uni[i] = (ub_span){lo, hi};
+}
 static int ub_hit(uint64_t lo, uint64_t hi) {
     if (!g_nupd || hi <= g_upd_lo || lo >= g_upd_hi) return 0;
-    for (int i = 0; i < g_nupd; i++) if (g_upd[i].lo < hi && lo < g_upd[i].hi) return 1;
-    return 0;
+    int i = uni_first_end_after(lo);
+    return i < g_nuni && g_uni[i].lo < hi;
 }
 static void ub_apply(const ub_upd *u, int n, uint64_t lo, uint8_t *out, uint64_t len) {
     for (int i = 0; i < n; i++) {
@@ -277,6 +295,7 @@ int vd_ub_update(uint64_t dst, const void *data, uint64_t n) {
     if (g_nupd == g_cupd) { g_cupd = g_cupd ? g_cupd * 2 : 256; g_upd = realloc(g_upd, (size_t)g_cupd * sizeof *g_upd); }
     uint8_t *d = malloc((size_t)n); memcpy(d, data, (size_t)n);
     g_upd[g_nupd++] = (ub_upd){dst, dst + n, 0, d};
+    uni_add(dst, dst + n);
     if (dst < g_upd_lo) g_upd_lo = dst;
     if (dst + n > g_upd_hi) g_upd_hi = dst + n;
     g_upd_seq++;
@@ -312,7 +331,7 @@ void vd_ub_flush(void) {   /* the logged updates into memory, on the GPU timelin
     uint64_t f = vk_open_fence();
     if (g_ninf + g_nupd > g_cinf) { g_cinf = (g_ninf + g_nupd) * 2; g_inf = realloc(g_inf, (size_t)g_cinf * sizeof *g_inf); }
     for (int i = 0; i < g_nupd; i++) { g_upd[i].fence = f; g_inf[g_ninf++] = g_upd[i]; }
-    g_nupd = 0; g_upd_lo = UINT64_MAX; g_upd_hi = 0;
+    g_nupd = 0; g_nuni = 0; g_upd_lo = UINT64_MAX; g_upd_hi = 0;
 }
 void vd_ub_guard(uint64_t lo, uint64_t hi) { vd_shadow_retire(lo, hi); if (ub_hit(lo, hi)) vd_ub_flush(); }
 void vd_ub_read(uint64_t lo, void *out, uint64_t len) { ub_read(lo, out, len); }
@@ -383,6 +402,7 @@ static int samples_targets(void) {   /* a sampled texture overlaps a render targ
     }
     return 0;
 }
+uint64_t vk_ns_draw, vk_ns_sets, vk_ns_dsmake, vk_ns_emit;   /* TOTK_DIAG timing of draws (the 10-second line) */
 static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
     VkDescriptorSet set = VK_NULL_HANDLE;   /* made at the end, unless an equal one is there */
     enum { MAXW = 96, MAXI = 512 };
@@ -452,9 +472,10 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
             if (b->type != DT_SAMP) d.imageView = dummy_image((VkImageViewType)b->view, storage);
             if (b->kind == RB_TEX && b->reg >= 0 && b->reg < 128) {
                 uint64_t h = S.tex[st][b->reg];
-                slot_tex s;
+                slot_tex s; int depth_tex = 0;
                 if (slot_texture(h, &s)) {
                     vtex *e = vt_get(&s.t);
+                    depth_tex = e && vt_depth(e);
                     VkImageView v = e ? vt_view(e, &s.t, s.has_v ? &s.v : NULL, VT_SAMPLED, (VkImageViewType)b->view) : VK_NULL_HANDLE;
                     if (v) d.imageView = v;
                     vt_prov_input(&s.t);
@@ -465,7 +486,13 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
                         if (e) { uint32_t w, h, d; vt_size(e, 0, &w, &h, &d); vx_note_sampled(vt_image(e), vt_vkformat(e), w, h); vt_prov_dump(e); } }
                 }
                 int sid = (int)((b->sreg >= 0 && b->sreg < 128 ? S.samp[st][b->sreg] : h) >> 20) & 0xfff;
-                samp_par sp; if (sid && vt_slot_samp(sid, &sp)) d.sampler = vt_sampler(&sp);
+                samp_par sp;
+                if (sid && vt_slot_samp(sid, &sp)) {
+                    /* plain reads of a depth texture land on one texel on the Switch (the game binds trilinear samplers);
+                       a filtered read blends depths and puts rebuilt positions in mid-air at edges (upstream issue #89) */
+                    if (depth_tex && sp.cmp_mode != NVN_COMPARE_MODE_COMPARE_R_TO_TEXTURE) { sp.magf = NVN_MAG_FILTER_NEAREST; sp.minf = NVN_MIN_FILTER_NEAREST; }
+                    d.sampler = vt_sampler(&sp);
+                }
             } else if (b->kind == RB_SAMP && b->reg >= 0 && b->reg < 128) {
                 int sid = (int)(S.samp[st][b->reg] >> 20) & 0xfff;
                 samp_par sp; if (sid && vt_slot_samp(sid, &sp)) d.sampler = vt_sampler(&sp);
@@ -498,9 +525,11 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st) {
     if (off < 0) { const char *e = pal_getenv("TOTK_DS_REUSE"); off = e && *e == '0'; }
     ds_ent *c = &g_dsc[key % 4096];
     if (!off && c->serial == sr && c->key == key && c->dsl == sh->dsl && c->set) { g_ds_reused++; return c->set; }
+    uint64_t tm = pal_now_ns();
     set = dset(sh->dsl);
     for (int i = 0; i < nw; i++) w[i].dstSet = set;
     vkUpdateDescriptorSets(vk_dev, (uint32_t)nw, w, 0, NULL);
+    vk_ns_dsmake += pal_now_ns() - tm;
     g_ds_made++;
     *c = (ds_ent){key, sr, sh->dsl, set};
     return set;
@@ -820,7 +849,7 @@ static void dynamic_state(VkCommandBuffer c, int prim) {
         DS_SET(wm != D.wm[f], (vkCmdSetStencilWriteMask(c, face, wm), D.wm[f] = wm));
         DS_SET(ref != D.ref[f], (vkCmdSetStencilReference(c, face, ref), D.ref[f] = ref));
     }
-    int rd = S.raster_discard ? 1 : 0, dbe = S.poly.offset_en ? 1 : 0;
+    int rd = S.raster_discard ? 1 : 0, dbe = (S.poly.offset_en & 4) ? 1 : 0;   /* NVN_POLYGON_OFFSET_ENABLE_FILL: point/line bits do not bias triangles (as upstream) */
     DS_SET(rd != D.rd, (vkCmdSetRasterizerDiscardEnable(c, (VkBool32)rd), D.rd = rd));
     DS_SET(dbe != D.dbe, (vkCmdSetDepthBiasEnable(c, (VkBool32)dbe), D.dbe = dbe));
     float bias[3] = {S.po.units, S.po.clamp, S.po.factor};
@@ -881,7 +910,9 @@ void vd_log_skipped(void) {
          (unsigned long long)g_draws, (unsigned long long)g_skipped[0], (unsigned long long)g_skipped[1], (unsigned long long)g_skipped[2],
          (unsigned long long)g_skipped[3], (unsigned long long)g_skipped[4], (unsigned long long)g_dropped_off);
 }
-void vd_draw(const p_draw *dw, const p_draw_idx *di) {
+static void draw_body(const p_draw *dw, const p_draw_idx *di);
+void vd_draw(const p_draw *dw, const p_draw_idx *di) { uint64_t t0 = pal_now_ns(); draw_body(dw, di); vk_ns_draw += pal_now_ns() - t0; }
+static void draw_body(const p_draw *dw, const p_draw_idx *di) {
     g_draws++;
     if (!g_state_ready) state_reset();
     fixed_init();
@@ -898,7 +929,9 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     { void vx_target_log_check(void); vx_target_log_check(); }
     vt_prov_reset();
     g_nsmp = g_dw_storage = 0;
+    uint64_t ts = pal_now_ns();
     VkDescriptorSet s0 = stage_set(vs, 0), s1 = fs ? stage_set(fs, 1) : VK_NULL_HANDLE;
+    vk_ns_sets += pal_now_ns() - ts;
     if (vx_barrier_pending() && samples_targets()) vx_end_pass();   /* the game's barrier: this draw reads what the pass drew */
     if (!vx_begin_pass()) { g_skipped[2]++; return; }
     if (g_dw_storage) vx_pass_wrote_storage();
@@ -911,7 +944,7 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     void vx_note_draw(void); vx_note_draw();
     { extern int vk_passlog_on; if (vk_passlog_on) VLOG("[pass]  draw %s + %s prim %d vp %g,%g %gx%g sc %d %d,%d %dx%d cull %d dt %d blend_en %#x mask %#x raster_discard %d",
         vs->name, fs ? fs->name : "-", prim, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], S.has_sc, S.sc.x, S.sc.y, S.sc.w, S.sc.h, S.poly.cull, S.ds.dt, S.color.blend_en, S.chmask.mask, S.raster_discard); }
-    VkCommandBuffer c = vk_cmd();
+    VkCommandBuffer c = vk_cmd(); uint64_t te = pal_now_ns();
     bind_pipeline(c, p);
     VkDescriptorSet sets[2] = {s0, s1};
     if (D.lay == lay && D.sets[0] == s0 && D.sets[1] == s1 && D.nsets == (fs ? 2 : 1)) g_ds_calls_saved++;   /* bind_pipeline ran ds_check */
@@ -924,6 +957,7 @@ void vd_draw(const p_draw *dw, const p_draw_idx *di) {
     char what[160]; if (tq != UINT32_MAX) snprintf(what, sizeof what, "%.16s + %.16s", vs->name, fs ? fs->name : "-");
     draw_inner(c, dw, di, prim, quads);
     vx_draw_time_end(tq, what);
+    vk_ns_emit += pal_now_ns() - te;
 }
 static void draw_inner(VkCommandBuffer c, const p_draw *dw, const p_draw_idx *di, int prim, int quads) {
     (void)prim;

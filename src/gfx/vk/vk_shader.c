@@ -234,8 +234,9 @@ static void *pk_build(void *arg) {
     return NULL;
 }
 /* a cache file by name: from the pack, else the loose file (NUL-terminated; the caller frees it) */
+static _Thread_local int t_loose, t_stale;   /* read the loose files only; the last load found an outdated translation */
 static uint8_t *cache_read(const char *name, size_t *n) {
-    const pk_ent *e = pk_find(name);
+    const pk_ent *e = t_loose ? NULL : pk_find(name);
     const char *x = strrchr(name, '.');
     if (e && x && !strcmp(x, ".variants")) {   /* a list the runtime appends to: the pack's copy only if still that size */
         char path[1400]; wchar_t w[1400]; WIN32_FILE_ATTRIBUTE_DATA a;
@@ -367,7 +368,16 @@ VkDescriptorType vs_desc_type(int t) { return DESC[t]; }
 static int word_index(const char *w, const char *const *names, int n) { for (int i = 0; i < n; i++) if (!strcmp(w, names[i])) return i; return -1; }
 
 /* <variant>.wtr + .spv -> a shader; NULL when the files are missing or broken (it is translated again) */
+static vk_shader *load_variant1(const char *variant, int stage, const uint8_t *c1, uint32_t c1n);
+/* An outdated translation in the pack may have a newer loose copy (the pack is rebuilt only after 512 changes); one
+   outdated in both is translated again by the caller. */
 static vk_shader *load_variant(const char *variant, int stage, const uint8_t *c1, uint32_t c1n) {
+    t_stale = 0;
+    vk_shader *s = load_variant1(variant, stage, c1, c1n);
+    if (!s && t_stale) { t_loose = 1; s = load_variant1(variant, stage, c1, c1n); t_loose = 0; }
+    return s;
+}
+static vk_shader *load_variant1(const char *variant, int stage, const uint8_t *c1, uint32_t c1n) {
     char name[200]; size_t n;
     snprintf(name, sizeof name, "%s.wtr", variant);
     char *txt = (char *)cache_read(name, &n);
@@ -379,7 +389,7 @@ static vk_shader *load_variant(const char *variant, int stage, const uint8_t *c1
     static const char *const types[] = {"ubo", "ssbo", "cis", "si", "samp", "utb", "simg", "stb"};
     static const char *const kinds[] = {"support", "c1", "drv0", "drv2", "cbuf", "sbuf", "ubo_ptr", "sbuf_ubo", "tex", "samp", "img", "none"};
     static const char *const depk[] = {"tex", "img", "attr", "fout"};
-    int cb = 0, cd = 0;
+    int cb = 0, cd = 0, shadow_array = 0, fixed_d16 = 0;
     for (char *line = txt, *next; line && *line; line = next) {
         next = strchr(line, '\n'); if (next) *next++ = 0;
         char w0[16] = "", w1[24] = "", w2[24] = "", w3[24] = "", w4[24] = "", dim[16] = "";
@@ -387,6 +397,8 @@ static vk_shader *load_variant(const char *variant, int stage, const uint8_t *c1
         if (sscanf(line, "bind %d %15s %d %15s %d %d %d %d %15s", &a, w1, &b, w2, &c, &d, &e, &f, dim) == 9) {
             int ti = word_index(w1, types, 8), ki = word_index(w2, kinds, 12);
             if (ti < 0 || ki < 0) { free(txt); free(spv); free(s); return NULL; }
+            size_t dl = strlen(dim);   /* dims: base + a (array) / ms / s (shadow) */
+            if (dl > 1 && dim[dl - 1] == 's' && dim[dl - 2] != 'm' && strchr(dim + 1, 'a')) shadow_array = 1;
             if (s->nb == cb) { cb = cb ? cb * 2 : 16; s->b = realloc(s->b, (size_t)cb * sizeof *s->b); }
             s->b[s->nb++] = (vs_bind){(uint16_t)a, (uint16_t)(b > 0 ? b : 1), (uint8_t)ti, (uint8_t)ki, (uint8_t)f,
                                       (uint8_t)(strcmp(dim, "-") ? dim_view(dim) : VK_IMAGE_VIEW_TYPE_2D), (int16_t)c, (int16_t)d, (uint16_t)e};
@@ -400,9 +412,11 @@ static vk_shader *load_variant(const char *variant, int stage, const uint8_t *c1
         else if (!strncmp(line, "out", 3) && (line[3] == ' ' || !line[3])) { for (char *p = line + 3; *p;) { long v = strtol(p, &p, 10); if (v >= 0 && v < 32) s->out_mask |= 1u << v; while (*p == ' ') p++; } }
         else if (sscanf(line, "local %d %d %d", &a, &b, &c) == 3) { s->local[0] = (uint32_t)a; s->local[1] = (uint32_t)b; s->local[2] = (uint32_t)c; }
         else if (!strcmp(line, "depth 1")) s->writes_depth = 1;
+        else if (!strcmp(line, "fix d16")) fixed_d16 = 1;
         (void)g;
     }
     free(txt);
+    if (shadow_array && !fixed_d16) { t_stale = 1; free(spv); free(s->b); free(s->dep); free(s); return NULL; }   /* compare reference not rounded */
     VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spn, .pCode = (const uint32_t *)spv};
     VkResult r = vkCreateShaderModule(vk_dev, &mi, NULL, &s->mod);
     free(spv);

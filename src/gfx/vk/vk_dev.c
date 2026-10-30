@@ -138,22 +138,29 @@ static int create_device(void) {
     uint32_t nex = 0; vkEnumerateDeviceExtensionProperties(vk_phys, NULL, &nex, NULL);
     VkExtensionProperties *ex = malloc((nex ? nex : 1) * sizeof *ex); vkEnumerateDeviceExtensionProperties(vk_phys, NULL, &nex, ex);
     int has_div = has_ext(ex, nex, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME), has_budget = has_ext(ex, nex, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
-    int has_fault = has_ext(ex, nex, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    int has_fault = has_ext(ex, nex, VK_EXT_DEVICE_FAULT_EXTENSION_NAME), has_cbc = has_ext(ex, nex, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     free(ex);
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT dvf = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
     if (has_div) f13.pNext = &dvf;
     VkPhysicalDeviceFeatures2 f = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &f11};
     VkPhysicalDeviceFaultFeaturesEXT flt = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (has_fault) { flt.pNext = f.pNext; f.pNext = &flt; }
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT cbc = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
+    if (has_cbc) { cbc.pNext = f.pNext; f.pNext = &cbc; }
     vkGetPhysicalDeviceFeatures2(vk_phys, &f);
+    /* NVN sampler borders are any RGBA (shadow lookups compare against R): the three fixed Vulkan borders lose that */
+    vk_custom_border = has_cbc && cbc.customBorderColors && cbc.customBorderColorWithoutFormat;
+    if (has_cbc && !vk_custom_border) f.pNext = cbc.pNext;   /* the extension is not enabled: its features leave the chain */
     flt.deviceFaultVendorBinary = VK_FALSE;
     g_fault = has_fault && flt.deviceFault;
     vk_divisor = has_div && dvf.vertexAttributeInstanceRateDivisor;
-    const char *dev_ext[NDEV_EXT + 3]; memcpy(dev_ext, DEV_EXT, sizeof DEV_EXT);
+    const char *dev_ext[NDEV_EXT + 4]; memcpy(dev_ext, DEV_EXT, sizeof DEV_EXT);
     uint32_t ndev_ext = NDEV_EXT;
     if (vk_divisor) dev_ext[ndev_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
     if (has_budget) dev_ext[ndev_ext++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
     if (has_fault) dev_ext[ndev_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;   /* why the device was lost (vk_lost) */
+    if (vk_custom_border) dev_ext[ndev_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+    VLOG("sampler border colours: %s", vk_custom_border ? "exact (VK_EXT_custom_border_color)" : "nearest of black / white / transparent");
     VLOG("device fault reports: %s", g_fault ? "on" : has_fault ? "the driver has the extension but not the feature" : "the driver lacks VK_EXT_device_fault");   /* the 10-second memory line: what the driver says is used and available */
     /* TOTK_VK_ROBUST=1 keeps the GPU's bounds checks (diagnosis: AMD turns an out-of-range access into a lost device) */
     { const char *e = pal_getenv("TOTK_VK_ROBUST"); int rob = e && *e == '1';
@@ -582,6 +589,7 @@ static void ts_read(sub *s) {   /* the submission has completed */
     }
 }
 
+static uint64_t g_cur_t0;   /* when the open submission began */
 void vk_open(void) {
     if (g_cur) return;
     sub *s = take_sub();
@@ -590,7 +598,7 @@ void vk_open(void) {
     ts_begin(s);
     vk_barrier(s->pre);    /* after everything submitted earlier */
     vk_barrier(s->main);   /* after this submission's uploads */
-    g_cur = s; g_serial++; g_cur_staged = 0;
+    g_cur = s; g_serial++; g_cur_staged = 0; g_cur_t0 = pal_now_ns();
 }
 VkCommandBuffer vk_cmd(void) { vk_open(); if (g_bar_lazy) vk_barrier(g_cur->main); return g_cur->main; }
 VkCommandBuffer vk_pre(void) { vk_open(); return g_cur->pre; }
@@ -655,9 +663,21 @@ static chunk *new_chunk(VkDeviceSize size) {
    the driver refused more host memory (out of memory, a stop). Past STAGE_SPLIT the replay ends the submission between
    two commands (vx_run, vk_split) so that its staging goes back once the GPU is done. */
 #define STAGE_SPLIT (256ull << 20)
-int vk_stage_heavy(void) { return g_cur && g_cur_staged > STAGE_SPLIT; }
+/* Also past TOTK_SPLIT_MS of replay (experimental, off by default: on the Steam Deck a split mid-frame lost the device
+   with a GPUVM read fault, cause not found yet): the GPU starts on the first part while the rest is replayed. The game
+   waits for its frames' fences; on the Steam Deck replay (~15-40 ms a frame), handing over (~5 ms) and the GPU (~15 ms)
+   ran one after the other, ~40 ms from the game's submit to done, and the game dropped to 20 fps (present interval 3).
+   On the PC a frame replays in ~3 ms: no split. */
+int vk_stage_heavy(void) {
+    if (!g_cur) return 0;
+    if (g_cur_staged > STAGE_SPLIT) return 1;
+    static unsigned tick; if (++tick & 31) return 0;
+    static int64_t lim = -1;
+    if (lim < 0) { const char *e = pal_getenv("TOTK_SPLIT_MS"); lim = (int64_t)((e && *e ? atof(e) : 0.0) * 1e6); if (lim) VLOG("submissions split after %.1f ms of replay (TOTK_SPLIT_MS; 0: off)", lim / 1e6); }
+    return lim > 0 && g_cur_staged < (8ull << 20) && pal_now_ns() - g_cur_t0 > (uint64_t)lim;   /* not in loads: a split there lost the device */
+}
 void vk_split(void) {   /* vk_mu held, between two commands of the replay: as at the end of a submission */
-    static unsigned long long n; if (!n++ || n % 100 == 0) VLOG("submission split after %llu MiB of staging (%llu so far)", (unsigned long long)(g_cur_staged >> 20), n);
+    static unsigned long long n; if (!n++ || n % 100 == 0) VLOG("submission split after %llu MiB of staging, %.1f ms of replay (%llu so far)", (unsigned long long)(g_cur_staged >> 20), (pal_now_ns() - g_cur_t0) / 1e6, n);
     vx_submit_done(); vx_end_pass(); vt_eager_writebacks();
     vk_flush(NULL, NULL);
 }
@@ -851,7 +871,7 @@ static void prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock
 static void window_tex(uint64_t serial) { (void)serial; }
 
 uint32_t vk_texel_align[2] = {16, 16}, vk_texel_single[2];
-int vk_divisor;
+int vk_divisor, vk_custom_border;
 uint32_t vk_sb_align = 16;
 uint64_t vk_ns_xlate, vk_ns_pipe, vk_ns_tex, vk_n_pass, vk_n_ubo, vk_n_ubflush, vk_n_barrier;
 static uint64_t g_sub_max;
@@ -939,6 +959,7 @@ static uint64_t submit(const uint64_t *handles, int n) {
         uint64_t sn = atomic_exchange(&g_sub_n, 0), sns = atomic_exchange(&g_sub_ns, 0), ln = atomic_exchange(&g_gpu_lat_n, 0), lns = atomic_exchange(&g_gpu_lat_ns, 0), w = atomic_exchange(&g_wait_ns, 0);
         { extern uint64_t vk_ns_hash; VLOG("of the replay: texture content checks (no write protection) %.0f ms, handing work to the driver (vkQueueSubmit2) %.0f ms; %llu imports alive (%.0f MiB), of them %llu windows (%.0f MiB, %d over physical memory)", vk_ns_hash / 1e6, atomic_exchange(&vk_ns_qsubmit, 0) / 1e6,
                                      (unsigned long long)g_import_all, g_import_bytes / 1048576.0, (unsigned long long)g_win_n, g_win_bytes / 1048576.0, g_aw_live); vk_ns_hash = 0; }
+        { extern uint64_t vk_ns_draw, vk_ns_sets, vk_ns_dsmake, vk_ns_emit; VLOG("of the replay: draws %.0f ms (descriptor sets %.0f, of them made %.0f; commands %.0f)", vk_ns_draw / 1e6, vk_ns_sets / 1e6, vk_ns_dsmake / 1e6, vk_ns_emit / 1e6); vk_ns_draw = vk_ns_sets = vk_ns_dsmake = vk_ns_emit = 0; }
         VLOG("last 10 s: %llu submissions, replay %.0f ms in all (longest %.0f ms; shader translation %.0f, pipelines %.0f, textures %.0f; %llu passes, %llu uniform updates (%llu flushes), %llu barriers); submit-to-done %.2f ms on average, GPU busy %.0f ms; game waited %.0f ms for the GPU; %.1f MiB copied to video memory",
              (unsigned long long)sn, sns / 1e6, g_sub_max / 1e6, vk_ns_xlate / 1e6, vk_ns_pipe / 1e6, vk_ns_tex / 1e6, (unsigned long long)vk_n_pass, (unsigned long long)vk_n_ubo, (unsigned long long)vk_n_ubflush, (unsigned long long)vk_n_barrier, ln ? lns / 1e6 / ln : 0.0, atomic_exchange(&g_gpu_busy_ns, 0) / 1e6, w / 1e6, g_sh_bytes / 1048576.0);
         if (vk_n_pass) { char pe[400]; vx_pass_end_report(pe, sizeof pe); VLOG("pass ends by place (last 10 s): %s", pe); }

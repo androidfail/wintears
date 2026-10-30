@@ -41,6 +41,16 @@ static int oq_make(void) {
     if (vkCreateQueryPool(vk_dev, &qi, NULL, &g_oq) != VK_SUCCESS) { g_oq = VK_NULL_HANDLE; g_oq_env = 0; VLOG("occlusion queries: no query pool, every query says visible"); return 0; }
     return 1;
 }
+/* While counting, each open pass has a query; a reset or report inside a pass ends that query and starts the next one in
+   the same pass (Vulkan allows queries inside a render pass instance), instead of ending the pass: TOTK's ~100 queries a
+   frame were ~100 extra passes. */
+static void oq_close(void) { if (g_oq_open) { vkCmdEndQuery(vk_cmd(), g_oq, (uint32_t)((g_oq_n - 1) % OQ_N)); g_oq_open = 0; } }
+static void oq_open(void) {
+    if (!g_oq_on || !g_pass || g_oq_open) return;
+    uint32_t q = (uint32_t)(g_oq_n++ % OQ_N);
+    vkResetQueryPool(vk_dev, g_oq, q, 1);
+    vkCmdBeginQuery(vk_cmd(), g_oq, q, 0); g_oq_open = 1;
+}
 typedef struct { uint64_t type, addr, from, to; int real; uint32_t tsq; } ctr_act;   /* tsq: its GPU timestamp query + 1 */
 static uint64_t oq_sum(uint64_t from, uint64_t to) {
     uint64_t n = to - from, sum = 0;
@@ -243,7 +253,7 @@ void vx_end_pass_at(const char *file, int line) {
         if (i < g_nendw) g_endw[i].n++; }
     if (plog()) VLOG("[pass] %ux%u colors %d (%d %d) depth %d: %d draws, %d clears", S.pass_w, S.pass_h, S.pass_fmt.ncolor, (int)S.pass_fmt.color[0], (int)S.pass_fmt.color[1],
                      (int)S.pass_fmt.depth, g_pass_draws, g_pass_clears);
-    if (g_oq_open) { vkCmdEndQuery(vk_cmd(), g_oq, (uint32_t)((g_oq_n - 1) % OQ_N)); g_oq_open = 0; }
+    oq_close();
     vkCmdEndRendering(vk_cmd());
     if (vk_passlog_on) pass_output_sample();
     if (g_pass_q != UINT32_MAX) {
@@ -349,12 +359,8 @@ static int begin_pass(void) {
     }
     vk_n_pass++;
     vkCmdBeginRendering(vk_cmd(), &ri);
-    if (g_oq_on) {   /* counting samples: this pass has its own query */
-        uint32_t q = (uint32_t)(g_oq_n++ % OQ_N);
-        vkResetQueryPool(vk_dev, g_oq, q, 1);
-        vkCmdBeginQuery(vk_cmd(), g_oq, q, 0); g_oq_open = 1;
-    }
     g_pass = 1;
+    oq_open();
     return 1;
 }
 int vx_begin_pass(void) { return begin_pass(); }
@@ -708,7 +714,7 @@ void vx_run(const uint8_t *p) {
             ctr_act *c = calloc(1, sizeof *c); memcpy(&c->type, a, 8); memcpy(&c->addr, a + 8, 8);
             {   static unsigned seen[64], logged; uint64_t ty = c->type < 64 ? c->type : 63;   /* TOTK_DIAG: the counter types the game reports (first 40) */
                 if (!seen[ty]++ || (logged < 40 && seen[ty] == 100)) { logged++; VLOG("[counter] type %llu reported (%u so far, submission %llu)", (unsigned long long)c->type, seen[ty], (unsigned long long)vk_sub_serial()); } }
-            if (g_oq_on && c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { vx_end_pass(); c->real = 1; c->from = g_oq_start; c->to = g_oq_n; }   /* later draws do not count */
+            if (g_oq_on && c->type == NVN_COUNTER_TYPE_SAMPLES_PASSED) { oq_close(); c->real = 1; c->from = g_oq_start; c->to = g_oq_n; oq_open(); }   /* later draws do not count here, but still count toward the next report */
             else {   /* known now: the counter field is written in replay order, as the GPU does. TOTK gates its clears with a
                         conditional on a counter the CPU sets to 1 and a report after the clear resets; written only when the
                         submission completed, a second gated clear in the same submission ran too and wiped what was drawn
@@ -724,14 +730,16 @@ void vx_run(const uint8_t *p) {
         case OP_RESET_COUNTER: {
             uint64_t t; memcpy(&t, a, 8);
             if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED && oq_enabled() && oq_make()) {
-                vx_end_pass();   /* draws before the reset are not part of the new count; the next pass starts with its own query */
-                g_oq_on = 1; g_oq_start = g_oq_n;
+                oq_close();   /* draws before the reset are not part of the new count */
+                g_oq_on = 1; g_oq_start = g_oq_n; oq_open();
             }
             break;
         }
         case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); copy_b2b(s, d, n); break; }
         case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); update_ub(d, a + 16, n); break; }
-        case OP_SET_RT: vx_end_pass(); memcpy(&S.rt, a, sizeof S.rt); S.has_rt = 1; break;
+        case OP_SET_RT:   /* the game often sets the targets it already has: keep the pass (records are zeroed, pins are per texture) */
+            if (!S.has_rt || memcmp(&S.rt, a, sizeof S.rt)) { vx_end_pass(); memcpy(&S.rt, a, sizeof S.rt); }
+            S.has_rt = 1; break;
         case OP_CLEAR_COLOR: clear_color((const p_clear_color *)a); break;
         case OP_CLEAR_DS: clear_ds((const p_clear_ds *)a); break;
         case OP_COPY_B2T: copy_b2t((const p_copy_b2t *)a); break;
