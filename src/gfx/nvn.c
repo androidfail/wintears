@@ -1268,7 +1268,7 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
 static uint64_t g_game_sys, g_acq_ns; static void *g_main_thr;
 static void find_game_sys(void) {
     const jit_context *c = host_guest_regs(); if (!c) return;
-    g_main_thr = host_thread_self();
+    g_main_thr = host_thread_self(); host_watch_thread(g_main_thr);
     uint64_t ret = host_code_base() + 0x8f6cbc, fp = c->x[29];
     if (c->x[30] == ret) { g_game_sys = *(const uint64_t *)(fp + 0x38); LOG("[nvn] game system object %#llx (lr)", (unsigned long long)g_game_sys); return; }
     static int told; if (!told++) LOG("[nvn] game system object: lr %#llx, controller return %#llx", (unsigned long long)c->x[30], (unsigned long long)ret);

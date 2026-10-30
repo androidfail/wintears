@@ -39,6 +39,7 @@ void host_set_trace(int svcs);
 /* Registers the calling host thread as the guest main thread (priority 44, core 0, cores 0-2) and returns its
    handle; fills ctx with the main stack (in the stack region) and the thread's TLS. */
 uint32_t host_thread_main_init(jit_context *ctx);
+void host_watch_thread(void *t);              /* TOTK_DIAG: log who ends this guest thread's waits, every 10 s */
 void *host_thread_self(void);                  /* the calling guest thread (NULL on a host thread) */
 void host_thread_times(void *t, uint64_t out[3]);   /* its ns waiting for a core, blocked in guest waits, in host calls (TOTK_DIAG) */
 const jit_context *host_guest_regs(void);   /* the calling guest thread's registers (NULL on a host thread) */

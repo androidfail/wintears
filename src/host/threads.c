@@ -50,6 +50,8 @@ typedef struct thr {
     uint64_t cseq, core_since; struct thr *cnext;
     uint32_t wh[4]; int nwh;
     _Atomic uint64_t ns_t[3];  /* waiting for a core, blocked in guest waits, in host calls away from the core (TOTK_DIAG) */
+    uint64_t ns_run, rep_run, rep_core;   /* time holding a core; both at the last watch report */
+    struct thr *waker;         /* the guest thread whose wake ended this thread's last wait (NULL: a host thread) */
     uint64_t away_at;
     jit_context *ctx;          /* the registers the thread runs now (nested host-to-guest calls replace it) */
     void *osh;                 /* host thread handle for the sampler (never closed: the sampler may still hold it) */
@@ -92,7 +94,9 @@ static void G_lock(void) {
 }
 static jit_core *g_jit[NCORE];   /* the virtual cores (defined below) */
 static void log_calls(void);
+static void watch_report(void);
 void runtime_wait_report(char *out, size_t cap) {
+    watch_report();
     {   /* the svcs and host calls that hold the cores, every 10 s (the sampler logs them itself when it runs) */
         static int smp = -1; if (smp < 0) { const char *e = pal_getenv("TOTK_SAMPLE"); smp = e && *e == '1'; }
         if (!smp) log_calls();
@@ -184,7 +188,7 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); if (t->ev) pal_event_set(t->ev); }
+static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->waker = me_or_null(); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv); if (t->ev) pal_event_set(t->ev); }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
 
 /* ---------- virtual cores ----------
@@ -208,7 +212,9 @@ static void core_grant(int c) {   /* holding G: give free core c to the best wai
 }
 static void core_put(thr_t *t) {   /* holding G */
     if (t->cur_core < 0) return;
-    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL; core_grant(c);
+    int c = t->cur_core; t->cur_core = -1; t->preempt = 0; g_core_owner[c] = NULL;
+    if (g_diag) t->ns_run += now_ns() - t->core_since;
+    core_grant(c);
     if (!g_core_owner[c]) g_free_since[c] = now_ns();
 }
 /* t waits for a core: halt the one owner it may displace (the worst priority worse than t's, not already asked). */
@@ -270,6 +276,43 @@ void runtime_core_checkpoint(void) {
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
+/* TOTK_DIAG: who ends the waits of one watched thread (the game's main thread, host_watch_thread from nvn.c), every 10 s:
+   the waking thread, the wait kind (negative: timed out), the time waited, and that thread's own time running and
+   waiting for a core in the same 10 s. Holding G. */
+static thr_t *g_watch;
+static struct { thr_t *w; int kind; uint32_t n; uint64_t ns; } g_wb[32];
+static void watch_note(thr_t *w, int kind, uint64_t d) {
+    int i = 0; while (i < 32 && g_wb[i].n && !(g_wb[i].w == w && g_wb[i].kind == kind)) i++;
+    if (i == 32) i = 31;
+    if (!g_wb[i].n) { g_wb[i].w = w; g_wb[i].kind = kind; }
+    g_wb[i].n++; g_wb[i].ns += d;
+}
+void host_watch_thread(void *t) { G_lock(); g_watch = t; pthread_mutex_unlock(&G); }
+static void watch_report(void) {
+    if (!g_watch) return;
+    G_lock();
+    char out[1600]; size_t at = 0;
+    for (int k = 0; k < 6; k++) {
+        int b = -1; for (int i = 0; i < 32; i++) if (g_wb[i].n && (b < 0 || g_wb[i].ns > g_wb[b].ns)) b = i;
+        if (b < 0) break;
+        thr_t *w = g_wb[b].w;
+        static const char *kn[] = {"?", "lock", "condition", "address", "sync"};
+        int kd = g_wb[b].kind < 0 ? -g_wb[b].kind : g_wb[b].kind;
+        if (w) at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0,
+            "%s%#x p%d mask %llx entry main+%#llx: %s %.0f ms (%u), it ran %.0f ms, waited for a core %.0f ms", at ? " | " : "",
+            w->handle, w->prio, (unsigned long long)w->mask, (unsigned long long)(w->entry - host_code_base()), kn[kd & 7],
+            g_wb[b].ns / 1e6, g_wb[b].n, (w->ns_run - w->rep_run) / 1e6, (atomic_load(&w->ns_t[0]) - w->rep_core) / 1e6);
+        else at += (size_t)snprintf(out + at, at < sizeof out ? sizeof out - at : 0, "%s%s %s %.0f ms (%u)", at ? " | " : "",
+            g_wb[b].kind < 0 ? "timed out" : "host thread", kn[kd & 7], g_wb[b].ns / 1e6, g_wb[b].n);
+        g_wb[b].n = 0; g_wb[b].ns = 0;
+    }
+    memset(g_wb, 0, sizeof g_wb);
+    double mr = (g_watch->ns_run - g_watch->rep_run) / 1e6;
+    for (thr_t *t = g_all; t; t = t->all) { t->rep_run = t->ns_run; t->rep_core = atomic_load(&t->ns_t[0]); }
+    pthread_mutex_unlock(&G);
+    LOG("[threads] the game's main thread %#x (last 10 s): ran %.0f ms; its waits ended by: %s", g_watch->handle,
+        mr, out);
+}
 static int64_t block(thr_t *t, int kind, int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
     core_put(t); int64_t r = block_inner(t, kind, ns); core_take(t); return r;
@@ -283,13 +326,13 @@ static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
         uint64_t end = t0 + (uint64_t)ns;
         while (!t->woke) {
             uint64_t now = pal_now_ns();
-            if (now >= end) { wait_unlink(t); t->wkind = 0; if (g_diag) { uint64_t d = now - t0; atomic_fetch_add(&g_ns_block, d); atomic_fetch_add(&t->ns_t[1], d); slp_note(1, (uint64_t)ns, d); } return R_TIMEOUT; }
+            if (now >= end) { wait_unlink(t); t->wkind = 0; if (g_diag) { uint64_t d = now - t0; atomic_fetch_add(&g_ns_block, d); atomic_fetch_add(&t->ns_t[1], d); slp_note(1, (uint64_t)ns, d); if (t == g_watch) watch_note(NULL, -kind, d); } return R_TIMEOUT; }
             pthread_mutex_unlock(&G);
             pal_event_wait_ns(t->ev, end - now);   /* a set left over from an earlier wake only makes this loop look again */
             pthread_mutex_lock(&G);
         }
     } else while (!t->woke) pthread_cond_wait(&t->cv, &G);
-    if (g_diag) { uint64_t d = pal_now_ns() - t0; atomic_fetch_add(&g_ns_block, d); atomic_fetch_add(&t->ns_t[1], d); }
+    if (g_diag) { uint64_t d = pal_now_ns() - t0; atomic_fetch_add(&g_ns_block, d); atomic_fetch_add(&t->ns_t[1], d); if (t == g_watch) watch_note(t->waker, kind, d); }
     return t->wres;
 }
 
