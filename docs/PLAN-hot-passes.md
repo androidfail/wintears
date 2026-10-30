@@ -59,7 +59,7 @@ Add per-pass accounting to the replay, under `TOTK_DIAG` only:
 spread evenly over many passes, stop here: this plan won't reach 30 fps, and the general per-draw work (and the
 idea of starting translation on the game's own recording threads) comes back first.
 
-Size: about 150 lines, a day including the Deck runs.
+Size: about 150 lines; an hour or two including the build and three Deck runs.
 
 ## Step 2: reuse a whole pass from the previous frame (generic, committed)
 
@@ -121,8 +121,8 @@ only version 1.0.0 is supported anyway). Do this for at most 2-3 passes, and onl
 
 | Step | What | Estimate (this project's pace) | Gate |
 |---|---|---|---|
-| 0 | Open-area save, baseline runs | an hour, needs the user | three comparable runs |
-| 1 | Per-pass accounting and ranking | about a day | top passes are 40% or more of replay |
+| 0 | Open-area save, baseline runs | about 15 minutes (three 4-minute runs), needs the user's save | three comparable runs |
+| 1 | Per-pass accounting and ranking | an hour or two | top passes are 40% or more of replay |
 | 2 | Pass reuse across frames | about a week | matching pixels, replay time down |
 | 3 | Engine-level replacement, 1-3 passes | a few days each | matching pixels, fps up |
 | 4 | Checks, then default on | with each step | as above |
