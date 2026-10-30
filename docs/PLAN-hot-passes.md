@@ -35,11 +35,22 @@ frame is ready sooner, and the GPU gets more of the power budget.
 - Measurements use the user's open-area save, skip the first 60-90 s of each run (menu and loading) and compare
   10-second blocks after that. The PC must stay at 30 fps with every change.
 
+## Where to test: the PC first, the Deck to confirm
+
+The game sends the same NVN commands on both machines, so which passes there are, how many draws they have, how much
+of each repeats between frames and whether the output pixels match are the same on the PC. The PC builds and runs
+much faster, with no copying over SSH, and correctness runs (step 4's pixel comparison) can run two or three at once
+with separate profile folders. Timing differs (the PC replays a frame in about 3 ms, the Deck in 15-30), but the
+ranking of passes by share of the replay should carry over; one Deck run per step confirms it. Timing runs on the PC
+run one at a time, since parallel runs share the CPU and GPU.
+
 ## Step 0: test setup (needs the user)
 
-1. The user saves the game in the open area where it holds 20 fps and drops to 9.
-2. `deck_run.sh` loads that save; the input script walks the same path through it every run, so runs compare.
-3. A baseline: three runs of the current build, with the per-block numbers above recorded.
+1. The user saves the game in the open area where the Deck holds 20 fps and drops to 9, and the save is copied to the
+   PC's profile (between the user's own machines, never committed).
+2. The PC test script and `deck_run.sh` load that save; the input script walks the same path through it every run,
+   so runs compare.
+3. A baseline: three runs of the current build on the PC and one on the Deck, with the per-block numbers recorded.
 
 ## Step 1: measure the cost of each pass
 
