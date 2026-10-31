@@ -433,7 +433,7 @@ int jit_run(jit_core *c) {
     int stop;
     for (;;) {
         if (c->halt_req) {
-            c->halt_req = 0;
+            c->halt_req = 0; c->nc.halt_now = 0;
 #if WT_DYNARMIC
             if (jit_dyn *d = c->dyn.load(std::memory_order_relaxed)) d->jit->ClearHalt(kHaltExternal);
 #endif
@@ -478,7 +478,7 @@ int jit_run(jit_core *c) {
         to_jit(c);
         Dynarmic::HaltReason r = J(c).Run();   /* dynarmic sets its own MXCSR and puts back the one it found */
         from_jit(c);
-        if ((r & stops) != Dynarmic::HaltReason{}) { stop = stop_of(c, r); if (stop == JIT_STOP_HALT) c->halt_req = 0; break; }
+        if ((r & stops) != Dynarmic::HaltReason{}) { stop = stop_of(c, r); if (stop == JIT_STOP_HALT) { c->halt_req = 0; c->nc.halt_now = 0; } break; }
 #else
         fprintf(stderr, "[wintears] Direct Native (no JIT): no recompiled block at %#llx%s. Add the line \"%llx 1\" to "
                 "native/misses.txt and run tools/recomp/build_native.py again.\n", (unsigned long long)n.pc,
@@ -501,7 +501,7 @@ int jit_step(jit_core *c) {
 #endif
 }
 void jit_halt(jit_core *c) {
-    c->halt_req = 1;
+    c->halt_req = 1; c->nc.halt_now = 1;
 #if WT_DYNARMIC
     if (jit_dyn *d = c->dyn.load(std::memory_order_acquire)) d->jit->HaltExecution(kHaltExternal);
 #endif

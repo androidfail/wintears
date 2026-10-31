@@ -31,6 +31,9 @@ typedef struct wt_ctx {
        FPCR the runtime set MXCSR for (a block whose FPCR differs goes back to the runtime) */
     const struct wt_lce *lc;
     uint32_t disp_fpcr, lc_mask;
+    /* appended: the core's halt request kept in the context itself (one load a block instead of two through
+       halt_request); the runtime sets and clears both */
+    volatile int halt_now;
 } wt_ctx;
 
 typedef void (*wt_block_fn)(wt_ctx *);
@@ -38,7 +41,7 @@ typedef struct wt_lce { uint64_t pc; wt_block_fn fn; } wt_lce;   /* the runtime'
 /* Indirect branches and returns (c->pc set): straight on to the next block when it is in the cache, else back to the
    runtime's loop. Skipping the loop for these (~8 million a second on the Steam Deck) is phase 5's return linking. */
 #define WT_DISPATCH(c) do { \
-        if (!*(c)->halt_request && (c)->fpcr == (c)->disp_fpcr && (c)->lc) { \
+        if (!(c)->halt_now && (c)->fpcr == (c)->disp_fpcr && (c)->lc) { \
             const wt_lce *e_ = &(c)->lc[((c)->pc >> 2) & (c)->lc_mask]; \
             if (e_->pc == (c)->pc && (uintptr_t)e_->fn > 2) { __attribute__((musttail)) return e_->fn(c); } \
         } \

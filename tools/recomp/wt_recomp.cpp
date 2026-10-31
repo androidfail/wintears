@@ -591,7 +591,7 @@ struct Emitter {
                 uint64_t to = A64::LocationDescriptor{l}.PC();
                 if (!e.linkable || !e.linkable->count(to)) { pc(l); return; }
                 // c->pc is only read once a block returns (jit.cpp), so a chained block leaves it for the next one to set
-                snprintf(e.buf, sizeof e.buf, "%sif (*c->halt_request) { c->pc = 0x%llxull; return; } { extern void B_%llx(wt_ctx *); __attribute__((musttail)) return B_%llx(c); }\n",
+                snprintf(e.buf, sizeof e.buf, "%sif (c->halt_now) { c->pc = 0x%llxull; return; } { extern void B_%llx(wt_ctx *); __attribute__((musttail)) return B_%llx(c); }\n",
                          ind.c_str(), (unsigned long long)to, (unsigned long long)to, (unsigned long long)to);
                 e.body += e.buf;
             }
@@ -608,7 +608,7 @@ struct Emitter {
                 e.body += ind + "if (c->check_bit) {\n"; sub(t.then_); e.body += ind + "} else {\n"; sub(t.else_); e.body += ind + "}\n";
             }
             void operator()(const IR::Term::CheckHalt &t) {
-                e.body += ind + "if (c->halt || *c->halt_request) return;\n"; boost::apply_visitor(*this, t.else_);
+                e.body += ind + "if (c->halt || c->halt_now) return;\n"; boost::apply_visitor(*this, t.else_);
             }
         } v{*this, depth, ind};
         boost::apply_visitor(v, t);
