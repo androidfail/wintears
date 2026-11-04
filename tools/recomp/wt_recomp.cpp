@@ -344,6 +344,7 @@ struct Emitter {
     std::map<const IR::Inst *, int> id;
     const std::unordered_set<uint64_t> *linkable = nullptr;   // blocks this DLL defines: direct jumps chain to them
     bool flags_local = false;   // set per block: keep NZCV in a local, it is dead at every exit
+    uint64_t cur_pc = 0;        // the block being emitted (link: a backward edge checks for a halt, a forward one does not)
     std::string body, why;   // why: the first opcode not supported
     char buf[512];
 
@@ -418,7 +419,11 @@ struct Emitter {
         case O::A64SetFPCR: line("c->fpcr = " + a(0) + ";"); return true;
         case O::A64SetFPSR: line("c->fpsr = " + a(0) + ";"); return true;
         case O::A64SetPC: line("c->pc = " + a(0) + ";"); return true;
-        case O::A64CallSupervisor: line("c->svc = " + a(0) + "; c->halt = WT_HALT_SVC;"); return true;
+        case O::A64CallSupervisor:
+            // svc 0x10 GetCurrentProcessorNumber: the answer is the core the context belongs to (threads.c answers
+            // the same from cur_core); no round trip through the runtime. Every other svc stops the block.
+            if (in.GetArg(0).GetU32() == 0x10) { line("c->x[0] = c->core_id;"); return true; }
+            line("c->svc = " + a(0) + "; c->halt = WT_HALT_SVC;"); return true;
         case O::A64ExceptionRaised: {
             auto e = static_cast<A64::Exception>(in.GetArg(1).GetU64());
             if (e == A64::Exception::Yield || e == A64::Exception::SendEvent || e == A64::Exception::SendEventLocal) return true;
@@ -590,9 +595,17 @@ struct Emitter {
             void link(const IR::LocationDescriptor &l) {   // chain: a tail call to the next block unless a halt is asked for
                 uint64_t to = A64::LocationDescriptor{l}.PC();
                 if (!e.linkable || !e.linkable->count(to)) { pc(l); return; }
-                // c->pc is only read once a block returns (jit.cpp), so a chained block leaves it for the next one to set
-                snprintf(e.buf, sizeof e.buf, "%sif (c->halt_now) { c->pc = 0x%llxull; return; } { extern void B_%llx(wt_ctx *); __attribute__((musttail)) return B_%llx(c); }\n",
-                         ind.c_str(), (unsigned long long)to, (unsigned long long)to, (unsigned long long)to);
+                // c->pc is only read once a block returns (jit.cpp), so a chained block leaves it for the next one to set.
+                // The halt request (preemption) is checked on backward edges only: a cycle of direct links must contain
+                // an edge whose target is at or below its source (forward-only chains are bounded by the code), and
+                // indirect branches and returns check it in WT_DISPATCH. A forward chain runs to its end unchecked
+                // (microseconds), which is the latency a halt gains.
+                if (to <= e.cur_pc)
+                    snprintf(e.buf, sizeof e.buf, "%sif (__builtin_expect(c->halt_now, 0)) { c->pc = 0x%llxull; return; } { extern void WT_BLOCK_ABI B_%llx(wt_ctx *); __attribute__((musttail)) return B_%llx(c); }\n",
+                             ind.c_str(), (unsigned long long)to, (unsigned long long)to, (unsigned long long)to);
+                else
+                    snprintf(e.buf, sizeof e.buf, "%s{ extern void WT_BLOCK_ABI B_%llx(wt_ctx *); __attribute__((musttail)) return B_%llx(c); }\n",
+                             ind.c_str(), (unsigned long long)to, (unsigned long long)to);
                 e.body += e.buf;
             }
             void operator()(const IR::Term::LinkBlock &t) { link(t.next); }
@@ -615,7 +628,7 @@ struct Emitter {
     }
 
     bool block(const IR::Block &b, uint64_t pc, std::string &out) {
-        id.clear(); body.clear(); why.clear();
+        id.clear(); body.clear(); why.clear(); cur_pc = pc;
         int n = 0;
         for (auto &in : b) {
             id[&in] = n;
@@ -623,7 +636,9 @@ struct Emitter {
             n++;
         }
         term(b.GetTerminal(), 1);
-        snprintf(buf, sizeof buf, "void B_%llx(wt_ctx *c) {\n", (unsigned long long)pc);
+        // restrict: guest code cannot address the host's context, so a guest store never changes c->x[] / c->nzcv and
+        // the compiler may keep them in registers across guest loads and stores (wt_native.h: WT_LD / WT_ST)
+        snprintf(buf, sizeof buf, "void WT_BLOCK_ABI B_%llx(wt_ctx *restrict c) {\n", (unsigned long long)pc);
         out += buf;
         if (flags_local) {   // no successor reads the flags this block leaves (flags_dead_at_exit)
             for (size_t i = 0; (i = body.find("c->nzcv", i)) != std::string::npos; i += 3) body.replace(i, 7, "nz_");
@@ -718,7 +733,7 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
         n_local += em.flags_local;
         if (!em.block(b, pc, cur)) {   // left to dynarmic: a stub that hands the pc back, for blocks that chain to it
             missing[em.why]++;
-            snprintf(em.buf, sizeof em.buf, "void B_%llx(wt_ctx *c) { c->pc = 0x%llxull; }\n", (unsigned long long)pc, (unsigned long long)pc);
+            snprintf(em.buf, sizeof em.buf, "void WT_BLOCK_ABI B_%llx(wt_ctx *c) { c->pc = 0x%llxull; }\n", (unsigned long long)pc, (unsigned long long)pc);
             cur += em.buf;
             continue;
         }
@@ -727,7 +742,7 @@ int emit(Program &p, const std::string &dir, const std::string &only, size_t per
     flush();
     FILE *f = fopen((dir + "/table.c").c_str(), "wb");
     fputs("#include \"wt_native.h\"\n", f);
-    for (uint64_t pc : done) fprintf(f, "void B_%llx(wt_ctx *);\n", (unsigned long long)pc);
+    for (uint64_t pc : done) fprintf(f, "void WT_BLOCK_ABI B_%llx(wt_ctx *);\n", (unsigned long long)pc);
     fprintf(f, "__declspec(dllexport) const unsigned long long wt_count = %zu;\n", done.size());
     fprintf(f, "__declspec(dllexport) const unsigned long long wt_bases[3] = {0x%llxull, 0x%llxull, 0x%llxull};\n",
             (unsigned long long)p.mods[0].base, (unsigned long long)p.mods[1].base, (unsigned long long)p.mods[2].base);
@@ -840,7 +855,7 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
 
     std::map<std::string, uint64_t> tested_ops, bad_ops;
     size_t ok = 0, bad = 0, faulted = 0, shown = 0;
-    volatile int no_halt = 1;   // chained blocks stop after the first: one block, as on the dynarmic side
+    volatile int no_halt = 1;   // the halt request is on: a backward chain, a dispatch and a svc stop the native side (forward chains run on: below)
     for (size_t s = 0; s < samples; s++) {
         const wt_entry &e = tab[rnd() % *cnt];
         // random state
@@ -854,7 +869,8 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
             if (rnd() % 4 == 0) { double d[2] = {(double)(int32_t)(rnd() % 20001 - 10000) / 64.0, (double)picks[rnd() % 10]}; memcpy(&n.v[i], d, 16); }
         }
         n.nzcv = (uint32_t)(rnd() & 0xF) << 28; n.pc = e.pc; n.tpidr = scratch + 4096; n.tpidrro = scratch + 8192;
-        n.halt_request = (volatile int *)&no_halt; n.cntpct = fixed_cntpct;
+        n.halt_request = (volatile int *)&no_halt; n.halt_now = 1; n.cntpct = fixed_cntpct;
+        n.disp_fpcr = ~0u;   // WT_DISPATCH: no block cache here, an indirect branch comes back to this loop
         n.fpcr = (rnd() & 1) ? 0x01000000u : 0;   // half with FZ, as TOTK's threads run
         wt_ctx start = n;
         restore();
@@ -867,7 +883,9 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
         _mm_setcsr(mx);
         g_in_test = 0;
         uint64_t h_native = mem_hash();
-        // dynarmic, one block
+        // dynarmic: the same blocks. The native side chains through forward direct links without looking at the halt
+        // request (link in the emitter), so it may have run a few blocks: dynarmic runs one block at a time until it
+        // reaches the pc the native side stopped at, or stops the same way (svc, exception).
         restore();
         auto &j = *cb.jit;
         std::array<uint64_t, 31> regs; memcpy(regs.data(), start.x, sizeof regs); j.SetRegisters(regs);
@@ -876,7 +894,12 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
         cb.tpidr = start.tpidr; cb.tpidrro = start.tpidrro; cb.svc = 0; cb.halted = 0; cb.exc = -1;
         g_in_test = 1;
         if (__builtin_setjmp(g_fault_jmp)) { g_in_test = 0; faulted++; cb.jit = std::make_unique<A64::Jit>(uc); continue; }
-        j.Run();
+        uint64_t last_pc = start.pc;   // the last block dynarmic ran: its flags decide whether NZCV is compared
+        for (int steps = 0;; ) {
+            last_pc = j.GetPC();
+            j.Run();
+            if (cb.halted || cb.exc != -1 || n.halt == WT_HALT_EXCEPTION || j.GetPC() == n.pc || ++steps >= 64) break;
+        }
         g_in_test = 0;
         j.ClearHalt(HaltReason::UserDefined1); j.ClearHalt(HaltReason::UserDefined3);
         uint64_t h_jit = mem_hash();
@@ -887,7 +910,7 @@ int difftest(Program &p, const std::string &dll, size_t samples, uint64_t seed) 
         if (j.GetSP() != n.sp) diff += " sp";
         if (j.GetPC() != n.pc && n.halt != WT_HALT_EXCEPTION && cb.exc == -1) diff += " pc";
         auto wf = [&](uint64_t x) { return p.code(x) && writes_flags_first(translate(p, x, tc)); };
-        if ((j.GetPstate() & 0xF0000000u) != n.nzcv && !flags_dead_at_exit(translate(p, e.pc, tc), wf)) diff += " nzcv";   // dead flags are left as they were
+        if ((j.GetPstate() & 0xF0000000u) != n.nzcv && !flags_dead_at_exit(translate(p, last_pc, tc), wf)) diff += " nzcv";   // dead flags are left as they were
         auto vec2 = j.GetVectors();
         for (int i = 0; i < 32; i++) {
             uint64_t a[2] = {vec2[i][0], vec2[i][1]}, b[2] = {n.v[i].lo, n.v[i].hi};

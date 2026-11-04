@@ -7,8 +7,12 @@ address. Each file is compiled with gcc unless the object cache already has it: 
 objects by a hash of the file, the headers and the flags, so a rebuild after a change to one opcode recompiles only the
 files that use it (a header change still recompiles everything). The objects are linked into
 <TOTK_win>/native/totk_<module>.dll; when every object is unchanged and the DLL is there, the link is skipped too.
-Flags: -O1 (--quick: -Og, a third faster to compile but its code is 16% slower in play), -ffp-contract=off (no fused multiply-add the ARM code did not ask for), -march=x86-64-v3 (AVX2 and FMA:
-the Deck, laptop and PC have them), no unwind tables or debug info (smaller and faster). A module whose inputs
+Flags: -O2 without the alignment padding (millions of small functions; GCC vectorises the NEON lane loops of
+wt_native_ops.h only from -O2: a 4-lane add is 4 scalar ops through the stack at -O1), -fno-math-errno (no errno
+path on every fsqrt) and -fno-trapping-math (generated code never reads FPSR), -ffp-contract=off (no fused
+multiply-add the ARM code did not ask for), -march=x86-64-v3 (AVX2 and FMA: the Deck, laptop and PC have them), no
+unwind tables or debug info (smaller and faster). --quick: -O1, about a third faster to compile, slower code (an
+earlier -Og build was 16% slower in play than -O1). A module whose inputs
 (recompiler, game code, seeds, headers, flags) are unchanged is skipped without emitting. A file gcc crashes on is
 retried (MSYS2 GCC sometimes crashes at random).
 
@@ -21,7 +25,9 @@ there (TOTK_NATIVE=0: the JIT only); a wintears.exe built with -DWINTEARS_NATIVE
 import argparse, concurrent.futures as cf, glob, hashlib, os, shutil, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-FLAGS = ['-O1', '-w', '--param=min-pagesize=0', '-ffp-contract=off', '-march=x86-64-v3', '-pipe', '-g0',
+FLAGS = ['-O2', '-fno-align-functions', '-fno-align-jumps', '-fno-align-loops', '-fno-align-labels',
+         '-fno-math-errno', '-fno-trapping-math', '-mno-red-zone',   # blocks are sysv_abi (wt_native.h); Windows has no red zone
+         '-w', '--param=min-pagesize=0', '-ffp-contract=off', '-march=x86-64-v3', '-pipe', '-g0',
          '-fno-asynchronous-unwind-tables', '-fno-ident']
 
 
@@ -80,14 +86,14 @@ def main():
     ap.add_argument('totk_win'); ap.add_argument('modules', nargs='*', default=['main', 'subsdk0', 'sdk'])
     ap.add_argument('--jobs', type=int, default=3)   # MSYS2 GCC crashes at random under more parallel load
     ap.add_argument('--clean', action='store_true', help='empty the object cache first')
-    ap.add_argument('--quick', action='store_true', help='-Og: faster to build, slower code (for trying changes)')
+    ap.add_argument('--quick', action='store_true', help='-O1: faster to build, slower code (for trying changes)')
     ap.add_argument('--hot', metavar='SAMPLES', help='profile from a run with TOTK_SAMPLE=1 TOTK_SAMPLE_OUT=<file>: the files '
                     'holding --hot-share of the samples get -O2 (kept in native/hot_<module>.txt for later builds)')
     ap.add_argument('--hot-share', type=float, default=0.8)
     ap.add_argument('--verify', action='store_true', help='compile every file again and replace objects that differ '
                     '(MSYS2 GCC sometimes miscompiles silently, as it sometimes crashes)')
     a = ap.parse_args()
-    if a.quick: FLAGS[0] = '-Og'
+    if a.quick: FLAGS[0] = '-O1'
     tool = os.path.join(ROOT, 'build', 'wt_recomp.exe' if os.name == 'nt' else 'wt_recomp')
     inc = os.path.join(ROOT, 'src', 'cpu', 'native')
     salt = hashlib.sha256(' '.join(FLAGS).encode())
@@ -98,7 +104,7 @@ def main():
     inputs0 = salt.copy()
     for f in [tool, seeds] + [os.path.join(a.totk_win, 'data', 'v0', 'exefs', m) for m in ('main', 'subsdk0', 'sdk')]:
         if os.path.exists(f): inputs0.update(open(f, 'rb').read())
-    hot_flags = ['-O2'] + FLAGS[1:]
+    hot_flags = list(FLAGS)   # every file is built at -O2 now; the hot list (TOTK_SAMPLE profiles) is kept for a later tier
     for mod in a.modules:
         hot_path = os.path.join(out, f'hot_{mod}.txt')
         if a.hot: pick_hot(a.hot, os.path.join(out, f'totk_{mod}.dll'), mod, a.hot_share, hot_path)
@@ -109,7 +115,7 @@ def main():
         if not a.clean and not a.verify and os.path.exists(dll) and os.path.exists(dll + '.inputs') and open(dll + '.inputs').read() == inputs:
             print(f'{mod}: up to date ({os.path.getsize(dll) / 2**20:.0f} MiB)')
             continue
-        # one cache folder per flag set: switching between -O1 and --quick keeps both
+        # one cache folder per flag set: switching between the default and --quick keeps both
         d, cache = os.path.join(out, mod), os.path.join(out, 'cache', mod, hashlib.sha256(' '.join(FLAGS).encode()).hexdigest()[:12])
         hcache = os.path.join(out, 'cache', mod, hashlib.sha256(' '.join(hot_flags).encode()).hexdigest()[:12])   # the hot files' -O2 objects
         os.makedirs(hcache, exist_ok=True)

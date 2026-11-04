@@ -34,14 +34,22 @@ typedef struct wt_ctx {
     /* appended: the core's halt request kept in the context itself (one load a block instead of two through
        halt_request); the runtime sets and clears both */
     volatile int halt_now;
+    /* appended: the virtual core this context belongs to, what svc 0x10 GetCurrentProcessorNumber answers; recompiled
+       blocks answer it in place (TOTK keys per-core data by it on hot paths; the svc round trip cost ~0.5 us) */
+    uint32_t core_id;
 } wt_ctx;
 
-typedef void (*wt_block_fn)(wt_ctx *);
+/* Blocks use the System V calling convention: on Win64 xmm6-xmm15 are callee-saved, so a vector-heavy block saved and
+   restored up to ten 16-byte registers in its prologue and epilogue although blocks make no calls of their own; with
+   sysv_abi every xmm register is caller-saved and only rbx, rbp, r12-r15 are kept. The runtime and the difftest call
+   blocks through this type, so both sides agree. (build_native.py compiles with -mno-red-zone: Windows has none.) */
+#define WT_BLOCK_ABI __attribute__((sysv_abi))
+typedef void (WT_BLOCK_ABI *wt_block_fn)(wt_ctx *);
 typedef struct wt_lce { uint64_t pc; wt_block_fn fn; } wt_lce;   /* the runtime's cache entry (jit.cpp: fn 1 and 2 mark host stubs) */
 /* Indirect branches and returns (c->pc set): straight on to the next block when it is in the cache, else back to the
    runtime's loop. Skipping the loop for these (~8 million a second on the Steam Deck) is phase 5's return linking. */
 #define WT_DISPATCH(c) do { \
-        if (!(c)->halt_now && (c)->fpcr == (c)->disp_fpcr && (c)->lc) { \
+        if (__builtin_expect(!(c)->halt_now && (c)->fpcr == (c)->disp_fpcr, 1)) { /* lc is set at core creation */ \
             const wt_lce *e_ = &(c)->lc[((c)->pc >> 2) & (c)->lc_mask]; \
             if (e_->pc == (c)->pc && (uintptr_t)e_->fn > 2) { __attribute__((musttail)) return e_->fn(c); } \
         } \
@@ -57,8 +65,11 @@ typedef uint16_t __attribute__((aligned(1), may_alias)) wt_u16u;
 typedef uint32_t __attribute__((aligned(1), may_alias)) wt_u32u;
 typedef uint64_t __attribute__((aligned(1), may_alias)) wt_u64u;
 
-#define WT_LD(T, a) (*(volatile T *)(uintptr_t)(a))
-#define WT_ST(T, a, v) (*(volatile T *)(uintptr_t)(a) = (v))
+/* Plain accesses (may_alias keeps them honest against each other), not volatile: a block is straight-line code, so a
+   value is re-read every time the block runs anyway, and the compiler may merge, forward and schedule the accesses
+   as the ARM memory model allows. Ordered accesses (LDAR / STLR), barriers and exclusives use __atomic_* below. */
+#define WT_LD(T, a) (*(T *)(uintptr_t)(a))
+#define WT_ST(T, a, v) (*(T *)(uintptr_t)(a) = (v))
 
 static inline wt_v128 wt_ld128(uint64_t a) { wt_v128 r; r.lo = WT_LD(wt_u64u, a); r.hi = WT_LD(wt_u64u, a + 8); return r; }
 static inline void wt_st128(uint64_t a, wt_v128 v) { WT_ST(wt_u64u, a, v.lo); WT_ST(wt_u64u, a + 8, v.hi); }

@@ -288,6 +288,7 @@ jit_core *jit_core_create(const jit_config *cfg, jit_monitor *m, size_t core_id)
     c->core_id = core_id;
     c->hybrid = g_nat.n != 0;
     c->nc.halt_request = &c->halt_req;
+    c->nc.core_id = (uint32_t)core_id;   /* svc 0x10 answered in recompiled code */
     c->nc.lc = reinterpret_cast<const wt_lce *>(c->lc); c->nc.lc_mask = sizeof c->lc / sizeof c->lc[0] - 1; c->nc.disp_fpcr = ~0u;
     static_assert(sizeof c->lc[0] == sizeof(wt_lce), "the cache entry generated code reads");
     c->nc.cntpct = c->cfg.cntpct;
