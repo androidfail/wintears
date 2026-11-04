@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <memory>
 
 namespace {
 struct ctx_entry { unsigned bw, bh; int srgb; astcenc_context *ctx; };
@@ -140,12 +141,12 @@ void bc3_rows(const uint8_t *rgba, unsigned w, unsigned h, uint8_t *dst, unsigne
 
 // As vk_astc_decode, then BC3 blocks into dst (ceil(w/4) x ceil(h/4) blocks of 16 bytes). 0 = done.
 extern "C" int vk_astc_decode_bc3(const uint8_t *src, size_t n, unsigned bw, unsigned bh, unsigned w, unsigned h, int srgb, uint8_t *dst) {
-    std::vector<uint8_t> rgba((size_t)w * h * 4);
-    int r = vk_astc_decode(src, n, bw, bh, w, h, srgb, rgba.data());
+    std::unique_ptr<uint8_t[]> rgba(new uint8_t[(size_t)w * h * 4]);   /* not value-initialised: the decoder writes every byte */
+    int r = vk_astc_decode(src, n, bw, bh, w, h, srgb, rgba.get());
     unsigned rows = (h + 3) / 4;
     std::lock_guard<std::mutex> lock(g_mu);   /* the helper threads are shared with the decoder */
     unsigned nt = (size_t)w * h >= 128u * 128u ? std::max(1u, g_threads) : 1;
-    if (nt == 1) bc3_rows(rgba.data(), w, h, dst, 0, rows);
-    else run_on(nt, [&](unsigned i) { bc3_rows(rgba.data(), w, h, dst, rows * i / nt, rows * (i + 1) / nt); });
+    if (nt == 1) bc3_rows(rgba.get(), w, h, dst, 0, rows);
+    else run_on(nt, [&](unsigned i) { bc3_rows(rgba.get(), w, h, dst, rows * i / nt, rows * (i + 1) / nt); });
     return r;
 }

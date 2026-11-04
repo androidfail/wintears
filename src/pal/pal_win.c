@@ -187,6 +187,7 @@ int pal_protect(uintptr_t addr, size_t size, unsigned prot) {
     /* VirtualProtect cannot cross allocations (views, private pieces): walk the regions. */
     DWORD want = win_prot(prot), old;
     uintptr_t end = addr + size;
+    if (size <= 4096) return VirtualProtect((void *)addr, size, want, &old) ? 0 : -1;   /* one page never crosses an allocation (the dirty tracker's unprotect) */
     while (addr < end) {
         MEMORY_BASIC_INFORMATION m;
         if (!VirtualQuery((void *)addr, &m, sizeof m)) return -1;
@@ -224,6 +225,7 @@ extern char pal_guarded_copy_insn[], pal_guarded_copy_fault[];
 
 static struct { volatile LONG code; volatile LONG64 n; } exc_codes[16];
 static volatile LONG64 exc_av_jit, exc_av_mod;
+static int exc_classify;   /* TOTK_DIAG: count faults by module (a module-list walk per fault) */
 static LONG CALLBACK veh(EXCEPTION_POINTERS *e) {
     EXCEPTION_RECORD *r = e->ExceptionRecord;
     for (int i = 0; i < 16; i++) {
@@ -232,7 +234,9 @@ static LONG CALLBACK veh(EXCEPTION_POINTERS *e) {
         if (c == (LONG)r->ExceptionCode) { InterlockedIncrement64(&exc_codes[i].n); break; }
     }
     /* not for the guarded copy: the sampler reads stacks with it while a thread that may hold the loader lock is stopped */
-    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->ContextRecord->Rip != (DWORD64)(uintptr_t)pal_guarded_copy_insn) {
+    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && e->ContextRecord->Rip != (DWORD64)(uintptr_t)pal_guarded_copy_insn && exc_classify) {
+        /* which module faulted (diagnostics): a loader-lock walk of the module list, so only when asked (TOTK_DIAG);
+           every first write to a write-protected texture page comes through here */
         HMODULE m = NULL;
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)r->ExceptionAddress, &m) && m) InterlockedIncrement64(&exc_av_mod);
         else InterlockedIncrement64(&exc_av_jit);
@@ -296,6 +300,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *e) {
 
 static BOOL CALLBACK veh_init(PINIT_ONCE o, PVOID p, PVOID *c) {
     (void)o; (void)p; (void)c;
+    { const char *d = pal_getenv("TOTK_DIAG"); exc_classify = d && *d == '1'; }
     SetUnhandledExceptionFilter(crash_filter);
     return AddVectoredExceptionHandler(1, veh) != NULL;
 }

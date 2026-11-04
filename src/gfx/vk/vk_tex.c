@@ -29,6 +29,7 @@ struct vtex {
     VkImage img; VmaAllocation al; VkFormat fmt; vk_fmt f; VkImageAspectFlags aspect; VkImageCreateFlags flags;
     uint32_t w, h, d, layers, levels, tsize; VkImageType type;   /* tsize: bytes per texel (block) in the image's own format */
     int mirrored, owned, uploaded;
+    uint64_t pre_sub;      /* the submission whose pre buffer last uploaded into it (upload: a barrier only between two uploads of one submission) */
     unsigned drop;         /* top mip levels left out (TOTK_MIP_DROP): image level l is the game's level l + drop */
     int kind; uint64_t bytes;   /* the memory line: 0 decoded ASTC, 1 other uploaded, 2 GPU-written; allocation size */
     char writer[128];   /* what last wrote it (diagnostics: the pass log prints it for sampled textures) */
@@ -539,11 +540,12 @@ static void upload(vtex *e, const tex_t *t) {
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh, slice = pitch * rows;
         for (unsigned ly = 0; ly < e->layers; ly++) {
             size_t n = slice * d;
-            uint8_t *lin = malloc(n);
-            if (!lin) die("texture upload: %zu bytes", n);
+            /* a grow-only scratch per thread: a fresh malloc per level and layer page-faulted its way through every upload */
+            static _Thread_local uint8_t *lin; static _Thread_local size_t lin_cap;
+            if (lin_cap < n) { free(lin); lin_cap = n < (1u << 20) ? 1u << 20 : n; lin = malloc(lin_cap); if (!lin) die("texture upload: %zu bytes", n); }
             if (nvn_deswizzle(&t->d, lv + e->drop, ly, t->mem, lin, pitch)) {   /* the game's level lv + drop */
                 VK_ONCE("texture %ux%u format %#x target %d flags %#x: layout not supported for upload", t->d.width, t->d.height, t->d.format, t->d.target, t->d.flags);
-                free(lin); goto done;
+                goto done;
             }
             uint8_t *dst; size_t out_n;
             put_linear(e, t->d.format, lin, slice, w, h, d, c, lv, ly, (VkOffset3D){0, 0, 0}, &dst, &out_n);
@@ -553,11 +555,14 @@ static void upload(vtex *e, const tex_t *t) {
                   uint64_t sum[4] = {0, 0, 0, 0}; for (size_t i = 0; i < (size_t)w * h; i++) for (int c = 0; c < 4; c++) sum[c] += dst[i * 4 + c];
                   double nn = (double)w * h * 255.0;
                   VLOG("[tex] upload %ux%u NVN format %#x (Vulkan %d) mean rgba %.3f %.3f %.3f %.3f", w, h, (unsigned)t->d.format, (int)e->fmt, sum[0] / nn, sum[1] / nn, sum[2] / nn, sum[3] / nn); } }
-            free(lin);
         }
     }
 done:
-    vk_barrier(c);
+    /* The main buffer begins with a barrier after this submission's uploads (vk_open) and nothing in the pre buffer
+       reads images, so a barrier here is needed only between two uploads of the same image in one submission
+       (write after write): one per upload was one full barrier per texture loaded. */
+    if (e->pre_sub == vk_sub_serial()) vk_barrier(c);
+    e->pre_sub = vk_sub_serial();
     e->uploaded = 1;
     { uint64_t dt = pal_now_ns() - t0; g_upload_ns += dt; vk_ns_tex += dt; }
 }

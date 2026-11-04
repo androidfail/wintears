@@ -49,16 +49,32 @@ static int busy_wait(range_t *r, uintptr_t p) {
     }
     return 1;
 }
-static range_t *find(uintptr_t a) {
+static _Atomic uint64_t g_range_gen;   /* moves after every range added: the gap cache below is only as old as that */
+/* The range holding a, or NULL with *gap_end the start of the nearest range above a (UINTPTR_MAX: none). Misses are
+   remembered per thread as the gap around a: a file read into untracked memory looked through all ~3,900 live ranges
+   once per 4 KiB page (prep_write), tens of millions of loads per second of streaming. A range removed only widens
+   the gap; a range added moves g_range_gen and the gap is forgotten. */
+static range_t *find_gap(uintptr_t a, uintptr_t *gap_end) {
     static _Thread_local range_t *recent[8]; static _Thread_local unsigned next;
+    static _Thread_local uintptr_t gap_lo, gap_hi; static _Thread_local uint64_t gap_gen;
     for (int k = 0; k < 8; k++) {
         range_t *l = recent[k];
         if (l && atomic_load_explicit(&l->live, memory_order_acquire) && a >= l->base && a < l->end) return l;
     }
-    int n = atomic_load(&g_nr);
-    for (int i = 0; i < n; i++) if (atomic_load_explicit(&g_r[i].live, memory_order_acquire) && a >= g_r[i].base && a < g_r[i].end) { recent[next++ & 7] = &g_r[i]; return &g_r[i]; }
+    uint64_t gen = atomic_load_explicit(&g_range_gen, memory_order_acquire);   /* before the scan: a range added later moves it */
+    if (gen == gap_gen && gap_hi > gap_lo && a >= gap_lo && a < gap_hi) { if (gap_end) *gap_end = gap_hi; return NULL; }
+    int n = atomic_load(&g_nr); uintptr_t lo = 0, hi = UINTPTR_MAX;
+    for (int i = 0; i < n; i++) {
+        if (!atomic_load_explicit(&g_r[i].live, memory_order_acquire)) continue;
+        uintptr_t b = g_r[i].base, e = g_r[i].end;
+        if (a >= b && a < e) { recent[next++ & 7] = &g_r[i]; return &g_r[i]; }
+        if (e <= a) { if (e > lo) lo = e; } else if (b < hi) hi = b;
+    }
+    gap_lo = lo; gap_hi = hi; gap_gen = gen;
+    if (gap_end) *gap_end = hi;
     return NULL;
 }
+static range_t *find(uintptr_t a) { return find_gap(a, NULL); }
 static void unprotect_page(range_t *r, uintptr_t p) {   /* the caller moved the state PROT -> BUSY */
     mp(r->base + (p << g_shift), g_pg, PAL_PROT_READ | PAL_PROT_WRITE);
     uint64_t g = atomic_fetch_add(&g_now, 1) + 1, l = atomic_load(&r->latest);
@@ -81,8 +97,9 @@ static int on_fault(uintptr_t addr, int kind, void *os_context, void *user) {
 static void prep_write(void *addr, size_t len) {
     uintptr_t a = (uintptr_t)addr, e = a + len;
     while (len && a < e) {
-        range_t *r = find(a);
-        if (!r) { a = (a + g_pg) & ~(g_pg - 1); continue; }
+        uintptr_t gap_end;
+        range_t *r = find_gap(a, &gap_end);
+        if (!r) { a = gap_end > a ? gap_end : (a + g_pg) & ~(g_pg - 1); continue; }   /* straight to the next range (bases are page-aligned) */
         uintptr_t stop = e < r->end ? e : r->end;
         for (uintptr_t p = (a - r->base) >> g_shift, q = (stop - 1 - r->base) >> g_shift; p <= q; p++) {
             for (;;) {
@@ -156,6 +173,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     r->base = base; r->end = end; r->state = state; r->gen = gen; atomic_store(&r->latest, 0);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_range_gen, 1, memory_order_release);   /* after the range is live: find_gap re-reads the gen first */
     pthread_mutex_unlock(&g_slot_mu);
 }
 void nvn_dirty_remove_range(const void *mem) {

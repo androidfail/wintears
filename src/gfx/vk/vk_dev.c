@@ -519,6 +519,7 @@ typedef struct sub {
     int slot;   /* its two timestamp queries: 2 * slot, 2 * slot + 1 (GPU time of the submission) */
 } sub;
 #define CHUNK_SIZE (16ull << 20)   /* staging: larger requests get a chunk of their own size */
+#define STAGE_SPARES 8   /* a load burst made and destroyed dozens of 16 MiB dedicated mapped allocations with 2 spares (each several driver calls under Wine) */
 enum { MAX_IN_FLIGHT = 6 };
 static VkSemaphore g_tl;
 static sub *g_cur, *g_free_subs, *g_fly_head, *g_fly_tail;
@@ -883,7 +884,7 @@ static void *done_thread(void *unused) {
         pthread_mutex_lock(&g_done_mu);
         for (chunk *c = s->chunks, *nx; c; c = nx) {
             nx = c->next;
-            if (c->size == CHUNK_SIZE && g_free_chunk_n < 2) {   /* 2 spare 16 MiB staging chunks */ c->next = g_free_chunks; g_free_chunks = c; g_free_chunk_n++; }
+            if (c->size == CHUNK_SIZE && g_free_chunk_n < STAGE_SPARES) {   /* spare 16 MiB staging chunks for the next load burst */ c->next = g_free_chunks; g_free_chunks = c; g_free_chunk_n++; }
             else { vmaDestroyBuffer(vk_vma, c->buf, c->al); atomic_fetch_sub(&g_chunk_bytes, c->size); free(c); }
         }
         s->chunks = NULL;
