@@ -22,7 +22,7 @@ def compile_runtime():
     env = dict(os.environ, MSYSTEM='UCRT64', CHERE_INVOKING='1')
     root = ROOT.as_posix()
     configure = '' if (ROOT / 'build/build.ninja').exists() else f'cmake -S "{root}" -B "{root}/build" -G Ninja && '
-    cmd = f'cd "{root}" && {configure}cmake --build build -j4'
+    cmd = f'cd "{root}" && {configure}cmake --build build -j{os.cpu_count() or 4}'
     print(f'[rebuild] compiling the runtime: {cmd}', flush=True)
     r = subprocess.run([str(bash), '-lc', cmd], env=env, cwd=ROOT)
     if r.returncode:

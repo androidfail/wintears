@@ -63,7 +63,7 @@ def main():
     ap.add_argument('game', type=Path, help='the TOTK_win folder from tools/build_win.py')
     ap.add_argument('--profile', type=Path, help='profile folder (default: TOTK_PROFILE_DIR or %%LOCALAPPDATA%%\\WinTears\\totk)')
     ap.add_argument('--translator', type=Path, default=ROOT/'build/shader-service/wt_xlate.exe')
-    ap.add_argument('--jobs', type=int, default=max(1, min(8, (os.cpu_count() or 4))))
+    ap.add_argument('--jobs', type=int, default=max(1, os.cpu_count() or 4))   # the work is in wt_xlate.exe processes: one per hardware thread
     args = ap.parse_args()
     romfs = args.game/'data/v0/romfs'
     if not (romfs/'index.json').is_file():

@@ -184,6 +184,13 @@ static void log_to_file(void) {
 }
 
 int main(int argc, char **argv) {
+#ifdef WINTEARS_NEED_AVX2   /* built with -march=x86-64-v3 (CMake WINTEARS_ARCH): say so instead of an illegal-instruction crash */
+    __builtin_cpu_init();
+    if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("fma")) {
+        fprintf(stderr, "wintears: this build needs a CPU with AVX2 and FMA (x86-64-v3), as the recompiled game code does; build with -DWINTEARS_ARCH=x86-64-v2 for this machine\n");
+        return 2;
+    }
+#endif
     if (argc >= 3 && !strcmp(argv[1], "boot")) {
         log_to_file();
         int trace = 0, window = 1;

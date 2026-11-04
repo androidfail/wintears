@@ -23,6 +23,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq mingw-w64 wine64 libboost-dev ninja-build llvm
           mkdir -p "$RUNNER_TEMP/boostinc" && ln -s /usr/include/boost "$RUNNER_TEMP/boostinc/boost"
+      - uses: hendrikmuhs/ccache-action@v1.2   # the externals (dynarmic, SDL, opus, astcenc) rebuilt from scratch on every push
+        with:
+          key: linux-cross-mingw
+          max-size: 600M
       - name: Check the generated guest test programs are up to date
         run: |
           python3 tools/embed_guest.py tests/guest/programs.S "$RUNNER_TEMP/programs.h"
@@ -35,7 +39,7 @@ jobs:
           python3 tools/gen_bridge.py "$RUNNER_TEMP/fx.c" tests/bridge_fixture.c --include bridge_fixture.h --table bridge_fixture_table
           diff -u tests/bridge_fixture_gen.c "$RUNNER_TEMP/fx.c"
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-x64.cmake -DBoost_INCLUDE_DIR="$RUNNER_TEMP/boostinc"
+        run: cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-x64.cmake -DBoost_INCLUDE_DIR="$RUNNER_TEMP/boostinc" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
       - name: Build
         run: cmake --build build
       - name: Test under Wine
@@ -62,7 +66,7 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          update: true
+          update: false   # a full pacman -Syu on every run took minutes; the packages below are installed at their current versions anyway
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
@@ -82,8 +86,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
           persist-credentials: false
+      - name: Fetch the upstream submodule (the only one these tests use)
+        run: git submodule update --init --depth 1 upstream
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
