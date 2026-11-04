@@ -77,6 +77,17 @@ a block the DLLs lack (the log says "made its JIT for the block at ..."). To add
 A `wintears.exe` configured with `-DWINTEARS_NATIVE_ONLY=ON` has no JIT at all: a missing block stops it with the line
 to add to `misses.txt`.
 
+The DLLs are built at -O2 with the System V calling convention and plain (non-volatile) guest accesses (2026-11-04);
+DLLs from before that are refused by nothing but will not get the gain and must be rebuilt after a `wt_native.h`
+change anyway (a full build: the header is part of every object's cache key). `wintears.exe` itself is built for
+x86-64-v3 (AVX2, FMA: what the DLLs need too) and says so instead of crashing on an older CPU; `-DWINTEARS_ARCH=x86-64-v2`
+builds for such a machine (the JIT only).
+
+Switches added with the 2026-11-04 optimisation pass, each with the old path behind it: `TOTK_SSBO_SHADOW=0/1` (storage
+buffers the GPU writes copied to video memory for the submission; off by default on an integrated GPU, on with a
+discrete one), `TOTK_WAKE_ALL=1` (every event signal wakes every thread in WaitSynchronization, as before; the default
+wakes the threads waiting on that object).
+
 On a laptop or a Steam Deck these are on by default: handheld mode (`TOTK_OPERATION_MODE=docked|handheld`), ASTC
 textures kept as BC3 (`TOTK_ASTC_BC3=0/1`), the top mip level of large textures left out (`TOTK_MIP_DROP=0/1`). To
 measure, play a minute with `TOTK_DIAG=1` set and send the lines of
