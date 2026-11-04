@@ -466,11 +466,12 @@ static void thr_free(thr_t *t) {   /* holding G */
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
     pthread_cond_destroy(&t->cv); if (t->ev) pal_event_free(t->ev); free(t);
 }
+static void wake_sync_waiters(const void *obj);
 static void thread_exit(thr_t *t) {
     G_lock();
     core_put(t);
     t->exited = 1;
-    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }   /* sync waiters look again */
+    wake_sync_waiters(t);   /* the threads waiting for this one look again */
     pthread_setspecific(g_keythr, NULL);
     host_tls_free(t->tls);
     if (t->closed) thr_free(t);
@@ -649,8 +650,24 @@ static int sig_obj(uint32_t h, int *bad) {   /* 1 = signaled (holding G) */
     default: *bad = 1; return 0;
     }
 }
-static void wake_sync_waiters(void) {
-    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }
+/* A sync object (event, thread) became signaled: wake the WaitSynchronization waiters that wait on it. The waited
+   handles are kept in wh[] (up to 4; more: woken on every signal, as before). Every event signal used to wake every
+   sync waiter (the audio renderer's period, the 60 Hz vsync, IPC events), and each woken thread took a virtual core
+   back, possibly halting a running worker, only to find its own object unsignaled and wait again. TOTK_WAKE_ALL=1
+   restores that. */
+static int g_wake_all = -1;
+static int waits_on(const thr_t *w, const void *obj) {
+    if (g_wake_all < 0) { const char *e = pal_getenv("TOTK_WAKE_ALL"); g_wake_all = e && *e == '1'; }
+    if (g_wake_all || !obj || w->nwh > 4) return 1;
+    for (int i = 0; i < w->nwh; i++) {
+        unsigned k = w->wh[i] - 0x1000;
+        if (w->wh[i] == H_CUR_THREAD) continue;
+        if (k == 0 || k >= MAX_H || g_h[k].obj == obj) return 1;   /* a bad handle: the waiter reports it */
+    }
+    return 0;
+}
+static void wake_sync_waiters(const void *obj) {
+    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4 && waits_on(w, obj)) wake(w, -1); w = n; }
 }
 static int64_t now_mono_ns(void) { return (int64_t)pal_now_ns(); }
 
@@ -793,7 +810,7 @@ int svc_thread(int num, uint64_t *regs) {
         int64_t r = 0;
         if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
                   if (r == R_BAD_HANDLE) LOG("event svc %#x: invalid handle %#x", num, h); }
-        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(); }
+        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(e); }
         else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
         else e->signaled = 0;
         pthread_mutex_unlock(&G);
@@ -864,7 +881,7 @@ uint32_t runtime_event_readable(uint32_t hw) {
 }
 void runtime_event_signal(uint32_t hw) {
     G_lock(); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
-    e->signaled = 1; wake_sync_waiters(); pthread_mutex_unlock(&G);
+    e->signaled = 1; wake_sync_waiters(e); pthread_mutex_unlock(&G);
 }
 
 /* ---------- SystemEvent of the service layer (upstream threads.c) ----------
@@ -901,6 +918,6 @@ void hle_signal_system_event(uint64_t ev) {   /* bound events only, from any thr
     G_lock();
     event_t *e = h_get(wh, O_EVENT_W);
     if (!e) die("SystemEvent writable handle %#x is gone", wh);
-    e->signaled = 1; wake_sync_waiters();
+    e->signaled = 1; wake_sync_waiters(e);
     pthread_mutex_unlock(&G);
 }

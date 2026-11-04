@@ -63,7 +63,12 @@ int64_t ldr_lz4_decode(const uint8_t *src, size_t n, uint8_t *dst, size_t cap) {
             } while (b == 255);
         }
         if (len > cap - o) return -1;
-        for (size_t k = 0; k < len; k++, o++) dst[o] = dst[o - off];   /* overlapping copies repeat the pattern */
+        if (off >= 8) {   /* the match lies wholly before the output: 8 bytes at a time (an overlap of 8 or more repeats correctly) */
+            size_t k = 0;
+            for (; k + 8 <= len; k += 8) memcpy(dst + o + k, dst + o + k - off, 8);
+            for (; k < len; k++) dst[o + k] = dst[o + k - off];
+            o += len;
+        } else for (size_t k = 0; k < len; k++, o++) dst[o] = dst[o - off];   /* overlapping copies repeat the pattern */
     }
     return (int64_t)o;
 }
