@@ -45,11 +45,14 @@ void vd_state_op(uint32_t op, const void *a) {
     case OP_BIND_VATTR: { const p_bind_vattr *b = a; if (b->first == 0 && b->n <= 16) { memcpy(S.attr, b->st, 4 * (size_t)b->n); S.nattr = b->n; S.key_gen++; } break; }
     case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; if (b->first == 0 && b->n <= 16) { memcpy(S.stream, b->st, 8 * (size_t)b->n); S.nstream = b->n; } break; }
     case OP_BIND_VBUF: { const p_bind_vbuf *b = a; if (b->first >= 0 && b->first + b->n <= 16) memcpy(&S.vbuf[b->first], b->r, sizeof *b->r * (size_t)b->n); break; }
-    case OP_BIND_UBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) { S.ubo[b->stage][b->index] = *b; S.bind_gen[b->stage]++; } break; }
-    case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) { S.ssbo[b->stage][b->index] = *b; S.bind_gen[b->stage]++; S.tex_gen[b->stage]++; } break; }
-    case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) { memcpy(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n); S.bind_gen[b->stage]++; S.tex_gen[b->stage]++; } break; }
-    case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) { memcpy(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n); S.bind_gen[b->stage]++; S.tex_gen[b->stage]++; } break; }
-    case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 32) { memcpy(&S.img[b->stage][b->first], b->h, 8 * (size_t)b->n); S.bind_gen[b->stage]++; S.tex_gen[b->stage]++; } break; }
+    /* The generation counters invalidate the per-shader set cache, the driver-bank cache and the shader-variant memo,
+       so they move only when the bound handles actually change: the game re-binds the same textures and buffers
+       between most draws of a material. */
+    case OP_BIND_UBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16 && memcmp(&S.ubo[b->stage][b->index], b, sizeof *b)) { S.ubo[b->stage][b->index] = *b; S.bind_gen[b->stage]++; } break; }
+    case OP_BIND_SSBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16 && memcmp(&S.ssbo[b->stage][b->index], b, sizeof *b)) { S.ssbo[b->stage][b->index] = *b; S.bind_gen[b->stage]++; S.tex_gen[b->stage]++; } break; }
+    case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 128 && memcmp(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n)) { memcpy(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n); S.bind_gen[b->stage]++; S.tex_gen[b->stage]++; } break; }
+    case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 128 && memcmp(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n)) { memcpy(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n); S.bind_gen[b->stage]++; S.tex_gen[b->stage]++; } break; }
+    case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 32 && memcmp(&S.img[b->stage][b->first], b->h, 8 * (size_t)b->n)) { memcpy(&S.img[b->stage][b->first], b->h, 8 * (size_t)b->n); S.bind_gen[b->stage]++; S.tex_gen[b->stage]++; } break; }
     case OP_STENCIL: {
         const p_stencil *b = a;
         for (int f = 0; f < 2; f++) if (b->face & (1 << f)) {
@@ -144,18 +147,35 @@ static dpool *dp_new(void) {
     return d;
 }
 static uint64_t g_dp_sub;
+/* Sets are allocated a batch at a time per layout (one driver call, a Wine thunk, per batch instead of per set) and
+   handed out from the batch for the rest of the frame; the frame's pools are reset when it completes, so a batch is
+   good for its frame only. */
+enum { DS_BATCH = 32, DS_LAYOUTS = 32 };
+static struct { VkDescriptorSetLayout l; uint64_t frame; VkDescriptorSet s[DS_BATCH]; int n; } g_ds_batch[DS_LAYOUTS];
+static int g_ds_batch_next;
 static VkDescriptorSet dset(VkDescriptorSetLayout l) {
-    if (g_dp_sub != vk_frame_serial() || !g_dp_cur) { g_dp_cur = dp_new(); vk_after_frame(dp_return, g_dp_cur); g_dp_sub = vk_frame_serial(); }
-    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_dp_cur->p, .descriptorSetCount = 1, .pSetLayouts = &l};
-    VkDescriptorSet s;
-    VkResult r = vkAllocateDescriptorSets(vk_dev, &ai, &s);
-    if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
-        g_dp_cur = dp_new(); vk_after_frame(dp_return, g_dp_cur);
-        ai.descriptorPool = g_dp_cur->p;
-        r = vkAllocateDescriptorSets(vk_dev, &ai, &s);
+    uint64_t fr = vk_frame_serial();
+    if (g_dp_sub != fr || !g_dp_cur) { g_dp_cur = dp_new(); vk_after_frame(dp_return, g_dp_cur); g_dp_sub = fr; }
+    __typeof__(g_ds_batch[0]) *b = NULL;
+    for (int i = 0; i < DS_LAYOUTS; i++) if (g_ds_batch[i].l == l) { b = &g_ds_batch[i]; break; }
+    if (b && b->frame == fr && b->n) return b->s[--b->n];
+    if (!b) { b = &g_ds_batch[g_ds_batch_next++ % DS_LAYOUTS]; b->l = l; }
+    b->frame = fr; b->n = 0;
+    VkDescriptorSetLayout ls[DS_BATCH]; for (int i = 0; i < DS_BATCH; i++) ls[i] = l;
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = g_dp_cur->p, .descriptorSetCount = DS_BATCH, .pSetLayouts = ls};
+    VkResult r = vkAllocateDescriptorSets(vk_dev, &ai, b->s);
+    if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {   /* the pool's remainder: one set, then a new pool */
+        ai.descriptorSetCount = 1;
+        r = vkAllocateDescriptorSets(vk_dev, &ai, b->s);
+        if (r == VK_ERROR_OUT_OF_POOL_MEMORY || r == VK_ERROR_FRAGMENTED_POOL) {
+            g_dp_cur = dp_new(); vk_after_frame(dp_return, g_dp_cur);
+            ai.descriptorPool = g_dp_cur->p; ai.descriptorSetCount = DS_BATCH;
+            r = vkAllocateDescriptorSets(vk_dev, &ai, b->s);
+        }
     }
     if (r != VK_SUCCESS) die("Vulkan: descriptor set allocation failed (%d)", (int)r);
-    return s;
+    b->n = (int)ai.descriptorSetCount;
+    return b->s[--b->n];
 }
 
 /* ---------- resources of one stage ---------- */
@@ -376,9 +396,14 @@ static VkDescriptorBufferInfo ssbo_at(uint64_t addr, uint64_t size, int rw) {
         if (!rw) return ub_copy_of(ga, range, vk_props.limits.minStorageBufferOffsetAlignment);
         vd_ub_flush();
     }
-    const shadow *x = shadow_of(ga, range, &ov);
-    if (!x && ov) vd_shadow_retire(ga, ga + range);   /* overlaps shadows in part: they go back to memory, then one shadow over all of it */
-    if (!x && rw) x = shadow_make(ga, range);
+    /* TOTK_SSBO_SHADOW=0/1: the video-memory copies (shadow_make) are for PCIe; where the GPU shares system RAM the copy
+       lands in the same RAM and only costs a buffer, two copies, two barriers and a pass end per storage buffer and
+       submission, so there the pool memory is bound directly */
+    static int shadows = -1;
+    if (shadows < 0) { const char *e = pal_getenv("TOTK_SSBO_SHADOW"); shadows = e ? *e != '0' : !vk_integrated; VLOG("storage buffers the GPU writes: %s", shadows ? "copied to video memory for the submission (TOTK_SSBO_SHADOW=0: bound in place)" : "bound in place (TOTK_SSBO_SHADOW=1: copied to video memory)"); }
+    const shadow *x = shadows ? shadow_of(ga, range, &ov) : NULL;
+    if (shadows && !x && ov) vd_shadow_retire(ga, ga + range);   /* overlaps shadows in part: they go back to memory, then one shadow over all of it */
+    if (shadows && !x && rw) x = shadow_make(ga, range);
     if (x) return (VkDescriptorBufferInfo){x->dev, ga - x->lo, range};
     VkBuffer b2 = b; VkDeviceSize o2 = lo;
     while (range > 16 && !vk_buf(ga, range, &b2, &o2)) range >>= 1;
@@ -407,7 +432,7 @@ static struct { const uint8_t *lo; uint64_t n; } g_smp[32]; static int g_nsmp, g
    buffer and range each uniform binding lands in. Consecutive draws of a material differ in their uniforms only: they
    reuse the set without resolving a texture again (that was ~13 ms a frame on the Steam Deck). */
 typedef struct { const vk_shader *sh; uint64_t frame, treg, gen; VkDescriptorSet set; int nu, nsmp; VkBuffer ub[8]; VkDeviceSize ur[8], uo[8]; __typeof__(g_smp[0]) smp[16]; } early_t;   /* uo: read-only storage buffers' offsets (not dynamic) */
-static early_t g_early[6][64];
+static early_t g_early[6][256];   /* direct-mapped by shader address; 256 so that two shaders of a frame rarely evict each other */
 uint64_t g_early_hits, g_early_miss[5];   /* misses: not eligible, other shader in the slot, frame / slots / binds changed, uniform buffer moved */
 static int samples_targets(void) {   /* a sampled texture overlaps a render target of the open pass */
     const tex_t *tg[9]; int nt = 0;
@@ -428,9 +453,10 @@ static VkDescriptorBufferInfo buf_binding(const vk_shader *sh, const vs_bind *b,
     case RB_C1: d = (VkDescriptorBufferInfo){sh->c1_buf, sh->c1_off, 65536}; break;
     case RB_DRV0: case RB_DRV2: {
         drv_ent *de = &g_drv[b->kind == RB_DRV2][st == 5 ? 2 : st == 1 ? 1 : 0];
-        /* the bytes depend on the stage's bindings only (compute: also the grid): unchanged binds, same upload */
-        if (st != 5 && de->serial == vk_frame_serial() && de->st == st && de->gen == S.bind_gen[st]) { d = (VkDescriptorBufferInfo){de->b, de->o, 0xA00}; break; }
-        de->gen = S.bind_gen[st]; de->st = st;
+        /* the bytes depend on the stage's storage buffers, textures and samplers only (tex_gen; compute: also its
+           uniform buffers and the grid, so bind_gen and never reused across draws): unchanged binds, same upload */
+        if (st != 5 && de->serial == vk_frame_serial() && de->st == st && de->gen == S.tex_gen[st]) { d = (VkDescriptorBufferInfo){de->b, de->o, 0xA00}; break; }
+        de->gen = st == 5 ? S.bind_gen[st] : S.tex_gen[st]; de->st = st;
         uint8_t tmp[0xA00]; drv_fill(tmp, b->kind == RB_DRV2 ? 2 : 0, st);
         if (de->serial != vk_frame_serial() || memcmp(tmp, de->bytes, sizeof tmp)) {
             uint8_t *p = vk_stage(0xA00, vk_props.limits.minUniformBufferOffsetAlignment, &de->b, &de->o);
@@ -475,7 +501,7 @@ static VkDescriptorSet stage_set(const vk_shader *sh, int st, uint32_t *dyn) {  
     VkBuffer e_ub[8]; VkDeviceSize e_ur[8], e_uo[8]; int e_nu = 0;
     if (msh->early != 1) g_early_miss[0]++;
     if (msh->early == 1 && !vk_passlog_on && !exp_me) {
-        ee = &g_early[st][((uintptr_t)sh >> 6) & 63];
+        ee = &g_early[st][(((uintptr_t)sh >> 6) ^ ((uintptr_t)sh >> 14)) & 255];
         if (ee->sh != sh) g_early_miss[1]++; else if (ee->frame != e_fr || ee->treg != e_tv) g_early_miss[2]++; else if (ee->gen != S.tex_gen[st]) g_early_miss[3]++;
         if (ee->sh == sh && ee->frame == e_fr && ee->treg == e_tv && ee->gen == S.tex_gen[st]) {
             int ok = 1, k = 0;
@@ -742,13 +768,27 @@ static VkPipeline graphics_pipeline(const vk_shader *vs, const vk_shader *fs, in
             k.blend[i].dst_a = b->dst_a; k.blend[i].eq_rgb = b->eq_rgb; k.blend[i].eq_a = b->eq_a;
         }
     }
-    static gp_key last_k; static VkPipeline last_p;   /* draws in a row mostly use one pipeline: no hash, no lock */
-    if (last_p && !memcmp(&k, &last_k, sizeof k)) return last_p;
+    /* Draws in a row mostly use a few pipelines (a pass alternates between its materials): a small most-recently-used
+       list in front of the map, read by the replay thread only, so most pipeline changes take neither the lock nor
+       the hash of the ~600-byte key. */
+    enum { PMRU = 16 };
+    static struct { gp_key k; VkPipeline p; } mru[PMRU]; static int mru_n;
+    for (int i = 0; i < mru_n; i++)
+        if (mru[i].k.vs == vs && mru[i].k.fs == fs && !memcmp(&k, &mru[i].k, sizeof k)) {
+            VkPipeline p = mru[i].p;
+            if (i) { __typeof__(mru[0]) e = mru[i]; memmove(&mru[1], &mru[0], sizeof mru[0] * (size_t)i); mru[0] = e; }
+            return p;
+        }
     pthread_mutex_lock(&g_pipes_mu);
     VkPipeline p = nvn_hm_get(&g_pipes, &k);
     pthread_mutex_unlock(&g_pipes_mu);
     if (p == PIPE_BUILDING) return VK_NULL_HANDLE;   /* still being built: the draw is left out this time */
-    if (p) { last_k = k; last_p = p; return p; }
+    if (p) {
+        if (mru_n < PMRU) mru_n++;
+        memmove(&mru[1], &mru[0], sizeof mru[0] * (size_t)(mru_n - 1));
+        mru[0].k = k; mru[0].p = p;
+        return p;
+    }
 
     pbuild *b = calloc(1, sizeof *b);
     if (!b) die("Vulkan: pipeline");

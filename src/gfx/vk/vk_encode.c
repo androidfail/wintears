@@ -15,7 +15,10 @@
 #define RING (32u << 20)
 typedef struct { void (*run)(void *); uint32_t size; uint32_t wrap; } rec_hdr;   /* size: the whole record, 16-byte aligned */
 static uint8_t *g_ring;
-static _Atomic uint64_t g_w, g_r;   /* bytes written / consumed, ever (positions are % RING) */
+/* bytes written / consumed, ever (positions are % RING): each on its own cache line, the producer writes g_w and
+   reads g_r per record and the consumer the reverse, and the two threads may run on different cores */
+static _Alignas(128) _Atomic uint64_t g_w;
+static _Alignas(128) _Atomic uint64_t g_r;
 static atomic_flag g_prod = ATOMIC_FLAG_INIT;   /* one producer at a time (a spin lock: almost never contended) */
 static inline void prod_lock(void) { while (atomic_flag_test_and_set_explicit(&g_prod, memory_order_acquire)) __builtin_ia32_pause(); }
 static inline void prod_unlock(void) { atomic_flag_clear_explicit(&g_prod, memory_order_release); }

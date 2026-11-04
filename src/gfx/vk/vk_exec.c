@@ -45,24 +45,48 @@ static int oq_make(void) {
    the same pass (Vulkan allows queries inside a render pass instance), instead of ending the pass: TOTK's ~100 queries a
    frame were ~100 extra passes. */
 static void oq_close(void) { if (g_oq_open) { vkCmdEndQuery(vk_cmd(), g_oq, (uint32_t)((g_oq_n - 1) % OQ_N)); g_oq_open = 0; } }
+static uint64_t g_oq_reset_hi;   /* queries below this are reset on the host ahead of use, 64 at a time (a host reset per pass was a driver call per pass) */
 static void oq_open(void) {
     if (!g_oq_on || !g_pass || g_oq_open) return;
-    uint32_t q = (uint32_t)(g_oq_n++ % OQ_N);
-    vkResetQueryPool(vk_dev, g_oq, q, 1);
+    uint64_t i = g_oq_n++; uint32_t q = (uint32_t)(i % OQ_N);
+    if (i >= g_oq_reset_hi) {   /* the ring's slots [q, q + k) were last used OQ_N - k queries ago: long complete and read */
+        uint32_t k = OQ_N - q < 64 ? OQ_N - q : 64;
+        vkResetQueryPool(vk_dev, g_oq, q, k); g_oq_reset_hi = i + k;
+    }
     vkCmdBeginQuery(vk_cmd(), g_oq, q, 0); g_oq_open = 1;
 }
 typedef struct { uint64_t type, addr, from, to; int real; uint32_t tsq; } ctr_act;   /* tsq: its GPU timestamp query + 1 */
-static uint64_t oq_sum(uint64_t from, uint64_t to) {
-    uint64_t n = to - from, sum = 0;
-    if (n > OQ_N) { from = to - OQ_N; n = OQ_N; }
-    uint64_t *r = malloc(n * sizeof *r);
-    for (uint64_t done = 0; r && done < n;) {   /* the ring wraps: at most two runs */
+/* Completion thread. The reports of one count series share their start (g_oq_start) and end later and later, so the
+   results read for one report are kept and the next report reads only the queries after them: one driver call per new
+   query range instead of one per report over the whole series (about 100 reports a frame, each a Wine call). */
+static uint64_t oq_read(uint64_t from, uint64_t n, uint64_t *r) {   /* results of [from, from + n) into r; how many were read */
+    uint64_t done = 0;
+    while (done < n) {   /* the ring wraps: at most two runs */
         uint32_t s = (uint32_t)((from + done) % OQ_N); uint64_t k = n - done < OQ_N - s ? n - done : OQ_N - s;
         if (vkGetQueryPoolResults(vk_dev, g_oq, s, (uint32_t)k, k * 8, r + done, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS) break;
         done += k;
     }
-    for (uint64_t i = 0; r && i < n; i++) sum += r[i];
-    free(r);
+    return done;
+}
+static uint64_t oq_sum(uint64_t from, uint64_t to) {
+    enum { OQ_KEEP = 4096 };
+    static uint64_t keep[OQ_KEEP], keep_from, keep_to, keep_sum;   /* results of [keep_from, keep_to) and their sum */
+    uint64_t n = to - from;
+    if (n > OQ_N) { from = to - OQ_N; n = OQ_N; }
+    if (from == keep_from && to >= keep_to && keep_to > keep_from && n <= OQ_KEEP) {   /* the series continues: read the new queries only */
+        uint64_t have = keep_to - keep_from, got = oq_read(keep_to, to - keep_to, keep + have);
+        for (uint64_t i = 0; i < got; i++) keep_sum += keep[have + i];
+        keep_to += got;
+        return keep_sum;
+    }
+    if (n <= OQ_KEEP) {
+        uint64_t got = oq_read(from, n, keep), sum = 0;
+        for (uint64_t i = 0; i < got; i++) sum += keep[i];
+        keep_from = from; keep_to = from + got; keep_sum = sum;
+        return sum;
+    }
+    uint64_t *r = malloc(n * sizeof *r), sum = 0;
+    if (r) { uint64_t got = oq_read(from, n, r); for (uint64_t i = 0; i < got; i++) sum += r[i]; free(r); }
     return sum;
 }
 /* Timestamp reports (TIMESTAMP_TOP / TIMESTAMP, about one each per submission) get the GPU's own time at that point of

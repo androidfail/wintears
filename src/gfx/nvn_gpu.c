@@ -19,7 +19,7 @@ enum { J_SUBMIT = 1, J_PRESENT, J_TEXREL, J_PROGREL, J_POOL_ADD, J_POOL_DEL };
 typedef struct { int kind, n; uint64_t *h; const tex_t *t; double period; int crop[4]; void *obj; const void *mem; uint64_t size, sub, t_ns; } job;
 uint64_t gpu_game_submit_ns;
 static uint64_t g_last_present_ns, g_sub_after_present_ns, g_sub_after_present_n;   /* TOTK_DIAG: where in its frame the game submits */   /* when the game submitted the work being replayed (vk_dev.c: GPU timestamps are reported from there) */
-#define XQ 64     /* queued jobs at most (the game waits for room) */
+#define XQ 1024   /* queued jobs at most (the game waits for room): texture-release bursts at a load queue one job each while the translation thread is mid-frame */
 #define XF 4096   /* fences / present tickets remembered */
 static job g_q[XQ];
 static uint64_t g_in, g_done, g_sub_in, g_sub_done, g_sub_fence[XF], g_ticket[XF];
